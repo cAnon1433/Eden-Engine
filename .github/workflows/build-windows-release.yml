@@ -20,12 +20,27 @@ on:
 permissions:
   contents: write   # required to publish a Release with an attached asset
 
+# actions/checkout, actions/upload-artifact, and softprops/action-gh-release
+# below are pinned to their Node.js 24 runtime versions (v6/v6/v3) - GitHub
+# is retiring Node 20 support for Actions runners in stages through late
+# 2026, and staying on the old major versions produces a "Node.js 20 is
+# deprecated" warning now and would eventually be a hard failure once
+# Node 20 is fully removed from runners.
+#
+# One remaining Node-20-declared action is NOT fixable here:
+# humbletim/install-vulkan-sdk@v1.2 uses actions/cache internally for its
+# own SDK-download caching, pinned to an older version as an implementation
+# detail of that third-party action - not something this workflow's pins
+# can control. It's currently harmless (GitHub already runs it under
+# Node 24 regardless, just with a warning) and will resolve itself once
+# that action's maintainer updates it.
+
 jobs:
   build-windows:
     runs-on: windows-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       # humbletim/install-vulkan-sdk installs the full Vulkan SDK and
       # exports VULKAN_SDK, which CMakeLists.txt's find_package(Vulkan
@@ -65,7 +80,7 @@ jobs:
       # sanity-check path - the actual thing testers should be pointed
       # at is the Release created below, which doesn't expire.
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: Eden-Windows
           path: dist/Eden-Windows.zip
@@ -80,7 +95,7 @@ jobs:
       # you delete them manually - a much simpler failure mode than a
       # rolling-tag update silently going wrong.
       - name: Publish Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: build-${{ github.run_number }}
           name: "Eden - build ${{ github.run_number }}"
