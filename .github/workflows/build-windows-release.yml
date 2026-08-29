@@ -47,21 +47,33 @@ jobs:
       # REQUIRED) picks up automatically - no extra CMake flags needed
       # on top of what already works locally.
       #
-      # cache: false, DELIBERATELY (this was cache: true and is the
-      # likely root cause of a real failure): a prior run's install may
-      # have been interrupted after only Bin/ was populated, and with
-      # caching on, every run since was silently restoring that same
-      # incomplete SDK - directory listing showed only Bin/ present,
-      # Include/ genuinely missing on disk, confirmed by CMake's own
-      # generate-time path-existence check failing on it. Turning
-      # caching off forces a real, complete download every run. Safe to
-      # re-enable later once confirmed stable, but not worth the risk
-      # of silently reintroducing the same failure to save ~a minute of
-      # download time per run.
+      # cache: false (kept off from the previous fix attempt) - already
+      # ruled out caching as the cause: this failed identically with
+      # caching disabled, so it wasn't a stale/incomplete cached
+      # install being reused.
+      #
+      # version PINNED to 1.4.309.0, not "latest" - this is the actual
+      # fix. "latest" resolved to 1.4.357.0, a very recent SDK release
+      # (its Bin/ contents include newer additions like dxc, slang,
+      # gfxreconstruct), and the installed Bin/ was otherwise complete
+      # while Include/ and Lib/ - a normal SDK's headers and link
+      # library - were silently absent entirely, confirmed by directly
+      # listing the folder, not just a failed find_package lookup. Most
+      # likely explanation: LunarG reorganized or renamed installer
+      # component IDs in a recent SDK release, and this action's
+      # (last-updated-a-while-ago) silent-install component list is
+      # requesting an ID that no longer matches, so that component gets
+      # silently skipped instead of erroring. 1.4.309.0 is the exact
+      # version shown in this action's own README usage example, which
+      # is a strong signal it's a version the action was actually
+      # validated against. Pinning to a known version instead of
+      # floating on "latest" is also just better CI practice generally
+      # - a build shouldn't get quietly different SDK contents on some
+      # future run because LunarG shipped something new.
       - name: Install Vulkan SDK
         uses: humbletim/install-vulkan-sdk@v1.2
         with:
-          version: latest
+          version: 1.4.309.0
           cache: false
 
       # Fails fast with a clear message here rather than three steps
