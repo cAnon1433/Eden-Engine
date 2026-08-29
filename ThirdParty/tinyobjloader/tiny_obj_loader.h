@@ -1402,32 +1402,58 @@ template <typename T> struct underlying_type {
 enum class ff_errc { ok = 0, invalid_argument = 22, result_out_of_range = 34 };
 
 // --- min_val (replaces std::min, avoids Windows min/max macro conflicts) ---
+// constexpr, same reasoning as distance() below - called from
+// FASTFLOAT_CONSTEXPR14 round() at line ~5126.
 template <typename T>
-inline T min_val(T a, T b) { return (b < a) ? b : a; }
+constexpr T min_val(T a, T b) { return (b < a) ? b : a; }
 
 // --- copy_n ---
+// constexpr, same reasoning as distance() below - called from
+// FASTFLOAT_CONSTEXPR20 extend_unchecked() at line ~4485.
 template <typename InputIt, typename Size, typename OutputIt>
-inline OutputIt copy_n(InputIt first, Size count, OutputIt result) {
+constexpr OutputIt copy_n(InputIt first, Size count, OutputIt result) {
   for (Size i = 0; i < count; ++i) *result++ = *first++;
   return result;
 }
 
 // --- copy_backward ---
+// constexpr, same reasoning as distance() below - called from
+// FASTFLOAT_CONSTEXPR20 shl_limbs() at line ~4921.
 template <typename BidirIt1, typename BidirIt2>
-inline BidirIt2 copy_backward(BidirIt1 first, BidirIt1 last, BidirIt2 d_last) {
+constexpr BidirIt2 copy_backward(BidirIt1 first, BidirIt1 last, BidirIt2 d_last) {
   while (first != last) *(--d_last) = *(--last);
   return d_last;
 }
 
 // --- fill ---
+// constexpr, same reasoning as distance() below - called from
+// FASTFLOAT_CONSTEXPR20 resize_unchecked() (line ~4505) and
+// shl_limbs() (line ~4933).
 template <typename ForwardIt, typename T>
-inline void fill(ForwardIt first, ForwardIt last, const T &value) {
+constexpr void fill(ForwardIt first, ForwardIt last, const T &value) {
   for (; first != last; ++first) *first = value;
 }
 
 // --- distance ---
+// constexpr added (was `inline` only), and audited alongside the four
+// functions just above (min_val/copy_n/copy_backward/fill) - this whole
+// tinyobj_ff namespace has exactly five functions with actual runtime
+// bodies (everything else here - is_same, conditional, integral_constant
+// etc. - is a compile-time-only type trait with no function body, so
+// none of those were at risk). All five turned out to be called from
+// FASTFLOAT_CONSTEXPR-marked fast_float code below, and all five had
+// the identical gap: declared `inline` only, never `constexpr`.
+// fast_float's loop_parse_if_eight_digits() (below) is itself constexpr
+// and calls this from within a constant-evaluated path; newer/stricter
+// MSVC (confirmed failing on toolset 14.51.36231) correctly rejects a
+// constexpr function calling a non-constexpr one, even though the call
+// was never actually exercised at compile time for this project's use
+// case - the body (`return last - first;`) is trivially valid as
+// constexpr for the pointer/random-access-iterator types this is
+// actually called with throughout this file, so this is a real fix,
+// not a suppression of the check.
 template <typename It>
-inline typename conditional<true, long long, It>::type
+constexpr typename conditional<true, long long, It>::type
 distance(It first, It last) {
   return last - first;
 }
