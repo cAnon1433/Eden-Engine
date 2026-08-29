@@ -8,36 +8,57 @@
 #include "../../Renderer/Vulkan/RendererTypes.h"
 #include "../../Renderer/Renderer.h"
 #include "../../Renderer/Frustum.h"
+#include "../../Renderer/SoftwareOcclusionBuffer.h"
 
 #include <vector>
+#include <algorithm>
 #include <iostream>
 
 namespace Eden::RenderSystem
 {
+    namespace detail
+    {
+        // Everything needed to either build this entity's DrawCommand or
+        // decide it's occluded, collected up front so the occlusion pass
+        // below doesn't need to re-touch ECS storage per candidate -
+        // same "resolve once" discipline as the storage references in
+        // BuildDrawList itself.
+        struct Candidate
+        {
+            MeshHandle mesh;
+            glm::mat4 model;
+            bool hasColorOverride;
+            glm::vec4 colorOverride;
+
+            bool projected; // false if ProjectAabb couldn't place this behind-camera-adjacent box - see its own comment
+            SoftwareOcclusionBuffer::ScreenRect rect;
+            float nearDepth;
+        };
+    }
+
     // Deliberately a free function, not an Eden::System - it doesn't
     // mutate ECS state, it reads Transform+Mesh(+Color+Visibility) pairs
     // and turns them into a per-frame draw list for Renderer::DrawFrame.
     // Call this directly from the main loop after Registry::UpdateSystems(),
     // not through UpdateSystems itself.
     //
-    // `renderer` is used for two things: building this frame's Frustum
+    // `renderer` is used for three things: building this frame's Frustum
     // (Renderer::GetViewFrustum - camera-derived, so it has to be built
-    // fresh each call, not cached) and looking up each mesh's bounding
-    // radius for the culling test below. Frustum culling is a coarse,
-    // conservative visibility test - entities entirely outside the
-    // camera's view volume are skipped before a DrawCommand is ever
-    // built for them, so the cost this actually removes is CPU-side
-    // (model matrix fetch, instance buffer upload, and ultimately the
-    // GPU draw call itself), not just "hidden geometry happens to get
-    // Z-rejected later". Matters most once something ELSE is also
-    // competing for frame budget (physics, SPH particles) - a scene that
-    // renders 166,375 instanced cubes fine in isolation can still fall
-    // behind once most of those cubes are off-screen at any given camera
-    // angle and get built into the draw list anyway.
+    // fresh each call, not cached), looking up each mesh's bounding
+    // radius, and running the software occlusion pass (see
+    // SoftwareOcclusionBuffer.h) via Renderer::GetOcclusionBuffer.
+    // Frustum culling and occlusion culling are both coarse, conservative
+    // visibility tests done BEFORE a DrawCommand is ever built, so the
+    // cost they remove is CPU-side (model matrix fetch, instance buffer
+    // upload, GPU draw call) - not just "hidden geometry gets Z-rejected
+    // later, who cares". Matters most once something ELSE is also
+    // competing for frame budget (physics, SPH particles), and once a
+    // scene actually has large objects blocking view of others - a
+    // scattered field of same-size objects with nothing substantial
+    // blocking anything gets little from the occlusion pass specifically
+    // (frustum culling still helps regardless of scene shape).
     inline std::vector<DrawCommand> BuildDrawList(Registry& registry, Renderer& renderer)
     {
-        std::vector<DrawCommand> drawList;
-
         // Resolved ONCE per BuildDrawList call, not once per entity - see
         // Registry::GetStorage's comment. At tens of thousands of entities
         // this is the difference between ~6 hash-map lookups and ~150,000
@@ -52,7 +73,13 @@ namespace Eden::RenderSystem
         // "resolve once, not per-entity" discipline as the storage
         // references above.
         Frustum frustum = renderer.GetViewFrustum();
+        glm::mat4 viewProjection = renderer.GetViewProjectionMatrix();
+        SoftwareOcclusionBuffer& occlusionBuffer = renderer.GetOcclusionBuffer();
+        bool occlusionEnabled = renderer.EnableOcclusionCulling;
 
+        std::vector<detail::Candidate> candidates;
+
+        // --- Phase 1: gather frustum-visible candidates ------------------
         // Deliberately NOT registry.View<TransformComponent, MeshComponent>()
         // here, even though that's the pattern every other system uses.
         // View() eagerly walks EVERY matching entity to build its result
@@ -64,16 +91,16 @@ namespace Eden::RenderSystem
         // is hit keeps this bounded at O(min(entity count, cap)) instead.
         for (Entity entity : transforms.Entities())
         {
-            if (drawList.size() >= MAX_INSTANCES_PER_FRAME)
+            if (candidates.size() >= MAX_INSTANCES_PER_FRAME)
             {
                 // Renderer::DrawFrame's own MAX_INSTANCES_PER_FRAME clamp
                 // still exists as a defense-in-depth backstop (in case
                 // something else ever feeds it a list built a different
                 // way), but THIS is what actually stops the work now -
-                // there's no reason to resolve a mesh handle, fetch a
-                // model matrix, or check for a color override on an
-                // entity that can't fit in this frame's fixed-size
-                // instance buffer regardless.
+                // capping CANDIDATE collection, not just the final list,
+                // since occlusion culling can only ever shrink the final
+                // count further - there's no scenario where collecting
+                // MORE than the frame could ever draw helps.
                 // Logged once, not every frame - printing to stderr 60
                 // times a second while over the cap is real I/O cost on
                 // top of the entity-count problem this is warning about,
@@ -110,10 +137,10 @@ namespace Eden::RenderSystem
 
             const TransformComponent& transform = transforms.Get(entity);
 
-            // Frustum cull BEFORE building the DrawCommand (model matrix
-            // fetch, color lookup) below - the entire point is to skip
-            // that work for off-screen entities, not just skip the draw
-            // call while still paying CPU cost to prepare it.
+            // Frustum cull BEFORE building anything else below - the
+            // entire point is to skip that work for off-screen entities,
+            // not just skip the draw call while still paying CPU cost to
+            // prepare it.
             //
             // World-space bounding radius = mesh's own local-space
             // bounding radius (Renderer::GetMeshBoundingRadius - computed
@@ -137,15 +164,123 @@ namespace Eden::RenderSystem
                 continue;
             }
 
-            DrawCommand drawCmd;
-            drawCmd.mesh = meshComp.handle;
-            drawCmd.model = transform.GetModelMatrix();
-
-            if (colors.Has(entity))
+            detail::Candidate candidate;
+            candidate.mesh = meshComp.handle;
+            candidate.model = transform.GetModelMatrix();
+            candidate.hasColorOverride = colors.Has(entity);
+            if (candidate.hasColorOverride)
             {
-                drawCmd.colorOverride = glm::vec4(colors.Get(entity).color, 1.0f);
+                candidate.colorOverride = glm::vec4(colors.Get(entity).color, 1.0f);
             }
 
+            if (occlusionEnabled)
+            {
+                // Sphere-derived world AABB - same conservative
+                // sphere-to-bounds approach as the frustum test above,
+                // reused here rather than inventing a tighter true AABB
+                // (a real per-mesh AABB would cull slightly more
+                // aggressively for non-cube meshes, but isn't computed
+                // anywhere yet - see Mesh::GetBoundingRadius, which only
+                // tracks a bounding sphere. Worth revisiting if occlusion
+                // culling's effectiveness on non-cube meshes turns out to
+                // matter, not needed to get a correct first version).
+                glm::vec3 worldMin = transform.position - glm::vec3(worldRadius);
+                glm::vec3 worldMax = transform.position + glm::vec3(worldRadius);
+                candidate.projected = occlusionBuffer.ProjectAabb(worldMin, worldMax, viewProjection,
+                    renderer.GetCamera().Position, renderer.GetCamera().Front, candidate.rect);
+                candidate.nearDepth = candidate.projected ? candidate.rect.nearDepth : 0.0f;
+            }
+            else
+            {
+                candidate.projected = false;
+                candidate.nearDepth = 0.0f;
+            }
+
+            candidates.push_back(candidate);
+        }
+
+        std::vector<DrawCommand> drawList;
+        drawList.reserve(candidates.size());
+
+        if (!occlusionEnabled)
+        {
+            for (const detail::Candidate& c : candidates)
+            {
+                DrawCommand drawCmd;
+                drawCmd.mesh = c.mesh;
+                drawCmd.model = c.model;
+                if (c.hasColorOverride)
+                {
+                    drawCmd.colorOverride = c.colorOverride;
+                }
+                drawList.push_back(drawCmd);
+            }
+            return drawList;
+        }
+
+        // --- Phase 2: occlusion pass, nearest-to-farthest -----------------
+        // Sorted so each candidate is only ever tested against occluders
+        // that are genuinely NEARER than it - processing in this order
+        // is what makes the single interleaved test-then-rasterize pass
+        // below correct rather than order-dependent-and-buggy: testing a
+        // candidate against occluders collected from farther-away
+        // objects would be physically backwards (something farther away
+        // can't occlude something nearer), and testing a candidate
+        // against ITS OWN just-rasterized depth would wrongly cull it
+        // against itself. Near-to-far order sidesteps both: by the time
+        // candidate N is tested, the buffer only contains depth from
+        // candidates 0..N-1, all strictly nearer.
+        std::sort(candidates.begin(), candidates.end(),
+            [](const detail::Candidate& a, const detail::Candidate& b)
+            {
+                // Un-projected candidates (behind-camera edge case, see
+                // ProjectAabb) sort last - order among them doesn't
+                // matter, they skip the occlusion test entirely below.
+                if (a.projected != b.projected)
+                {
+                    return a.projected; // projected ones first
+                }
+                return a.nearDepth < b.nearDepth;
+            });
+
+        occlusionBuffer.Clear();
+        int minOccluderCells = renderer.MinOccluderFootprintCells;
+
+        for (const detail::Candidate& c : candidates)
+        {
+            bool visible = true;
+
+            if (c.projected)
+            {
+                visible = occlusionBuffer.IsVisible(c.rect);
+
+                if (visible)
+                {
+                    int width = c.rect.maxX - c.rect.minX + 1;
+                    int height = c.rect.maxY - c.rect.minY + 1;
+                    if (width * height >= minOccluderCells)
+                    {
+                        occlusionBuffer.RasterizeOccluder(c.rect);
+                    }
+                }
+            }
+            // !c.projected: couldn't be placed in the occlusion buffer at
+            // all (behind-camera-adjacent edge case) - treated as
+            // visible here, same "let frustum culling handle genuinely
+            // off-screen cases" reasoning as ProjectAabb's own comment.
+
+            if (!visible)
+            {
+                continue;
+            }
+
+            DrawCommand drawCmd;
+            drawCmd.mesh = c.mesh;
+            drawCmd.model = c.model;
+            if (c.hasColorOverride)
+            {
+                drawCmd.colorOverride = c.colorOverride;
+            }
             drawList.push_back(drawCmd);
         }
 

@@ -29,11 +29,23 @@ namespace Eden
         // and needs no other changes here: point rasterization still goes
         // through the exact same vertex/instance input, viewport/scissor,
         // and descriptor-set binding path, it just assembles differently.
+        //
+        // `cullMode` defaults to VK_CULL_MODE_BACK_BIT, preserving every
+        // existing call site's behavior unchanged. Pass VK_CULL_MODE_NONE
+        // for meshes where a small missing/misordered patch of surface
+        // (e.g. a marching-cubes ambiguous-case crack - see Voxel/
+        // VoxelSystemGPU.cpp's notes on that open issue) should read as
+        // "see the far interior wall through the gap" rather than "see
+        // straight through to the skybox" - see Renderer::m_VoxelPipeline
+        // for the one call site that does this today. This is a stopgap:
+        // it papers over rare topology gaps by making backfaces visible
+        // through them, it doesn't fix the gaps themselves.
         void Init(VkDevice device, VkRenderPass renderPass, VkPipelineLayout layout,
                   const std::string& vertSpirvPath, const std::string& fragSpirvPath,
                   const std::vector<VkVertexInputBindingDescription>& bindingDescriptions,
                   const std::vector<VkVertexInputAttributeDescription>& attributeDescriptions,
-                  VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+                  VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+                  VkCullModeFlags cullMode = VK_CULL_MODE_BACK_BIT);
         void Shutdown();
 
         VkPipeline Get() const { return m_Pipeline; }

@@ -4,7 +4,8 @@
 
 namespace Eden
 {
-    void VulkanPipelineLayout::Init(VkDevice device, const std::vector<VkDescriptorSetLayout>& descriptorSetLayouts)
+    void VulkanPipelineLayout::Init(VkDevice device, const std::vector<VkDescriptorSetLayout>& descriptorSetLayouts,
+                                     const std::vector<VkPushConstantRange>& pushConstantRanges)
     {
         m_DeviceHandle = device;
 
@@ -13,8 +14,8 @@ namespace Eden
         layoutInfo.setLayoutCount = static_cast<uint32_t>(descriptorSetLayouts.size());
         layoutInfo.pSetLayouts = descriptorSetLayouts.empty() ? nullptr : descriptorSetLayouts.data();
 
-        layoutInfo.pushConstantRangeCount = 0;
-        layoutInfo.pPushConstantRanges = nullptr;
+        layoutInfo.pushConstantRangeCount = static_cast<uint32_t>(pushConstantRanges.size());
+        layoutInfo.pPushConstantRanges = pushConstantRanges.empty() ? nullptr : pushConstantRanges.data();
 
         if (vkCreatePipelineLayout(m_DeviceHandle, &layoutInfo, nullptr, &m_Layout) != VK_SUCCESS)
         {

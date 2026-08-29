@@ -1,0 +1,637 @@
+#version 450
+
+// Semi-implicit Euler integration + SDF boundary collision, one
+// invocation per particle - GPU mirror of ParticleSystem::Integrate and
+// ResolveBoundaries combined into a single pass (the CPU version keeps
+// them as two separate functions purely for readability; nothing here
+// depends on that split). Safe to read-modify-write positions[i]/
+// velocities[i] in place: every other pass this substep (density,
+// force) only ever READS positions/velocities, and this is the only
+// pass that writes them, so there's no cross-invocation hazard the way
+// there would be if two particles' invocations could touch the same
+// index.
+//
+// SDF math below is a direct GLSL port of Engine/Physics/SDF.h - same
+// function names/shapes, kept in sync by hand since GLSL can't #include
+// C++ headers. If SDF.h's math ever changes, this needs the same change.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer PositionsBuffer { vec4 positions[]; };
+layout(std430, binding = 1) buffer VelocitiesBuffer { vec4 velocities[]; };
+layout(std430, binding = 2) readonly buffer DensitiesBuffer { float densities[]; };
+layout(std430, binding = 4) readonly buffer ForcesBuffer { vec4 forces[]; };
+
+// Heat/cooldown state (Eden Particle State Transitions). Written here
+// (the only compute pass that touches it, same "one writer" reasoning
+// as positions/velocities above) and read later by clustering/reform.
+// GPU_HEAT_NOT_MELTED (-1.0) means "not part of the melt system, skip
+// decay entirely" - see ParticleGPUTypes.h.
+layout(std430, binding = 8) buffer HeatBuffer { float heat[]; };
+
+// VoxelSystemGPU's single shared density buffer (see that class's
+// m_SharedDensityBuffer comment) - added for particle-vs-voxel
+// collision (ColliderGPU shape type 4). Same buffer raymarch.frag reads
+// (see that shader's DensityBuffer binding comment for the full
+// history of why this is one shared buffer rather than per-volume) -
+// this is a SEPARATE descriptor binding into the SAME underlying
+// VkBuffer, bound once at ParticleSystemGPU::Init time (see
+// CreateComputeDescriptors), not per-frame.
+layout(std430, binding = 9) readonly buffer DensityBuffer { float voxelDensity[]; };
+
+struct ColliderGPU
+{
+    vec4 rotRight;
+    vec4 rotUp;
+    vec4 rotForward;
+    vec4 worldCenterType; // xyz = world center, w = shape type (0=Sphere,1=Box,2=Capsule,3=Plane,4=Voxel)
+    vec4 shapeParams;
+
+    // Voxel-only (shape type 4) - see ColliderGPU's C++ struct comment
+    // in ParticleGPUTypes.h for the exact field meanings; mirrored here
+    // field-for-field, kept in sync by hand like every other struct in
+    // this file.
+    vec4 voxelParams;     // x = densityOffset (as float, reinterpreted below), y = voxelSize, zw unused
+    ivec4 voxelSampleDims; // xyz = SampleDims(), w unused padding
+};
+layout(std430, binding = 7) readonly buffer CollidersBuffer { ColliderGPU colliders[]; };
+
+layout(push_constant) uniform SimParams
+{
+    uint particleCount;
+    uint numColliders;
+    uint hashTableSize;
+    uint maxPerCell;
+    float h;
+    float h2;
+    float mass;
+    float restDensity;
+    float stiffness;
+    float gamma;
+    float viscosity;
+    float dt;
+    float cellSize;
+    float particleRadius;
+    float boundaryRestitution;
+    float maxAcceleration;
+    uint maxSweepIterations;
+    float heatDecayRate;      // was _pad0
+    float heatColdMultiplier; // was _pad1
+    float boundaryFriction;   // was _pad2
+    vec4 gravity;
+
+    // A particle whose position.y falls below this is treated as having
+    // left the simulated world (fallen past the floor's extent into an
+    // open void, etc.) - see the early-exit at the top of main() below
+    // for what that actually does, and SimParamsGPU's own comment
+    // (ParticleGPUTypes.h) for the full reasoning. Set by whatever owns
+    // scene layout (main.cpp), not this engine subsystem - defaults far
+    // below any real scene so it's a no-op until something sets it.
+    float voidKillY;
+} sim;
+
+// --- SDF math (Engine/Physics/SDF.h port) --------------------------------
+
+float SdfSphere(vec3 p, float radius)
+{
+    return length(p) - radius;
+}
+
+float SdfBox(vec3 p, vec3 halfExtents)
+{
+    vec3 q = abs(p) - halfExtents;
+    float outsideDistance = length(max(q, vec3(0.0)));
+    float insideDistance = min(max(q.x, max(q.y, q.z)), 0.0);
+    return outsideDistance + insideDistance;
+}
+
+float SdfCapsule(vec3 p, float halfHeight, float radius)
+{
+    p.y -= clamp(p.y, -halfHeight, halfHeight);
+    return length(p) - radius;
+}
+
+float SdfPlane(vec3 p, vec3 normal)
+{
+    return dot(p, normal);
+}
+
+// Trilinear density-field sample, direct port of raymarch.frag's
+// SampleDensityTrilinear (see that shader's comment for the full
+// derivation) - reads through THIS shader's own DensityBuffer binding
+// (binding 9 above), which points at the exact same underlying
+// VkBuffer raymarch.frag reads, just bound as a separate descriptor in
+// a separate pipeline (see that binding's own comment). densityOffset/
+// sampleDims/voxelSize come from a Voxel ColliderGPU's voxelParams/
+// voxelSampleDims (see that struct's fields) rather than a
+// RaymarchObjectGPU, but the math is identical either way - both are
+// ultimately just "trilinear-sample this shared buffer starting at my
+// own offset."
+float SampleDensityTrilinear(uint densityOffset, vec3 localPos, float voxelSize, ivec3 sampleDims)
+{
+    vec3 gridPos = localPos / voxelSize;
+    vec3 maxGrid = vec3(sampleDims) - vec3(1.0 + 1e-4);
+    vec3 clampedGrid = clamp(gridPos, vec3(0.0), max(maxGrid, vec3(0.0)));
+
+    ivec3 i0 = ivec3(floor(clampedGrid));
+    vec3 frac = clampedGrid - vec3(i0);
+
+    // x-fastest linear index, matching VoxelSystemGPU::SampleIndex's
+    // layout exactly (see that function's own comment) - NOT clamped
+    // per-corner the way raymarch.frag's SampleIndexClamped is, since
+    // clampedGrid above already guarantees i0 and i0+1 both stay inside
+    // [0, sampleDims-1] in every axis (the `- vec3(1.0+1e-4)` margin on
+    // maxGrid exists specifically so i0+1 never overflows). A second
+    // clamp here would be redundant, not incorrect.
+    ivec3 dims = sampleDims;
+    #define VOXEL_IDX(o) uint((o).x + (o).y * dims.x + (o).z * dims.x * dims.y)
+
+    float c000 = voxelDensity[densityOffset + VOXEL_IDX(i0 + ivec3(0,0,0))];
+    float c100 = voxelDensity[densityOffset + VOXEL_IDX(i0 + ivec3(1,0,0))];
+    float c010 = voxelDensity[densityOffset + VOXEL_IDX(i0 + ivec3(0,1,0))];
+    float c110 = voxelDensity[densityOffset + VOXEL_IDX(i0 + ivec3(1,1,0))];
+    float c001 = voxelDensity[densityOffset + VOXEL_IDX(i0 + ivec3(0,0,1))];
+    float c101 = voxelDensity[densityOffset + VOXEL_IDX(i0 + ivec3(1,0,1))];
+    float c011 = voxelDensity[densityOffset + VOXEL_IDX(i0 + ivec3(0,1,1))];
+    float c111 = voxelDensity[densityOffset + VOXEL_IDX(i0 + ivec3(1,1,1))];
+
+    #undef VOXEL_IDX
+
+    float c00 = mix(c000, c100, frac.x);
+    float c10 = mix(c010, c110, frac.x);
+    float c01 = mix(c001, c101, frac.x);
+    float c11 = mix(c011, c111, frac.x);
+    float c0 = mix(c00, c10, frac.y);
+    float c1 = mix(c01, c11, frac.y);
+    return mix(c0, c1, frac.z);
+}
+
+// Voxel signed-distance query - direct port of
+// VoxelSystemGPU::SampleSignedDistance (clamp into the sample grid, add
+// back exact box-distance for query points outside the field's own
+// bounds - see that function's comment for why). localPoint here is
+// ALREADY in the volume's own local space by the time this is called
+// (WorldToLocal has run - see this function's caller), which for Voxel
+// reduces to exactly `worldPoint - origin` since Voxel colliders carry
+// an identity rotation (see ColliderGPU's C++ struct comment) - no
+// separate un-rotate step needed here.
+float VoxelShapeDistance(ColliderGPU c, vec3 localPoint)
+{
+    ivec3 sampleDims = c.voxelSampleDims.xyz;
+    if (sampleDims.x <= 0 || sampleDims.y <= 0 || sampleDims.z <= 0)
+    {
+        // No voxel system was available when this collider was
+        // uploaded (see ParticleSystemGPU.cpp's Step - the CPU side
+        // leaves voxelSampleDims zeroed in that case) - report "very
+        // far away" rather than dividing by a zero/garbage sampleDims
+        // below, same "no contact rather than a crash" contract
+        // TestSphereVsVoxel's CPU equivalent follows.
+        return 1.0e30;
+    }
+
+    float voxelSize = c.voxelParams.y;
+    vec3 extent = vec3(sampleDims - ivec3(1)) * voxelSize;
+    vec3 clampedLocal = clamp(localPoint, vec3(0.0), extent);
+    float outsideDistance = length(localPoint - clampedLocal);
+
+    uint densityOffset = uint(c.voxelParams.x); // reinterpret float->uint, see voxelParams' own comment
+    return SampleDensityTrilinear(densityOffset, clampedLocal, voxelSize, sampleDims) + outsideDistance;
+}
+
+float ShapeDistance(ColliderGPU c, vec3 localPoint)
+{
+    int shapeType = int(c.worldCenterType.w);
+    if (shapeType == 0) return SdfSphere(localPoint, c.shapeParams.x);
+    if (shapeType == 1) return SdfBox(localPoint, c.shapeParams.xyz);
+    if (shapeType == 2) return SdfCapsule(localPoint, c.shapeParams.x, c.shapeParams.y);
+    if (shapeType == 4) return VoxelShapeDistance(c, localPoint); // Voxel
+    return SdfPlane(localPoint, c.shapeParams.xyz); // Plane
+}
+
+// --- Tetrahedron-technique gradient (Inigo Quilez's calcNormal trick) ---
+// direct GLSL port of VoxelSystemGPU::SampleGradient (see that
+// function's comment for the full derivation and for why the epsilon
+// is a full voxelSize, not a tight sub-voxel value - short version: a
+// reformed surface has real sub-voxel/SmoothMin-seam noise a tight
+// epsilon would faithfully - and visibly - resolve into a jittery
+// contact normal). 4 VoxelShapeDistance taps instead of the 6
+// NumericalGradient above would cost - this used to fall through to
+// NumericalGradient for Voxel (6 taps, each itself a full
+// SampleDensityTrilinear = 8 buffer reads), which was the same "missing
+// the CPU-side fix" gap SampleGradient's own comment already flagged
+// and fixed on that side; this ports the same fix here.
+vec3 VoxelGradient(ColliderGPU c, vec3 localPoint)
+{
+    float epsilon = max(c.voxelParams.y, 1e-4); // c.voxelParams.y = voxelSize
+
+    const vec3 kD0 = vec3(1.0, -1.0, -1.0);
+    const vec3 kD1 = vec3(-1.0, -1.0, 1.0);
+    const vec3 kD2 = vec3(-1.0, 1.0, -1.0);
+    const vec3 kD3 = vec3(1.0, 1.0, 1.0);
+
+    vec3 gradient =
+        kD0 * VoxelShapeDistance(c, localPoint + kD0 * epsilon) +
+        kD1 * VoxelShapeDistance(c, localPoint + kD1 * epsilon) +
+        kD2 * VoxelShapeDistance(c, localPoint + kD2 * epsilon) +
+        kD3 * VoxelShapeDistance(c, localPoint + kD3 * epsilon);
+
+    float len = length(gradient);
+    return len > 0.0 ? gradient / len : vec3(0.0, 1.0, 0.0);
+}
+
+// Analytic box normal - the closest face's axis-aligned normal, sign
+// matching which side of that face p is on. Standard box-SDF gradient
+// shortcut, replacing NumericalGradient's 6 SdfBox evaluations with 2
+// subtractions and a couple of comparisons. Exact away from edges/
+// corners; still a valid unit-length direction exactly ON an edge/
+// corner (picks one of the tied faces rather than numerically blending
+// them like NumericalGradient would - a negligible difference here
+// since Box colliders in this project are floor/wall geometry: large,
+// flat, and rarely contacted edge-on). This is the single most-called
+// gradient path in the whole file once particles settle - the floor/
+// walls are Box colliders (see main.cpp's scene setup) and a resting
+// fluid pile is, definitionally, mostly particles sitting right at
+// that boundary every substep.
+vec3 BoxNormal(vec3 p, vec3 halfExtents)
+{
+    vec3 d = abs(p) - halfExtents;
+    vec3 s = sign(p);
+    if (d.x > d.y && d.x > d.z) return vec3(s.x, 0.0, 0.0);
+    if (d.y > d.z) return vec3(0.0, s.y, 0.0);
+    return vec3(0.0, 0.0, s.z);
+}
+
+// Analytic capsule normal - not an approximation like BoxNormal above,
+// this IS the literal derivative of SdfCapsule (distance to the
+// clamped-to-segment point, minus radius - its gradient is exactly the
+// normalized vector from that clamped point to p, which is exactly
+// what SdfCapsule already computes internally before taking length()).
+// Replaces NumericalGradient's 6 SdfCapsule evaluations with the same
+// single clamp SdfCapsule itself does.
+vec3 CapsuleNormal(vec3 p, float halfHeight)
+{
+    p.y -= clamp(p.y, -halfHeight, halfHeight);
+    float len = length(p);
+    return len > 0.0 ? p / len : vec3(0.0, 1.0, 0.0);
+}
+
+vec3 ShapeNormal(ColliderGPU c, vec3 localPoint)
+{
+    int shapeType = int(c.worldCenterType.w);
+    if (shapeType == 0)
+    {
+        float len = length(localPoint);
+        return len > 0.0 ? localPoint / len : vec3(0.0, 1.0, 0.0);
+    }
+    if (shapeType == 1)
+    {
+        return BoxNormal(localPoint, c.shapeParams.xyz);
+    }
+    if (shapeType == 2)
+    {
+        return CapsuleNormal(localPoint, c.shapeParams.x);
+    }
+    if (shapeType == 3)
+    {
+        return c.shapeParams.xyz; // Plane normal, already normalized
+    }
+    // shapeType == 4 (Voxel) - the only shape without a closed-form
+    // normal, hence VoxelGradient's 4-tap numerical approach.
+    return VoxelGradient(c, localPoint);
+}
+
+vec3 WorldToLocal(ColliderGPU c, vec3 worldPoint)
+{
+    mat3 rotation = mat3(c.rotRight.xyz, c.rotUp.xyz, c.rotForward.xyz);
+    // transpose() of an orthonormal rotation matrix is its inverse -
+    // same shortcut SDF::WorldToLocal takes. For Voxel (shape 4), this
+    // rotation matrix is always identity (see ColliderGPU's C++ struct
+    // comment), so this correctly reduces to exactly
+    // `worldPoint - c.worldCenterType.xyz` - which for Voxel holds
+    // desc.origin, not a center (see that field's own comment) - i.e.
+    // precisely VoxelSystemGPU::SampleSignedDistance's own convention,
+    // with zero special-casing needed here.
+    return transpose(rotation) * (worldPoint - c.worldCenterType.xyz);
+}
+
+vec3 LocalToWorldNormal(ColliderGPU c, vec3 localNormal)
+{
+    mat3 rotation = mat3(c.rotRight.xyz, c.rotUp.xyz, c.rotForward.xyz);
+    return normalize(rotation * localNormal);
+}
+
+// --- Broad-phase collider bounds (reject-only optimization) ---------------
+//
+// ShapeDistance is cheap for Sphere/Plane, moderate for Box/Capsule, and
+// genuinely expensive for Voxel (SampleDensityTrilinear = 8 buffer reads),
+// and ShapeNormal's NumericalGradient calls ShapeDistance SIX more times
+// on top of that. Both loops in main() below call these for EVERY
+// particle against EVERY collider with no culling at all - fine when
+// "colliders are few" (see ParticleSystemGPU.cpp's comment on why that
+// used to be a safe assumption), but the melt/reform pipeline can grow
+// the collider count well past "few" over a session (every H press
+// registers new ECS collider entities that nothing currently
+// unregisters), and Voxel colliders are exactly the expensive kind.
+//
+// These two functions compute a conservative world-space bounding sphere
+// per collider - conservative meaning it's guaranteed to fully contain
+// the shape's true surface, so a REJECT based on this bound can never
+// discard a genuine collision, only pairs the exact math would also have
+// judged "no contact." This is a correctness-preserving optimization,
+// not an approximation of the physics.
+vec3 ColliderBoundCenter(ColliderGPU c)
+{
+    int shapeType = int(c.worldCenterType.w);
+    if (shapeType == 4) // Voxel
+    {
+        // worldCenterType.xyz holds desc.origin for Voxel, not a center
+        // (see WorldToLocal's comment) - the true center is the origin
+        // plus half the field's extent. No rotation to apply here -
+        // Voxel colliders always carry an identity rotation (same
+        // comment), so adding the extent directly in world space is
+        // correct, not an approximation.
+        ivec3 sampleDims = c.voxelSampleDims.xyz;
+        vec3 halfExtent = 0.5 * vec3(max(sampleDims - ivec3(1), ivec3(0))) * c.voxelParams.y;
+        return c.worldCenterType.xyz + halfExtent;
+    }
+    return c.worldCenterType.xyz; // Sphere/Box/Capsule/Plane already store a true center here
+}
+
+float ColliderBoundRadius(ColliderGPU c)
+{
+    int shapeType = int(c.worldCenterType.w);
+    if (shapeType == 0) return c.shapeParams.x; // Sphere: exact radius
+    if (shapeType == 1) return length(c.shapeParams.xyz); // Box: center-to-corner diagonal, rotation-invariant
+    if (shapeType == 2) return c.shapeParams.x + c.shapeParams.y; // Capsule: halfHeight + radius, exact regardless of orientation
+    if (shapeType == 4)
+    {
+        ivec3 sampleDims = c.voxelSampleDims.xyz;
+        vec3 halfExtent = 0.5 * vec3(max(sampleDims - ivec3(1), ivec3(0))) * c.voxelParams.y;
+        return length(halfExtent); // Voxel: center-to-corner diagonal of the field's AABB
+    }
+    // Plane (shapeType 3, matches ShapeDistance's own fallback) is
+    // infinite - no useful bound, so return a value large enough that
+    // every reject check below always evaluates a Plane's real distance.
+    return 1.0e30;
+}
+
+// --- main -----------------------------------------------------------------
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= sim.particleCount)
+    {
+        return;
+    }
+
+    // Void-kill: a particle that has already fallen below the world's
+    // floor extent (see SimParamsGPU::voidKillY's comment) is frozen
+    // rather than paying for gravity integration, the SPH force read,
+    // or either collision pass below - none of that work can possibly
+    // matter for something that's left the simulated world and will
+    // never be seen again. This is exactly the case Hawkins found: 90K
+    // particles with ~88K fully off-screen in an open void, still
+    // costing full per-particle physics every frame with nothing
+    // checking for it.
+    //
+    // Checked against positions[i] (the value from BEFORE this frame's
+    // move, since `position` the local variable doesn't exist yet at
+    // this point) - a particle that crossed the threshold last frame
+    // already had its sentinel Y written below, so this reads that same
+    // sentinel and exits again immediately, same as every frame after
+    // the first crossing. A particle that crosses THIS frame still pays
+    // for one full frame of normal physics before freezing next frame -
+    // functionally irrelevant, not worth a special case.
+    if (positions[i].y < sim.voidKillY)
+    {
+        // Pinned to a large FIXED sentinel - independent of the actual,
+        // scene-specific voidKillY value - so particle_point_gpu.vert
+        // can recognize "gone" with a hardcoded constant of its own,
+        // without needing access to this compute pipeline's push
+        // constants (different pipeline/shader stage entirely). Cheap
+        // even re-running every frame - two vec4 writes is a small
+        // fraction of the gravity/collision/SPH work being skipped.
+        const float kVoidSentinelY = -1.0e8;
+        positions[i] = vec4(positions[i].x, kVoidSentinelY, positions[i].z, positions[i].w);
+        velocities[i] = vec4(0.0);
+        return;
+    }
+
+    float density = densities[i];
+    vec3 acceleration = sim.gravity.xyz;
+    if (density > 0.0)
+    {
+        acceleration += forces[i].xyz / density;
+    }
+
+    float accelMagnitude = length(acceleration);
+    if (accelMagnitude > sim.maxAcceleration)
+    {
+        acceleration *= sim.maxAcceleration / accelMagnitude;
+    }
+
+    vec3 velocity = velocities[i].xyz + acceleration * sim.dt;
+    vec3 position = positions[i].xyz + velocity * sim.dt;
+
+    const float kSurfaceEpsilon = 0.001;
+
+    // --- Tunnelling fix: SDF conservative-advancement sweep ---
+    // Direct port of ParticleSystem::ResolveBoundaries' sweep - see its
+    // .cpp comment for the full reasoning (sphere-trace the substep's
+    // displacement against every collider's SDF, taking the largest
+    // provably-safe step each iteration).
+    vec3 displacement = velocity * sim.dt;
+    float travelDistance = length(displacement);
+
+    if (sim.particleRadius > 0.0 && travelDistance > sim.particleRadius)
+    {
+        vec3 endPos = position;
+        vec3 startPos = endPos - displacement;
+        vec3 travelDir = displacement / travelDistance;
+
+        vec3 sweepPos = startPos;
+        float remaining = travelDistance;
+        bool hitSomething = false;
+
+        for (uint iteration = 0u; iteration < sim.maxSweepIterations && remaining > 0.0; ++iteration)
+        {
+            float safeStep = remaining;
+            bool constrainedByCollider = false;
+
+            for (uint c = 0u; c < sim.numColliders; ++c)
+            {
+                // Broad-phase reject: this collider can only be the
+                // binding constraint on safeStep THIS iteration if its
+                // true surface could be within `remaining` travel of
+                // sweepPos. If even its bounding sphere is farther than
+                // that, its real (more expensive) distance can only
+                // come back >= remaining too, so it can't lower
+                // safeStep - safe to skip entirely. Cheap: one
+                // subtraction-heavy vec3 distance instead of
+                // WorldToLocal + ShapeDistance (which for a Voxel
+                // collider is 8 buffer reads).
+                float boundDistance = distance(sweepPos, ColliderBoundCenter(colliders[c]))
+                                     - ColliderBoundRadius(colliders[c]) - sim.particleRadius;
+                if (boundDistance > remaining)
+                {
+                    continue;
+                }
+
+                vec3 local = WorldToLocal(colliders[c], sweepPos);
+                float distanceToSurface = ShapeDistance(colliders[c], local) - sim.particleRadius;
+
+                if (distanceToSurface < safeStep)
+                {
+                    safeStep = distanceToSurface;
+                    constrainedByCollider = true;
+                }
+            }
+
+            if (constrainedByCollider && safeStep <= kSurfaceEpsilon)
+            {
+                hitSomething = true;
+                break;
+            }
+
+            safeStep = max(safeStep, 0.0);
+            sweepPos += travelDir * safeStep;
+            remaining -= safeStep;
+        }
+
+        position = sweepPos;
+
+        if (hitSomething)
+        {
+            float speedIntoObstacle = dot(velocity, travelDir);
+            if (speedIntoObstacle > 0.0)
+            {
+                velocity -= travelDir * speedIntoObstacle;
+            }
+        }
+    }
+
+    // --- Discrete penetration check (always runs, same as CPU) ---
+    // Also tracks the closest surface this particle ended up near, for
+    // the heat-decay cold-surface bonus below - reusing this loop's
+    // per-collider distance rather than a second pass over colliders.
+    //
+    // kColdSurfaceBand is declared here (rather than down in Heat decay,
+    // where it's actually used) because the broad-phase reject below
+    // needs it too: nearestSurfaceDistance feeds BOTH the penetration
+    // check (needs distance < particleRadius) AND the cold-surface bonus
+    // (needs distance < kColdSurfaceBand), so a collider can only be
+    // safely skipped here if its bounding sphere is farther away than
+    // BOTH thresholds - using just particleRadius would silently break
+    // the cold-surface bonus for particles resting near, but not
+    // overlapping, a collider (kColdSurfaceBand is far larger than
+    // particleRadius - see the tuning values in the to-do doc).
+    const float kColdSurfaceBand = 0.15;
+    float discreteRejectMargin = max(sim.particleRadius, kColdSurfaceBand);
+
+    // Plain linear scan over every registered collider, with the same
+    // cheap bounding-sphere reject the sweep loop above uses - NOT the
+    // hash-indexed per-cell bitmask this briefly used. That approach is
+    // gone: it replaced a scan over at most GPU_MAX_COLLIDERS (32,
+    // usually far fewer in practice - this project's actual scenes run
+    // a handful) with a hash computation plus a scattered, effectively-
+    // random read into a 256KB buffer, once per particle per substep.
+    // For a collider count this small, the original array already
+    // fits comfortably in cache; trading that for a wide, low-locality
+    // buffer read was a real regression, not a win - the Big-O
+    // improvement doesn't pay for itself until M is much larger than
+    // this project actually has. Reverted after Hawkins reported lag
+    // starting at a LOWER particle count than before the mask existed.
+    float nearestSurfaceDistance = 1.0e30;
+    for (uint c = 0u; c < sim.numColliders; ++c)
+    {
+        // Broad-phase reject - see ColliderBoundCenter/ColliderBoundRadius's
+        // comment for why this can never discard a genuine penetration
+        // or cold-surface hit. length(a - b) rather than distance(a, b)
+        // - this scope re-declares a local `distance` a few lines down
+        // (shadowing the builtin for the rest of this iteration), so
+        // spelling it out avoids relying on GLSL's before-the-
+        // declaration-point scoping to resolve the builtin correctly.
+        float boundDistance = length(position - ColliderBoundCenter(colliders[c])) - ColliderBoundRadius(colliders[c]);
+        if (boundDistance > discreteRejectMargin)
+        {
+            continue;
+        }
+
+        vec3 localPoint = WorldToLocal(colliders[c], position);
+        float distance = ShapeDistance(colliders[c], localPoint);
+        nearestSurfaceDistance = min(nearestSurfaceDistance, distance);
+
+        if (distance >= sim.particleRadius)
+        {
+            continue;
+        }
+
+        vec3 localNormal = ShapeNormal(colliders[c], localPoint);
+        vec3 worldNormal = LocalToWorldNormal(colliders[c], localNormal);
+
+        float penetration = sim.particleRadius - distance;
+        position += worldNormal * penetration;
+
+        float normalVelocity = dot(velocity, worldNormal);
+        if (normalVelocity < 0.0)
+        {
+            velocity -= (1.0 + sim.boundaryRestitution) * normalVelocity * worldNormal;
+        }
+
+        // Tangential damping ("boundary friction") - see
+        // SimParamsGPU's comment on boundaryFriction for why this
+        // exists. Recomputed against the (possibly just-zeroed) normal
+        // component so this only ever removes along-surface motion,
+        // never fights the restitution response above.
+        vec3 tangentialVelocity = velocity - dot(velocity, worldNormal) * worldNormal;
+        velocity -= tangentialVelocity * sim.boundaryFriction;
+    }
+
+    // --- Heat decay ---
+    // Deliberately blunt "environmental exposure" for this pass (see
+    // planning notes: nothing elaborate yet) - passive decay everywhere,
+    // extra decay within a fixed band of any collider surface, using the
+    // nearest-surface distance the penetration loop above already
+    // computed for free.
+    float particleHeat = heat[i];
+    if (particleHeat >= 0.0)
+    {
+        // --- Heat conduction (toward SPH neighbors) ---
+        // Pull this particle's heat toward its neighborhood average
+        // (computed in particle_force.comp - see forces[i].w's comment
+        // there) BEFORE applying decay below. Without this, a resting
+        // pool cools patchily: only particles directly touching a
+        // collider get the cold-surface decay bonus, so a puddle
+        // crosses the reform threshold as a scattered set of isolated
+        // cold particles instead of together - see ReformSystem's
+        // comment on minClusterSize for the downstream symptom
+        // ("hardens into individual balls"). Conducting toward neighbors
+        // first means a cold patch pulls its warm neighbors down with
+        // it, so the WHOLE contiguous pool converges toward reform-
+        // eligibility together, not just whichever particles happen to
+        // be touching the floor.
+        //
+        // kConductionRate is a fraction-per-second pulled toward the
+        // neighbor average, not a physically-measured constant -
+        // deliberately fast relative to heatDecayRate (0.15/sec) so a
+        // resting pool homogenizes well before any of it finishes
+        // cooling. Clamped to 1.0 so a single substep can't overshoot
+        // past the neighbor average.
+        const float kConductionRate = 3.0;
+        float neighborAvgHeat = forces[i].w;
+        particleHeat += (neighborAvgHeat - particleHeat) * min(kConductionRate * sim.dt, 1.0);
+
+        // kColdSurfaceBand declared up near the discrete penetration
+        // loop above (the broad-phase reject there needs it too) - this
+        // block just reuses it, not a second declaration.
+        float decay = sim.heatDecayRate;
+        if (nearestSurfaceDistance < kColdSurfaceBand)
+        {
+            decay *= sim.heatColdMultiplier;
+        }
+        heat[i] = max(particleHeat - decay * sim.dt, 0.0);
+    }
+
+    velocities[i] = vec4(velocity, 0.0);
+    positions[i] = vec4(position, 0.0);
+}

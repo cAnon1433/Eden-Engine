@@ -58,7 +58,29 @@ namespace Eden
         // uniform across a simulation rather than per-particle, so this
         // is one shared constant, not stored per-particle in
         // ParticleData.
-        float particleMass = 0.02f;
+        //
+        // NOT a free parameter you can pick independently of restDensity/
+        // smoothingRadius/spacing - this was a real, shipped bug: the
+        // previous default (0.02) made it MATHEMATICALLY IMPOSSIBLE for
+        // density to ever approach restDensity, at any packing, which
+        // means pressure (clamped to >= 0, see `stiffness` below) was
+        // permanently 0 regardless of how compressed the fluid got -
+        // nothing was ever pushing particles apart. Verified by direct
+        // calculation: at the densest possible neighbor packing under
+        // the old defaults, density peaked at ~3.3 against a restDensity
+        // of 1000 - not "a bit low", off by two and a half orders of
+        // magnitude. This is why particles could collapse into a single
+        // point instead of behaving like a fluid.
+        //
+        // This default (restDensity * spacing^3) is the standard SPH
+        // mass-initialization formula - each particle represents roughly
+        // a spacing^3 chunk of fluid volume, so mass = density * volume.
+        // `spacing` here matches EmitBox's own default fill spacing
+        // (smoothingRadius * 0.6) - if you change smoothingRadius,
+        // restDensity, or EmitBox's spacing argument independently,
+        // recompute this the same way, or density will silently stop
+        // being able to reach restDensity again.
+        float particleMass = 5.832f; // = 1000.0f * (0.3f * 0.6f)^3 -> restDensity * spacing^3
 
         // Target rest density (roughly water-like in arbitrary
         // simulation units, not real kg/m^3 - nothing else in Eden is
@@ -91,6 +113,26 @@ namespace Eden
         float viscosityCoefficient = 0.5f;
 
         glm::vec3 gravity{ 0.0f, -9.81f, 0.0f };
+
+        // Safety cap on per-particle acceleration magnitude (world units
+        // per second squared) - a defensive stability valve, not a
+        // tuning knob you should normally need to touch. Found necessary
+        // by direct stress-testing: a whole EmitBox lattice landing on a
+        // rigid floor simultaneously is a genuinely extreme initial
+        // condition for an explicit WCSPH solver - many particles in
+        // sudden, correlated contact at once, which the very-stiff Tait
+        // equation (gamma=7 by default) can respond to with a transient
+        // force spike large enough to fling individual particles out at
+        // high velocity even though the bulk density/pressure field
+        // stays reasonable throughout (confirmed by direct
+        // instrumentation - this isn't an unbounded feedback runaway,
+        // it's a bounded-but-large single-substep impulse). Increasing
+        // substeps alone does NOT fix this (also confirmed empirically -
+        // the resulting ejection velocity converged to the same value
+        // across substep counts from 4 to 64), which is what makes this
+        // a force-magnitude problem needing a hard cap, not a resolution
+        // problem substepping already solves elsewhere in this class.
+        float maxAcceleration = 500.0f;
 
         // How many sub-steps Step() divides its incoming fixedDeltaTime
         // into. WCSPH with Tait's equation needs a substantially smaller

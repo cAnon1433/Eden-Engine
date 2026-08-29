@@ -1,0 +1,120 @@
+#version 450
+
+// Density + Tait-EOS pressure, one invocation per particle - GPU mirror
+// of ParticleSystem::ComputeDensityPressure / SPHKernels::Poly6. Walks
+// the same 3x3x3 neighbor-cell window BuildNeighborLists' CPU grid walk
+// does, just against the hash grid built by particle_build_grid.comp
+// instead of a cached flat neighbor list (no equivalent cache here - GPU
+// invocations are cheap enough in parallel that re-walking the 27 cells
+// per particle per pass, three times a substep, is the accepted cost of
+// not maintaining a second GPU-side neighbor-list buffer).
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer PositionsBuffer { vec4 positions[]; };
+layout(std430, binding = 2) buffer DensitiesBuffer { float densities[]; };
+layout(std430, binding = 3) buffer PressuresBuffer { float pressures[]; };
+layout(std430, binding = 5) readonly buffer CellCountsBuffer { uint cellCounts[]; };
+layout(std430, binding = 6) readonly buffer CellBucketsBuffer { uint cellBuckets[]; };
+
+layout(push_constant) uniform SimParams
+{
+    uint particleCount;
+    uint numColliders;
+    uint hashTableSize;
+    uint maxPerCell;
+    float h;
+    float h2;
+    float mass;
+    float restDensity;
+    float stiffness;
+    float gamma;
+    float viscosity;
+    float dt;
+    float cellSize;
+    float particleRadius;
+    float boundaryRestitution;
+    float maxAcceleration;
+    uint maxSweepIterations;
+    float heatDecayRate;      // was _pad0
+    float heatColdMultiplier; // was _pad1
+    float boundaryFriction;   // was _pad2
+    vec4 gravity;
+
+    // Read here too now (see main() below) as well as by
+    // particle_integrate.comp and particle_build_grid.comp - not just
+    // present for layout matching anymore.
+    float voidKillY;
+} sim;
+
+const float PI = 3.14159265358979323846;
+
+// W(r,h) = 315 / (64 * pi * h^9) * (h^2 - r^2)^3, for 0 <= r <= h
+float Poly6(float r, float h)
+{
+    if (r > h)
+    {
+        return 0.0;
+    }
+    float diff = h * h - r * r;
+    float coefficient = 315.0 / (64.0 * PI * pow(h, 9.0));
+    return coefficient * diff * diff * diff;
+}
+
+uint HashCell(ivec3 cell)
+{
+    uint h = (uint(cell.x) * 73856093u) ^ (uint(cell.y) * 19349663u) ^ (uint(cell.z) * 83492791u);
+    return h & (sim.hashTableSize - 1u);
+}
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= sim.particleCount)
+    {
+        return;
+    }
+
+    vec3 pi = positions[i].xyz;
+
+    // Void-killed particles never got inserted into the grid by
+    // particle_build_grid.comp (see that shader's own check), so this
+    // particle would find zero real neighbors regardless - skip the
+    // wasted 27-cell scan entirely rather than paying for a search that
+    // can only come back empty. densities[i] is left at whatever it was
+    // last written - harmless, nothing reads a void particle's density
+    // for anything that matters.
+    if (pi.y < sim.voidKillY)
+    {
+        return;
+    }
+
+    ivec3 cell = ivec3(floor(pi / sim.cellSize));
+
+    float density = 0.0;
+
+    for (int dz = -1; dz <= 1; ++dz)
+    for (int dy = -1; dy <= 1; ++dy)
+    for (int dx = -1; dx <= 1; ++dx)
+    {
+        uint hash = HashCell(cell + ivec3(dx, dy, dz));
+        uint count = min(cellCounts[hash], sim.maxPerCell);
+        uint base = hash * sim.maxPerCell;
+
+        for (uint s = 0u; s < count; ++s)
+        {
+            uint j = cellBuckets[base + s];
+            float r = length(pi - positions[j].xyz);
+            density += sim.mass * Poly6(r, sim.h);
+        }
+    }
+
+    // A particle always sees itself as a neighbor (r=0, Poly6(0,h) != 0)
+    // - correct, standard SPH self-contribution, not double-counting.
+    densities[i] = density;
+
+    // Tait equation of state, clamped non-negative - see ParticleSystem.h's
+    // `stiffness` comment for why (tensile instability otherwise).
+    float ratio = density / sim.restDensity;
+    float pressure = sim.stiffness * (pow(ratio, sim.gamma) - 1.0);
+    pressures[i] = max(0.0, pressure);
+}

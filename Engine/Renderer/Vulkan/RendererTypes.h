@@ -198,4 +198,33 @@ namespace Eden
     // drops instances beyond this cap rather than crashing - see the
     // warning logged there.
     constexpr size_t MAX_INSTANCES_PER_FRAME = 65536;
+
+    // One GPU-generated-geometry indirect draw source - built for
+    // marching-cubes voxel volumes (see Engine/Voxel/VoxelSystemGPU.h),
+    // but not named/typed after voxels specifically: any future compute-
+    // generated mesh source (a different deformable representation, a
+    // procedural generator, etc.) that produces Vertex-formatted data
+    // plus a per-chunk-or-submesh VkDrawIndirectCommand list can reuse
+    // this same struct and the same DrawFrame draw path, rather than
+    // each such system growing its own bespoke Renderer plumbing the way
+    // particles and meshes each did historically (see the render-remodel
+    // conversation this was born from).
+    //
+    // vertexBuffer must have been created with BOTH
+    // VK_BUFFER_USAGE_STORAGE_BUFFER_BIT (so compute can write it) and
+    // VK_BUFFER_USAGE_VERTEX_BUFFER_BIT (so this can bind it at binding
+    // 0 for m_GraphicsPipeline, unmodified - no dedicated voxel pipeline
+    // exists or is needed). indirectBuffer similarly needs
+    // VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT alongside STORAGE_BUFFER_BIT.
+    // instanceBuffer is a plain 1-entry InstanceData vertex buffer (the
+    // source's model matrix/color override) bound at binding 1 - every
+    // draw in one source shares that single instance, unlike the
+    // per-mesh instance GROUPS the ordinary drawList path builds.
+    struct VoxelDrawSource
+    {
+        VkBuffer vertexBuffer = VK_NULL_HANDLE;
+        VkBuffer indirectBuffer = VK_NULL_HANDLE;
+        VkBuffer instanceBuffer = VK_NULL_HANDLE;
+        uint32_t drawCount = 0; // number of VkDrawIndirectCommand entries in indirectBuffer (one per chunk)
+    };
 }

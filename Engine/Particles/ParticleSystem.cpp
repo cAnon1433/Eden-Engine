@@ -236,9 +236,63 @@ namespace Eden
                     glm::vec3 rVec = pi - pj;
                     float r = glm::length(rVec);
 
-                    if (r <= 0.0f || r > smoothingRadius)
+                    if (r > smoothingRadius)
                     {
                         continue;
+                    }
+
+                    // Below this, true separation direction is
+                    // ill-defined (rVec/r is 0/0 at r == 0, and just
+                    // numerically unstable close to it) - falls back to
+                    // a deterministic pseudo-random direction instead of
+                    // silently skipping the pair with zero force. This
+                    // matters: two particles landing at (or extremely
+                    // near) the exact same position, with no force
+                    // pushing them apart, can stay stuck together
+                    // indefinitely - part of how a whole clump could end
+                    // up collapsed onto a single point instead of
+                    // behaving like separate fluid particles (the other,
+                    // larger part of that bug was `particleMass` being
+                    // wildly inconsistent with `restDensity` - see this
+                    // class's comment on particleMass - which meant
+                    // pressure could never build up in the first place;
+                    // this is defense-in-depth on top of that real fix,
+                    // for the genuinely degenerate case, not the primary
+                    // fix itself).
+                    //
+                    // The direction is a hash of the pair, not true
+                    // randomness - keeps the simulation reproducible run
+                    // to run given the same initial state. Built
+                    // antisymmetric on purpose (particle i gets pushed
+                    // one way, particle j gets pushed exactly the
+                    // opposite way): hashing the UNORDERED pair (min,
+                    // max) so both particles compute the identical base
+                    // direction, then flipping its sign based on i/j
+                    // order. A real repulsive force between two
+                    // particles has to be equal and opposite, or their
+                    // shared center of mass would drift for no physical
+                    // reason - same conservation-of-momentum logic as
+                    // any other pairwise force in this solver.
+                    constexpr float kMinSeparation = 1e-4f;
+                    glm::vec3 effectiveRVec = rVec;
+                    float effectiveR = r;
+
+                    if (r < kMinSeparation)
+                    {
+                        uint32_t a = glm::min(static_cast<uint32_t>(i), j);
+                        uint32_t b = glm::max(static_cast<uint32_t>(i), j);
+                        uint32_t hash = a * 73856093u ^ b * 19349663u;
+                        float theta = static_cast<float>(hash % 6283u) / 1000.0f;              // [0, ~2pi)
+                        float z = static_cast<float>((hash / 6283u) % 2000u) / 1000.0f - 1.0f; // [-1, 1)
+                        float ringRadius = glm::sqrt(glm::max(0.0f, 1.0f - z * z));
+                        glm::vec3 direction(ringRadius * glm::cos(theta), ringRadius * glm::sin(theta), z);
+                        if (i > j)
+                        {
+                            direction = -direction;
+                        }
+
+                        effectiveR = kMinSeparation;
+                        effectiveRVec = direction * effectiveR;
                     }
 
                     float rhoJ = m_Particles.densities[j];
@@ -255,13 +309,13 @@ namespace Eden
                     // the more commonly implemented one and matches the
                     // reference this module was built against.
                     float pressureJ = m_Particles.pressures[j];
-                    glm::vec3 gradW = SPH::SpikyGradient(rVec, r, smoothingRadius);
+                    glm::vec3 gradW = SPH::SpikyGradient(effectiveRVec, effectiveR, smoothingRadius);
                     pressureForce -= particleMass * (pressureI + pressureJ) / (2.0f * rhoJ) * gradW;
 
                     // Viscosity force (eq. 14) - diffuses velocity
                     // toward neighbor velocities.
                     const glm::vec3& vj = m_Particles.velocities[j];
-                    float lapW = SPH::ViscosityLaplacian(r, smoothingRadius);
+                    float lapW = SPH::ViscosityLaplacian(effectiveR, smoothingRadius);
                     viscosityForce += particleMass * (vj - vi) / rhoJ * lapW;
                 }
 
@@ -294,6 +348,19 @@ namespace Eden
                 // rearranged with density standing in for a per-particle
                 // "how much stuff is actually here" term.
                 acceleration += m_Particles.forces[i] / density;
+            }
+
+            // Safety valve - see maxAcceleration's comment in
+            // ParticleSystem.h for why this exists and what it's
+            // actually guarding against (a bounded-but-large transient
+            // impulse at simultaneous multi-particle contact, not an
+            // unbounded runaway). Only rescales direction-preserving
+            // when the cap is actually exceeded - normal dynamics well
+            // under the cap are completely unaffected.
+            float accelMagnitude = glm::length(acceleration);
+            if (accelMagnitude > maxAcceleration)
+            {
+                acceleration *= maxAcceleration / accelMagnitude;
             }
 
             m_Particles.velocities[i] += acceleration * dt;
@@ -382,6 +449,26 @@ namespace Eden
                     {
                         float safeStep = remaining;
 
+                        // Tracks whether a COLLIDER actually constrained
+                        // safeStep this iteration, as opposed to safeStep
+                        // just staying at its initial `remaining` value
+                        // because nothing nearby reduced it. This
+                        // distinction is the fix for a real bug found by
+                        // direct testing: without it, the check below
+                        // ("is safeStep small enough to call this a hit")
+                        // can't tell "small because a surface is right
+                        // there" apart from "small because there simply
+                        // wasn't much travel budget left this substep" -
+                        // the latter happens constantly for ordinary
+                        // slow-moving particles (their whole per-substep
+                        // displacement is often well under kSurfaceEpsilon
+                        // on its own) and, before this fix, was being
+                        // misread as "hit a surface" regardless of
+                        // whether any collider was actually nearby -
+                        // freezing particles or falsely triggering the
+                        // velocity kill below for no physical reason.
+                        bool constrainedByCollider = false;
+
                         for (const ColliderInfo& c : colliders)
                         {
                             glm::vec3 local = SDF::WorldToLocal(position, *c.transform, c.scaledCollider);
@@ -390,14 +477,24 @@ namespace Eden
                             if (distanceToSurface < safeStep)
                             {
                                 safeStep = distanceToSurface;
+                                constrainedByCollider = true;
                             }
                         }
 
-                        if (safeStep <= kSurfaceEpsilon)
+                        if (constrainedByCollider && safeStep <= kSurfaceEpsilon)
                         {
                             hitSomething = true;
                             break;
                         }
+
+                        // Defensive clamp: safeStep can only be negative
+                        // here if a collider constrained it below zero
+                        // (already-penetrating at the START of this
+                        // substep's sweep) without that also tripping the
+                        // kSurfaceEpsilon check above, which shouldn't
+                        // happen given kSurfaceEpsilon > 0, but costs
+                        // nothing to guard against a negative advance.
+                        safeStep = glm::max(safeStep, 0.0f);
 
                         position += travelDir * safeStep;
                         remaining -= safeStep;

@@ -9,6 +9,8 @@
 #include "../ECS/Components/RotationSpeedComponent.h"
 #include "../Physics/RigidBodyComponent.h"
 #include "../Physics/ColliderComponent.h"
+#include "../Voxel/VoxelSystemGPU.h" // pulls in VoxelTypes.h + VoxelField.h transitively
+#include "../Renderer/Raymarch/RaymarchSystem.h"
 
 #include <imgui.h>
 
@@ -54,6 +56,25 @@ namespace Eden::UI
 
         bool s_AddCollider = false;
         int s_NewColliderShape = static_cast<int>(ColliderShape::Sphere);
+
+        // --- Raymarch box creation state ---
+        // Separate from the MeshComponent cube's s_NewCubeSize (raymarch
+        // boxes take a half-extents vector, not a single side length) and
+        // from s_AddColor (RaymarchVolumeComponent's tint is unconditional,
+        // not an optional override like ColorComponent).
+        glm::vec3 s_NewRaymarchHalfExtents{ 0.5f, 0.5f, 0.5f };
+        glm::vec3 s_NewRaymarchTint{ 1.0f, 0.5f, 0.2f };
+        // Mirrors main.cpp's RaymarchBoxCollision enum (None / Voxel /
+        // AnalyticBox) - see that enum's comment for why this isn't a
+        // plain bool. Kept as an int + string table here rather than
+        // pulling the enum itself in, since it's a Source/main.cpp-local
+        // type this module has no header to include. Defaults to 1
+        // (Voxel), matching RaymarchBoxCollision::Voxel's own comment on
+        // why it's the project-wide default for anything raymarched -
+        // real narrow-phase support in both CollisionSystem and
+        // ParticleSystemGPU, and collision automatically tracks this
+        // box's live shape if it's ever carved/melted/reformed.
+        int s_NewRaymarchCollision = 1; // 0=None, 1=Voxel, 2=AnalyticBox
 
         // --- Inspector state ---
         // Which entity (if any) the "Entities" list has selected for
@@ -102,7 +123,69 @@ namespace Eden::UI
             }
         }
 
-        void DrawCreationPanel(Registry& registry, Renderer& renderer)
+        // Editor-side twin of main.cpp's local SpawnRaymarchBox (see that
+        // function's comments for the full rationale on field margin,
+        // collision strategy, and the AnalyticBox-vs-Voxel tradeoff) -
+        // duplicated rather than shared because main.cpp's version is
+        // anonymous-namespace-local to that translation unit. If this
+        // drifts out of sync with main.cpp's version, that's the known
+        // cost of the duplication; worth factoring into a shared header
+        // if a third call site ever needs it.
+        //
+        // collisionMode: 0=None, 1=Voxel, 2=AnalyticBox - see
+        // s_NewRaymarchCollision's comment above for why this is an int
+        // rather than main.cpp's RaymarchBoxCollision enum.
+        Entity SpawnRaymarchBoxFromEditor(Registry& registry, VoxelSystemGPU& voxelSystem,
+                                           const glm::vec3& worldCenter, const glm::vec3& halfExtents,
+                                           const glm::vec3& tintColor, int collisionMode)
+        {
+            constexpr float kFieldMargin = 0.2f;
+            glm::vec3 fieldHalfExtents = halfExtents + glm::vec3(kFieldMargin);
+
+            VoxelVolumeDesc desc;
+            desc.origin = worldCenter - fieldHalfExtents;
+            desc.voxelSize = 0.08f;
+            desc.chunkDims = glm::ivec3(2, 2, 2);
+            VoxelVolumeHandle handle = voxelSystem.RegisterVolume(desc);
+
+            glm::vec3 fieldExtent = glm::vec3(desc.VoxelDims()) * desc.voxelSize;
+            glm::vec3 fieldLocalCenter = fieldExtent * 0.5f;
+            voxelSystem.SeedBox(handle, fieldLocalCenter, halfExtents);
+
+            Entity e = registry.CreateEntity();
+
+            TransformComponent transform;
+            transform.position = worldCenter;
+            registry.AddComponent(e, transform);
+
+            registry.AddComponent(e, VoxelVolumeComponent{ handle });
+            registry.AddComponent(e, RaymarchVolumeComponent{ tintColor });
+
+            if (collisionMode != 0) // not None
+            {
+                RigidBodyComponent body;
+                body.type = BodyType::Static;
+                body.inverseMass = 0.0f;
+                registry.AddComponent(e, body);
+
+                ColliderComponent collider;
+                collider.halfExtents = halfExtents;
+                if (collisionMode == 1) // Voxel
+                {
+                    collider.shape = ColliderShape::Voxel;
+                    collider.voxelVolume = handle;
+                }
+                else // AnalyticBox
+                {
+                    collider.shape = ColliderShape::Box;
+                }
+                registry.AddComponent(e, collider);
+            }
+
+            return e;
+        }
+
+        void DrawCreationPanel(Registry& registry, Renderer& renderer, VoxelSystemGPU& voxelSystem)
         {
             ImGui::Text("Create");
             ImGui::Separator();
@@ -184,6 +267,26 @@ namespace Eden::UI
             }
 
             ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Text("Raymarch box (SDF, no texture support)");
+            ImGui::DragFloat3("Half Extents##raymarch", &s_NewRaymarchHalfExtents.x, 0.02f, 0.05f, 20.0f);
+            ImGui::ColorEdit3("Tint##raymarch", &s_NewRaymarchTint.x);
+            const char* collisionNames[] = { "None", "Voxel (default - tracks live shape, SPH-safe)", "Analytic Box (static geometry only)" };
+            ImGui::Combo("Collision##raymarch", &s_NewRaymarchCollision, collisionNames, IM_ARRAYSIZE(collisionNames));
+            ImGui::TextDisabled("Uses Position above, not Scale (Scale only applies to MeshComponent cubes).");
+            if (ImGui::Button("Create Raymarch Box"))
+            {
+                SpawnRaymarchBoxFromEditor(registry, voxelSystem, s_NewPosition, s_NewRaymarchHalfExtents,
+                                            s_NewRaymarchTint, s_NewRaymarchCollision);
+                // Deliberately does NOT call ApplyOptionalCreationComponents -
+                // RaymarchVolumeComponent already carries its own tint (no
+                // ColorComponent needed) and SpawnRaymarchBoxFromEditor
+                // already adds RigidBody+Collider when collision is
+                // requested; running the optional-components block on top
+                // would risk a second, conflicting ColliderComponent.
+            }
+
+            ImGui::Spacing();
             ImGui::InputText("Texture path", s_TexturePathBuffer, sizeof(s_TexturePathBuffer));
             ImGui::SameLine();
             if (ImGui::Button("Create Textured Cube"))
@@ -251,7 +354,7 @@ namespace Eden::UI
             }
         }
 
-        void DrawEntityList(Registry& registry)
+        void DrawEntityList(Registry& registry, VoxelSystemGPU& voxelSystem)
         {
             ImGui::Spacing();
             ImGui::Spacing();
@@ -264,13 +367,22 @@ namespace Eden::UI
             // returns a plain vector<Entity> (not a live iterator into
             // storage), so this is safe by construction rather than by
             // luck. See Registry::View's own comment for why.
-            for (Entity entity : registry.View<MeshComponent>())
+            //
+            // Two separate View() calls (MeshComponent, then
+            // VoxelVolumeComponent) rather than one combined query -
+            // MeshComponent and VoxelVolumeComponent entities are
+            // mutually exclusive in practice (nothing in this panel
+            // creates both on the same entity), and this keeps each list
+            // a flat, ordinary View() the same way DrawEntityList always
+            // worked, rather than introducing an either/or query type
+            // just for this listing.
+            auto drawEntityRow = [&](Entity entity, const char* fallbackPrefix)
             {
                 ImGui::PushID(static_cast<int>(GetEntityIndex(entity)));
 
                 std::string label = registry.HasComponent<NameComponent>(entity)
                     ? registry.GetComponent<NameComponent>(entity).name
-                    : "Entity " + std::to_string(GetEntityIndex(entity));
+                    : std::string(fallbackPrefix) + std::to_string(GetEntityIndex(entity));
 
                 bool isSelected = (entity == s_SelectedEntity);
                 if (ImGui::Selectable(label.c_str(), isSelected))
@@ -285,10 +397,29 @@ namespace Eden::UI
                     {
                         s_SelectedEntity = NullEntity;
                     }
+
+                    // Free the GPU/CPU-side volume BEFORE dropping the
+                    // ECS side - this used to be the actual live leak
+                    // (see UnregisterVolume's header comment): clicking
+                    // Destroy here removed the entity but nothing ever
+                    // freed the VoxelSystemGPU volume it pointed at.
+                    if (registry.HasComponent<VoxelVolumeComponent>(entity))
+                    {
+                        voxelSystem.UnregisterVolume(registry.GetComponent<VoxelVolumeComponent>(entity).handle);
+                    }
                     registry.DestroyEntity(entity);
                 }
 
                 ImGui::PopID();
+            };
+
+            for (Entity entity : registry.View<MeshComponent>())
+            {
+                drawEntityRow(entity, "Entity ");
+            }
+            for (Entity entity : registry.View<VoxelVolumeComponent>())
+            {
+                drawEntityRow(entity, "Raymarch Box ");
             }
         }
 
@@ -349,6 +480,19 @@ namespace Eden::UI
                 ImGui::DragFloat3("Position##inspector", &transform.position.x, 0.1f);
                 ImGui::DragFloat3("Rotation (deg)##inspector", &transform.rotationDegrees.x, 1.0f);
                 ImGui::DragFloat3("Scale##inspector", &transform.scale.x, 0.05f, 0.01f, 100.0f);
+            }
+
+            // Not routed through DrawOptionalComponentRow like the
+            // components below - RaymarchVolumeComponent is mandatory on
+            // any entity that has it (RaymarchSystem's own comment: "a
+            // RaymarchVolumeComponent entity always has a color", no
+            // fallback), so offering a "Remove" button here would let the
+            // inspector put a raymarch box into a state RaymarchSystem
+            // doesn't expect. Just an unconditional tint edit when present.
+            if (registry.HasComponent<RaymarchVolumeComponent>(s_SelectedEntity))
+            {
+                auto& raymarch = registry.GetComponent<RaymarchVolumeComponent>(s_SelectedEntity);
+                ImGui::ColorEdit3("Raymarch Tint##inspector", &raymarch.tintColor.x);
             }
 
             ImGui::Spacing();
@@ -483,12 +627,12 @@ namespace Eden::UI
         }
     }
 
-    void DrawMeshPanel(Registry& registry, Renderer& renderer)
+    void DrawMeshPanel(Registry& registry, Renderer& renderer, VoxelSystemGPU& voxelSystem)
     {
         ImGui::Begin("Eden - Mesh Editor");
 
-        DrawCreationPanel(registry, renderer);
-        DrawEntityList(registry);
+        DrawCreationPanel(registry, renderer, voxelSystem);
+        DrawEntityList(registry, voxelSystem);
         DrawInspector(registry);
 
         ImGui::End();
@@ -586,6 +730,23 @@ namespace Eden::UI
         ImGui::SliderInt("Max Sweep Iterations##part", &particleSystem.maxSweepIterations, 1, 32);
         ImGui::TextDisabled("Sweep (tunnelling fix) only runs for particles moving faster than Boundary Radius per substep.");
         ImGui::TextDisabled("Particles are deflected by any TransformComponent + ColliderComponent entity; no force is applied back onto it yet.");
+
+        ImGui::End();
+    }
+
+    void DrawRendererSettingsPanel(Renderer& renderer)
+    {
+        ImGui::Begin("Eden - Rendering / Culling");
+
+        ImGui::Checkbox("Occlusion Culling##render", &renderer.EnableOcclusionCulling);
+        ImGui::TextDisabled("Frustum culling always runs; this adds a second, coarse CPU pass on top of it.");
+
+        ImGui::SliderInt("Min Occluder Footprint (cells)##render", &renderer.MinOccluderFootprintCells, 1, 64);
+        ImGui::TextDisabled("How big (in the occlusion grid) an object's silhouette must be before it's used to hide OTHER objects.");
+        ImGui::TextDisabled("Every object is still tested against occluders regardless of its own size - this only controls who contributes depth.");
+
+        ImGui::TextDisabled("Occluders use bounding BOXES, not exact shapes - a rotated or non-box object's box can be");
+        ImGui::TextDisabled("bigger than what it actually blocks. If something visible seems to vanish, try toggling this off first.");
 
         ImGui::End();
     }

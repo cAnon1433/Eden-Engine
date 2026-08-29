@@ -15,6 +15,8 @@
 #include "Vulkan/Resources/Mesh.h"
 #include "Camera.h"
 #include "Frustum.h"
+#include "SoftwareOcclusionBuffer.h"
+#include "Raymarch/RaymarchTypes.h"
 
 #include <array>
 #include <string>
@@ -51,7 +53,79 @@ namespace Eden
         // application-level concern (see Engine/UI/EdenUI.h for Eden's
         // actual mesh create/destroy panel, wired in from main.cpp).
         // Left empty, no UI renders - existing call sites need no changes.
-        void DrawFrame(const std::vector<DrawCommand>& drawList, const std::function<void()>& buildUI = {});
+        //
+        // recordComputeWork, if provided, is invoked with this frame's
+        // command buffer right after it enters the recording state and
+        // BEFORE vkCmdBeginRenderPass - compute dispatches can't happen
+        // inside a render pass, and this is the one point in DrawFrame
+        // where the command buffer is open but nothing else has been
+        // recorded into it yet. Built for ParticleSystemGPU::
+        // RecordPendingSteps (pass `[&](VkCommandBuffer cmd){
+        // particleSystem.RecordPendingSteps(cmd); }`), but not coupled
+        // to that class specifically - any compute work a caller wants
+        // folded into this frame's single submission can go through
+        // here. If provided, DrawFrame inserts one memory barrier
+        // (compute-shader-write -> vertex-shader-read) right after the
+        // callback returns, before the render pass begins - see
+        // particleGPUCount below for why vertex-shader-read is the
+        // relevant destination stage.
+        //
+        // particleGPUCount, if nonzero, draws that many points using
+        // RegisterParticleGPUSource's storage buffer directly (see that
+        // method) - a second, independent particle path alongside the
+        // ECS/CPU-particle drawList above, not a replacement for it.
+        // voxelSources, if non-empty, draws each entry via
+        // vkCmdDrawIndirect against m_GraphicsPipeline (same pipeline as
+        // the ordinary drawList mesh loop - see VoxelDrawSource's own
+        // comment in RendererTypes.h for why no dedicated pipeline is
+        // needed). Entirely separate draw path from drawList/
+        // particleGPUCount, same "own section, own loop" treatment
+        // particleGPUCount already gets below.
+        // raymarchObjects, if non-empty, sphere-traces each entry as a
+        // fullscreen pass AFTER the ordinary mesh/voxel draws above
+        // (same render pass, same depth buffer - see
+        // m_RaymarchPipeline's comment for why depth write stays on).
+        // raymarchDensityBuffer is the ONE GPU buffer every object in
+        // raymarchObjects samples from - each object finds its own
+        // region within it via RaymarchObjectGPU::densityOffset (see
+        // RaymarchSystem::BuildObjectList, which builds both, and
+        // VoxelSystemGPU::m_SharedDensityBuffer's comment for why every
+        // volume now shares one buffer instead of each having its own).
+        // A single VkBuffer, not a per-object vector, since that's the
+        // whole point of this design - see RaymarchTypes.h's
+        // kRaymarchMaxObjects comment for why an earlier per-object-
+        // buffer version hit MoltenVK's descriptor-count ceiling.
+        void DrawFrame(const std::vector<DrawCommand>& drawList, const std::function<void()>& buildUI = {},
+                        const std::function<void(VkCommandBuffer)>& recordComputeWork = {},
+                        uint32_t particleGPUCount = 0,
+                        const std::vector<VoxelDrawSource>& voxelSources = {},
+                        const std::vector<RaymarchObjectGPU>& raymarchObjects = {},
+                        VkBuffer raymarchDensityBuffer = VK_NULL_HANDLE);
+
+        // One-time registration (call once after the source's position
+        // buffer is created and stable - see ParticleSystemGPU::Init/
+        // GetPositionBuffer) of a GPU-resident particle source to draw
+        // directly from, with zero CPU readback: builds the dedicated
+        // pipeline/layout/descriptor set that let particle_point_gpu.vert
+        // read `positionBuffer` straight from the vertex shader, indexed
+        // by gl_InstanceIndex - see that shader's file comment. Safe to
+        // call only once; the position buffer must not be recreated
+        // afterward (it's baked into a descriptor set here, which isn't
+        // automatically kept in sync with a buffer handle changing).
+        void RegisterParticleGPUSource(VkBuffer positionBuffer);
+
+        // Raw handle accessors - needed by ParticleSystemGPU::Init (which
+        // owns its own Vulkan resources, outside Renderer's normal mesh/
+        // texture registries, so it needs to allocate against the same
+        // device/allocator/command pool Renderer itself uses rather than
+        // Renderer owning it directly). Not meant for general use -
+        // reach for CreateMesh/CreateTexture/etc. above for anything
+        // that fits Renderer's existing resource-registry pattern.
+        VkDevice GetDevice() { return m_Context.Device().Get(); }
+        VkPhysicalDevice GetPhysicalDevice() { return m_Context.PhysicalDevice().Get(); }
+        VmaAllocator GetAllocator() const { return m_Allocator.Get(); }
+        VkCommandPool GetCommandPool() const { return m_CommandPool.Get(); }
+        VkQueue GetGraphicsQueue() { return m_Context.Device().GetGraphicsQueue(); }
 
         // Call from the GLFW framebuffer-resize callback.
         void NotifyFramebufferResized() { m_FramebufferResized = true; }
@@ -139,7 +213,61 @@ namespace Eden
         // stiffness, etc.), which are public fields for the same reason:
         // they're meant to be live-tweaked from a UI panel, not
         // encapsulated behind getter/setter ceremony.
-        float ParticlePointSize = 6.0f;
+        float ParticlePointSize = 16.0f;
+
+        // Flat debug-viz color for GPU-resident particles (see
+        // RegisterParticleGPUSource / DrawFrame's particleGPUCount) -
+        // same default as ParticleSystem::BuildDrawList's colorOverride
+        // for the CPU path. Not a per-call parameter the way the CPU
+        // path's is, since DrawFrame's particleGPUCount is just a count,
+        // not a list of per-particle draw data - public and mutable for
+        // the same live-tweak-from-UI reasoning as ParticlePointSize.
+        glm::vec4 ParticleGPUColor{ 0.2f, 0.5f, 1.0f, 1.0f };
+
+        // CPU software occlusion buffer, cleared and repopulated fresh
+        // every frame by RenderSystem::BuildDrawList - see
+        // SoftwareOcclusionBuffer.h for the technique. Owned by Renderer
+        // for the same reason Camera/Frustum are: it's part of "what's
+        // actually visible this frame" state, which is a rendering
+        // concern independent of any single call site. Resized once in
+        // Init() and reused every frame after that (no per-frame
+        // reallocation - only Clear()'d).
+        //
+        // COARSE, AABB-BASED - a real tradeoff worth knowing, not a
+        // hidden limitation: occluders are tested/rasterized as their
+        // world-space bounding boxes, not their exact triangle
+        // silhouettes. For an axis-aligned, box-shaped occluder this is
+        // exact; for a ROTATED or non-box-shaped one, the AABB can be
+        // noticeably larger than what's actually opaque on screen,
+        // which means something genuinely visible through a gap near
+        // such an occluder could, in principle, get wrongly culled.
+        // Standard, accepted tradeoff for this class of technique - the
+        // fix, if it's ever visibly wrong, is either restricting what
+        // qualifies as an occluder (see MinOccluderFootprintCells) or a
+        // real triangle-rasterization version, not a quick patch here.
+        SoftwareOcclusionBuffer& GetOcclusionBuffer() { return m_OcclusionBuffer; }
+
+        // Master on/off switch - RenderSystem::BuildDrawList checks this
+        // and skips the whole occlusion pass (falling back to frustum-
+        // culling-only) when false. Useful for A/B-testing whether
+        // occlusion culling is actually helping in a given scene, or for
+        // diagnosing a suspected false-cull (see GetOcclusionBuffer's
+        // comment on the AABB tradeoff) by turning it off and confirming
+        // the "missing" object reappears.
+        bool EnableOcclusionCulling = true;
+
+        // Minimum screen-space footprint (in occlusion-buffer grid
+        // cells) an entity's bounding box needs to cover before it's
+        // considered worth rasterizing as an occluder for OTHER entities
+        // to be tested against. Small/distant objects are skipped as
+        // occluder sources - not because they can't occlude anything in
+        // principle, but because their contribution is negligible and
+        // testing+rasterizing every tiny far-away object for little
+        // benefit defeats the point of a performance optimization. Every
+        // entity still gets TESTED against the buffer regardless of its
+        // own size - this only controls who gets to contribute depth,
+        // not who gets checked against it.
+        int MinOccluderFootprintCells = 9; // roughly a 3x3 cell area
 
     private:
         void RecreateSwapchainResources();
@@ -148,14 +276,12 @@ namespace Eden
         void CreateRenderFinishedSemaphores();
         void InitImGui();
         void ShutdownImGui();
-
         // Maps a (possibly InvalidTextureHandle) TextureHandle to the
         // actual descriptor set to bind - resolving InvalidTextureHandle
         // to the default white texture happens here, once, so
         // CreateMesh/CreateCubeMesh/CreateIndexedMesh don't each need
         // their own copy of that fallback logic.
         VkDescriptorSet ResolveTextureDescriptorSet(TextureHandle texture) const;
-
     private:
         GLFWwindow* m_Window = nullptr;
 
@@ -166,6 +292,23 @@ namespace Eden
         VulkanDescriptorPool m_DescriptorPool;
         VulkanPipelineLayout m_PipelineLayout;
         VulkanGraphicsPipeline m_GraphicsPipeline;
+        // Same shaders/layout/vertex-input as m_GraphicsPipeline, only
+        // difference is cullMode=NONE instead of BACK_BIT - used
+        // exclusively for voxel/marching-cubes meshes (see
+        // VoxelSystemGPU's draw path in DrawFrame), so that a rare
+        // marching-cubes topology gap (see VoxelSystemGPU.cpp's notes on
+        // the open ambiguous-face crack issue) shows the mesh's own far
+        // interior wall through the gap instead of the skybox straight
+        // through to nothing - a cheap visual stopgap, not a fix for the
+        // gap itself. Deliberately its OWN pipeline object rather than
+        // flipping m_GraphicsPipeline's cullMode globally, so ordinary
+        // (non-voxel) meshes keep normal backface culling and its
+        // performance benefit untouched. Extra cost versus a culled
+        // pipeline is occasional back-face overdraw on voxel/terrain
+        // meshes specifically (mostly absorbed by early depth testing
+        // on solid closed geometry) - NOT a second draw call or a
+        // second pass over the scene.
+        VulkanGraphicsPipeline m_VoxelPipeline;
         // Second pipeline, same VkPipelineLayout/render pass/vertex input
         // description as m_GraphicsPipeline (see CreateParticlePointResources
         // in Renderer.cpp) but VK_PRIMITIVE_TOPOLOGY_POINT_LIST topology and
@@ -174,6 +317,106 @@ namespace Eden
         // each mesh's draw call (see the per-mesh loop there).
         VulkanGraphicsPipeline m_ParticlePointsPipeline;
         MeshHandle m_ParticlePointMeshHandle = InvalidMeshHandle;
+
+        // --- GPU-resident particle rendering (see RegisterParticleGPUSource) ---
+        // Separate pipeline/layout/descriptor-set trio from
+        // m_ParticlePointsPipeline above: that one draws the CPU
+        // ParticleSystem's positions via the normal instanced-draw path
+        // (InstanceData per particle, built by ParticleSystem::
+        // BuildDrawList). This one draws directly from a compute-owned
+        // storage buffer with NO per-instance vertex data at all - see
+        // particle_point_gpu.vert. Only valid (non-VK_NULL_HANDLE) after
+        // RegisterParticleGPUSource has been called.
+        VkDescriptorSetLayout m_ParticleGPUSetLayout = VK_NULL_HANDLE;
+        VulkanPipelineLayout m_ParticleGPUPipelineLayout;
+        VulkanGraphicsPipeline m_ParticlePointsGPUPipeline;
+        VulkanDescriptorPool m_ParticleGPUDescriptorPool;
+        VkDescriptorSet m_ParticleGPUStorageSet = VK_NULL_HANDLE;
+
+        // --- Raymarch pass (see Raymarch/RaymarchSystem.h) -------------
+        // Fullscreen-triangle pipeline, no vertex/instance input (see
+        // raymarch.vert - vertices are generated from gl_VertexIndex),
+        // cullMode=NONE (a fullscreen triangle has no "back face" to
+        // cull), depth test+write ON so raymarched hits correctly
+        // occlude/are-occluded-by rasterized terrain drawn earlier in
+        // the same render pass (see DrawFrame's raymarch section).
+        // Set 0 reuses m_DescriptorSetLayout (camera UBO) exactly like
+        // m_ParticleGPUPipelineLayout does. Set 1 is m_RaymarchSetLayout
+        // below - one RaymarchObjectGPU array (binding 0) + ONE shared
+        // density buffer (binding 1). Both bindings are ordinary,
+        // fixed-count (descriptorCount=1) storage buffers - NOT
+        // bindless/descriptor-indexed. An earlier version of this pass
+        // tried true bindless (one descriptor per object, later an
+        // unbounded array via descriptor indexing + update-after-bind)
+        // specifically to get past MoltenVK's
+        // maxPerStageDescriptorStorageBuffers=31 ceiling, and hit
+        // confirmed dead ends on this project's actual dev hardware at
+        // every step, ending with vkGetDescriptorSetLayoutSupport
+        // reporting the required layout as unsupported outright,
+        // independent of descriptor count (see RaymarchTypes.h's
+        // kRaymarchMaxObjects comment for the full history). The actual
+        // fix doesn't touch descriptor count at all: every raymarch
+        // object's density data now lives in ONE shared buffer
+        // (VoxelSystemGPU::m_SharedDensityBuffer), with each object
+        // finding its own region within it via
+        // RaymarchObjectGPU::densityOffset - so binding 1 only ever
+        // needs to be ONE descriptor, however many objects exist. This
+        // is portable by construction (Vulkan 1.0-guaranteed-minimum
+        // storage-buffer limits only - every conformant implementation
+        // supports far more than the 2 this pass needs), not just a
+        // MoltenVK-specific workaround.
+        VkDescriptorSetLayout m_RaymarchSetLayout = VK_NULL_HANDLE;
+        VulkanPipelineLayout m_RaymarchPipelineLayout;
+        VulkanGraphicsPipeline m_RaymarchPipeline;
+        // Plain handle, not VulkanDescriptorPool - created/destroyed
+        // directly in InitRaymarchPass/the renderer's teardown path.
+        // (Was briefly a VulkanDescriptorPool, then briefly needed
+        // VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT for the
+        // bindless attempt mentioned above - neither is true anymore,
+        // this is back to an ordinary pool, just not routed through
+        // that shared wrapper since InitRaymarchPass also needs direct
+        // vkAllocateDescriptorSets control.)
+        VkDescriptorPool m_RaymarchDescriptorPool = VK_NULL_HANDLE;
+
+        // One set/buffer per frame-in-flight, NOT a single shared one -
+        // this used to be a single VkDescriptorSet/VulkanBuffer, which
+        // was a real, confirmed bug: UpdateRaymarchDescriptors
+        // vkUpdateDescriptorSets's this set's bindings every frame
+        // (raymarch objects can change every frame), but with
+        // MAX_FRAMES_IN_FLIGHT=2, that update could race a PREVIOUS
+        // frame's command buffer that was still pending on the GPU and
+        // still referenced the old contents - exactly the Vulkan
+        // validation error class this caused ("VkDescriptorSet ... is
+        // in use by VkCommandBuffer ... only possible with
+        // VK_EXT_descriptor_indexing"), which then cascaded into
+        // unrelated-looking validation failures on nearby draw calls
+        // and eventually a lost device. Same fix shape as
+        // FrameContext's own descriptorSet/uniformBuffer - indexed by
+        // m_CurrentFrame, exactly like those.
+        std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> m_RaymarchSets{};
+
+        // Rewritten every frame from raymarchObjects (see DrawFrame) -
+        // host-visible + persistently mapped, same reasoning as
+        // VoxelSystemGPU::Volume::instance: small, written every frame,
+        // not worth a staging round trip. Per-frame array for the same
+        // reason m_RaymarchSets above is - a single shared buffer being
+        // memcpy'd into while a previous frame's GPU work might still
+        // be reading it is the same race, even though it doesn't trip
+        // this specific validation layer check the descriptor set does.
+        std::array<VulkanBuffer, MAX_FRAMES_IN_FLIGHT> m_RaymarchObjectBuffers;
+        std::array<void*, MAX_FRAMES_IN_FLIGHT> m_RaymarchObjectBuffersMapped{};
+
+        void InitRaymarchPass();
+        // densityBuffer: the ONE shared buffer every live raymarch
+        // object samples from this frame (see m_RaymarchSetLayout's
+        // comment above) - VK_NULL_HANDLE is valid (no raymarch objects
+        // this frame; DrawFrame only calls this when raymarchObjects is
+        // non-empty, but this function handles the null case
+        // defensively regardless).
+        void UpdateRaymarchDescriptors(const std::vector<RaymarchObjectGPU>& objects,
+                                        VkBuffer densityBuffer);
+
+        SoftwareOcclusionBuffer m_OcclusionBuffer;
         VulkanCommandPool m_CommandPool;
         VulkanMemoryAllocator m_Allocator;
         VulkanImage m_DepthImage;

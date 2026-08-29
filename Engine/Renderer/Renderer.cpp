@@ -17,6 +17,7 @@
 #include <cstring>
 #include <cctype>
 #include <iostream>
+#include <array>
 
 namespace Eden
 {
@@ -78,6 +79,22 @@ namespace Eden
             bindingDescriptions,
             attributeDescriptions);
 
+        // Same shaders/layout/vertex-input as m_GraphicsPipeline - only
+        // cullMode differs (NONE instead of the default BACK_BIT). See
+        // m_VoxelPipeline's own comment in Renderer.h for why this
+        // exists as a separate pipeline object rather than a global
+        // culling change.
+        m_VoxelPipeline.Init(
+            m_Context.Device().Get(),
+            m_RenderPass.Get(),
+            m_PipelineLayout.Get(),
+            "Shaders/Compiled/triangle.vert.spv",
+            "Shaders/Compiled/triangle.frag.spv",
+            bindingDescriptions,
+            attributeDescriptions,
+            VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+            VK_CULL_MODE_NONE);
+
         // Same pipeline layout, render pass, and vertex/instance input
         // description as m_GraphicsPipeline above - only the shader
         // modules and topology differ. This is what actually lets
@@ -100,6 +117,11 @@ namespace Eden
             VK_PRIMITIVE_TOPOLOGY_POINT_LIST);
 
         m_CommandPool.Init(m_Context.Device().Get(), m_Context.PhysicalDevice().GetQueueFamilies().graphicsFamily.value());
+
+        // Needs m_CommandPool (for the dummy density buffer's - none
+        // actually needed, host-visible init only) and m_Allocator,
+        // both already initialized above by this point.
+        InitRaymarchPass();
 
         // Default/fallback texture - a single white pixel, bound to any
         // mesh created without an explicit TextureHandle so the shader's
@@ -137,6 +159,15 @@ namespace Eden
             m_ParticlePointMeshHandle = CreateMesh({ originVertex });
         }
 
+        // Deliberately low resolution - see SoftwareOcclusionBuffer.h's
+        // class comment on why this is a coarse conservative test, not a
+        // second real depth buffer. 16:9-ish aspect independent of the
+        // actual window/swapchain size (this buffer's grid mapping is
+        // NDC-based, see ProjectAabb, so it works for any actual
+        // viewport aspect - this resolution choice is just "how many
+        // samples," not tied to matching pixels 1:1 with anything).
+        m_OcclusionBuffer.Resize(160, 90);
+
         for (auto& frame : m_Frames)
         {
             frame.Init(m_Context.Device().Get(), m_CommandPool.Get(), m_Allocator.Get(),
@@ -148,6 +179,270 @@ namespace Eden
         m_Camera.Position = glm::vec3(0.0f, 0.5f, 3.0f);
 
         InitImGui();
+    }
+
+    void Renderer::RegisterParticleGPUSource(VkBuffer positionBuffer)
+    {
+        VkDevice device = m_Context.Device().Get();
+
+        // Single binding: the compute-owned positions storage buffer,
+        // read-only from the vertex stage - see particle_point_gpu.vert.
+        VkDescriptorSetLayoutBinding storageBinding{};
+        storageBinding.binding = 0;
+        storageBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        storageBinding.descriptorCount = 1;
+        storageBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+
+        VkDescriptorSetLayoutCreateInfo layoutInfo{};
+        layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        layoutInfo.bindingCount = 1;
+        layoutInfo.pBindings = &storageBinding;
+
+        if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &m_ParticleGPUSetLayout) != VK_SUCCESS)
+        {
+            throw std::runtime_error("Eden: failed to create particle-GPU descriptor set layout");
+        }
+
+        // Dedicated tiny pool - one set, one binding - rather than
+        // resizing m_DescriptorPool (which is sized exactly for the
+        // camera-UBO/texture sets already allocated by the time this
+        // runs). See VulkanDescriptorPool's own comment on why pool
+        // sizing is caller-specified rather than hardcoded.
+        std::vector<VkDescriptorPoolSize> poolSizes = { { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1 } };
+        m_ParticleGPUDescriptorPool.Init(device, poolSizes, 1);
+        m_ParticleGPUStorageSet = m_ParticleGPUDescriptorPool.AllocateSet(m_ParticleGPUSetLayout);
+
+        VkDescriptorBufferInfo bufferInfo{ positionBuffer, 0, VK_WHOLE_SIZE };
+        VkWriteDescriptorSet write{};
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet = m_ParticleGPUStorageSet;
+        write.dstBinding = 0;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        write.pBufferInfo = &bufferInfo;
+        vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+
+        // Set 0 = camera UBO (REUSES m_DescriptorSetLayout - the exact
+        // same VkDescriptorSetLayout object m_PipelineLayout's set 0
+        // already uses, which is what makes frame.descriptorSet, bound
+        // every frame for the ordinary mesh draws, ALSO valid to bind
+        // against this different pipeline layout at set 0 - see
+        // DrawFrame). Set 1 = the storage buffer above.
+        VkPushConstantRange colorPushConstant{};
+        colorPushConstant.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+        colorPushConstant.offset = 0;
+        colorPushConstant.size = sizeof(glm::vec4);
+
+        m_ParticleGPUPipelineLayout.Init(device, { m_DescriptorSetLayout.Get(), m_ParticleGPUSetLayout }, { colorPushConstant });
+
+        // No vertex/instance input at all - position comes from the
+        // storage buffer via gl_InstanceIndex, not a bound vertex buffer
+        // (see particle_point_gpu.vert). Reuses particle_point.frag
+        // unchanged (round-point discard + flat color), same as
+        // m_ParticlePointsPipeline does for its own fragment stage.
+        m_ParticlePointsGPUPipeline.Init(
+            device,
+            m_RenderPass.Get(),
+            m_ParticleGPUPipelineLayout.Get(),
+            "Shaders/Compiled/particle_point_gpu.vert.spv",
+            "Shaders/Compiled/particle_point.frag.spv",
+            {},
+            {},
+            VK_PRIMITIVE_TOPOLOGY_POINT_LIST);
+    }
+
+
+    void Renderer::InitRaymarchPass()
+    {
+        VkDevice device = m_Context.Device().Get();
+        VmaAllocator allocator = m_Allocator.Get();
+
+        // Set 1: two bindings, both ORDINARY fixed-count storage
+        // buffers (descriptorCount = 1 each) - no descriptor indexing,
+        // no update-after-bind, no bindless anything. This is
+        // deliberate: an earlier version of this pass tried true
+        // bindless (one descriptor slot per raymarch object's own
+        // density buffer, later an unbounded densityBuffers[] array via
+        // descriptor indexing) to get past MoltenVK's
+        // maxPerStageDescriptorStorageBuffers=31 ceiling, and hit real,
+        // confirmed dead ends on this project's actual dev hardware at
+        // every step (see RaymarchTypes.h's kRaymarchMaxObjects comment
+        // for the full history, including vkGetDescriptorSetLayoutSupport
+        // returning supported=VK_FALSE for the bindless layout outright).
+        //
+        // The actual fix doesn't touch descriptor count at all: EVERY
+        // volume's density data now lives in one shared buffer
+        // (VoxelSystemGPU::m_SharedDensityBuffer), so binding 1 here is
+        // just ONE ordinary storage-buffer descriptor regardless of how
+        // many raymarch objects exist this frame - each object finds
+        // its own region within that one buffer via
+        // RaymarchObjectGPU::densityOffset (added in raymarch.frag's
+        // SampleDensityTrilinear). This is portable by construction -
+        // it only uses Vulkan 1.0-guaranteed-minimum storage-buffer
+        // limits (every conformant implementation supports at least a
+        // handful of per-stage storage buffers; this pass only ever
+        // needs 2), not any optional/tier-dependent feature.
+        //
+        // Binding 0: the per-frame RaymarchObjectGPU array
+        // (kRaymarchMaxObjects entries, rewritten wholesale every frame
+        // - see UpdateRaymarchDescriptors).
+        // Binding 1: the ONE shared density buffer - see above.
+        VkDescriptorSetLayoutBinding objectBinding{};
+        objectBinding.binding = 0;
+        objectBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        objectBinding.descriptorCount = 1;
+        objectBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+        VkDescriptorSetLayoutBinding densityBinding{};
+        densityBinding.binding = 1;
+        densityBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        densityBinding.descriptorCount = 1;
+        densityBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+        std::array<VkDescriptorSetLayoutBinding, 2> bindings = { objectBinding, densityBinding };
+
+        VkDescriptorSetLayoutCreateInfo layoutInfo{};
+        layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
+        layoutInfo.pBindings = bindings.data();
+
+        if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &m_RaymarchSetLayout) != VK_SUCCESS)
+        {
+            throw std::runtime_error("Eden: failed to create raymarch descriptor set layout");
+        }
+
+        // Pool sized for MAX_FRAMES_IN_FLIGHT sets, each with 2 storage-
+        // buffer descriptors - same "dedicated tiny pool" choice
+        // RegisterParticleGPUSource makes, for the same reason (this
+        // set's budget has nothing to do with m_DescriptorPool's mesh-
+        // texture sizing). Ordinary vkCreateDescriptorPool, no
+        // UPDATE_AFTER_BIND flag - not needed, per-frame sets solve the
+        // same problem without it (see m_RaymarchSets' own comment).
+        std::vector<VkDescriptorPoolSize> poolSizes = {
+            { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * MAX_FRAMES_IN_FLIGHT }
+        };
+
+        VkDescriptorPoolCreateInfo raymarchPoolInfo{};
+        raymarchPoolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        raymarchPoolInfo.maxSets = MAX_FRAMES_IN_FLIGHT;
+        raymarchPoolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+        raymarchPoolInfo.pPoolSizes = poolSizes.data();
+
+        if (vkCreateDescriptorPool(device, &raymarchPoolInfo, nullptr, &m_RaymarchDescriptorPool) != VK_SUCCESS)
+        {
+            throw std::runtime_error("Eden: failed to create raymarch descriptor pool");
+        }
+
+        for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i)
+        {
+            VkDescriptorSetAllocateInfo allocInfo{};
+            allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+            allocInfo.descriptorPool = m_RaymarchDescriptorPool;
+            allocInfo.descriptorSetCount = 1;
+            allocInfo.pSetLayouts = &m_RaymarchSetLayout;
+
+            VkResult allocResult = vkAllocateDescriptorSets(device, &allocInfo, &m_RaymarchSets[i]);
+            if (allocResult != VK_SUCCESS)
+            {
+                throw std::runtime_error(
+                    "Eden: failed to allocate raymarch descriptor set (VkResult "
+                    + std::to_string(static_cast<int>(allocResult)) + ")");
+            }
+
+            // Host-visible + persistently mapped - rewritten wholesale
+            // every frame from RaymarchSystem::BuildObjectList's output,
+            // same "small and constantly rewritten, skip the staging
+            // round trip" reasoning as VoxelSystemGPU::Volume::instance.
+            m_RaymarchObjectBuffers[i].Init(allocator, sizeof(RaymarchObjectGPU) * kRaymarchMaxObjects,
+                                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO,
+                                             VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
+                                             &m_RaymarchObjectBuffersMapped[i]);
+        }
+
+        // Set 0 = camera UBO, reusing m_DescriptorSetLayout exactly like
+        // m_ParticleGPUPipelineLayout does (see that function's own
+        // comment on why the same VkDescriptorSetLayout object is valid
+        // to bind at set 0 across different pipeline layouts). Set 1 =
+        // m_RaymarchSetLayout above.
+        VkPushConstantRange pushConstant{};
+        pushConstant.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        pushConstant.offset = 0;
+        pushConstant.size = sizeof(RaymarchPushConstants);
+
+        m_RaymarchPipelineLayout.Init(device, { m_DescriptorSetLayout.Get(), m_RaymarchSetLayout }, { pushConstant });
+
+        // No vertex/instance input (see raymarch.vert), TRIANGLE_LIST
+        // topology with a 3-vertex bufferless draw, cullMode=NONE - a
+        // fullscreen triangle has no back face to cull.
+        m_RaymarchPipeline.Init(
+            device,
+            m_RenderPass.Get(),
+            m_RaymarchPipelineLayout.Get(),
+            "Shaders/Compiled/raymarch.vert.spv",
+            "Shaders/Compiled/raymarch.frag.spv",
+            {},
+            {},
+            VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+            VK_CULL_MODE_NONE);
+    }
+
+    void Renderer::UpdateRaymarchDescriptors(const std::vector<RaymarchObjectGPU>& objects,
+                                              VkBuffer densityBuffer)
+    {
+        VkDevice device = m_Context.Device().Get();
+
+        // objects.size() may legitimately exceed kRaymarchMaxObjects for
+        // one frame (RaymarchSystem::BuildObjectList already clamps and
+        // warns - see that function - but this is defensive in case a
+        // caller ever builds the list some other way).
+        uint32_t liveCount = std::min(static_cast<uint32_t>(objects.size()), kRaymarchMaxObjects);
+
+        // Indexed by m_CurrentFrame throughout this function - see
+        // m_RaymarchSets' own comment on why this can't be a single
+        // shared set/buffer.
+        if (liveCount > 0)
+        {
+            std::memcpy(m_RaymarchObjectBuffersMapped[m_CurrentFrame], objects.data(), sizeof(RaymarchObjectGPU) * liveCount);
+        }
+
+        VkDescriptorBufferInfo objectBufferInfo{ m_RaymarchObjectBuffers[m_CurrentFrame].Get(), 0, VK_WHOLE_SIZE };
+
+        VkWriteDescriptorSet objectWrite{};
+        objectWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        objectWrite.dstSet = m_RaymarchSets[m_CurrentFrame];
+        objectWrite.dstBinding = 0;
+        objectWrite.descriptorCount = 1;
+        objectWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        objectWrite.pBufferInfo = &objectBufferInfo;
+
+        std::array<VkWriteDescriptorSet, 2> writes{};
+        writes[0] = objectWrite;
+
+        // Only ONE density-buffer descriptor to write now, always -
+        // see InitRaymarchPass's opening comment. When densityBuffer is
+        // VK_NULL_HANDLE (no raymarch objects exist yet this frame -
+        // DrawFrame only calls this when raymarchObjects is non-empty,
+        // but defensively handled here too), skip this write entirely
+        // rather than binding a null buffer, which would be invalid.
+        uint32_t writeCount = 1;
+        VkDescriptorBufferInfo densityInfo{};
+        if (densityBuffer != VK_NULL_HANDLE)
+        {
+            densityInfo = { densityBuffer, 0, VK_WHOLE_SIZE };
+
+            VkWriteDescriptorSet densityWrite{};
+            densityWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            densityWrite.dstSet = m_RaymarchSets[m_CurrentFrame];
+            densityWrite.dstBinding = 1;
+            densityWrite.descriptorCount = 1;
+            densityWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            densityWrite.pBufferInfo = &densityInfo;
+
+            writes[1] = densityWrite;
+            writeCount = 2;
+        }
+
+        vkUpdateDescriptorSets(device, writeCount, writes.data(), 0, nullptr);
     }
 
     void Renderer::InitImGui()
@@ -365,7 +660,11 @@ namespace Eden
         CreateRenderFinishedSemaphores();
     }
 
-    void Renderer::DrawFrame(const std::vector<DrawCommand>& drawList, const std::function<void()>& buildUI)
+    void Renderer::DrawFrame(const std::vector<DrawCommand>& drawList, const std::function<void()>& buildUI,
+                              const std::function<void(VkCommandBuffer)>& recordComputeWork, uint32_t particleGPUCount,
+                              const std::vector<VoxelDrawSource>& voxelSources,
+                              const std::vector<RaymarchObjectGPU>& raymarchObjects,
+                              VkBuffer raymarchDensityBuffer)
     {
         FrameContext& frame = m_Frames[m_CurrentFrame];
 
@@ -433,6 +732,26 @@ namespace Eden
         frame.commandBuffer.Begin();
 
         VkCommandBuffer cmd = frame.commandBuffer.Get();
+
+        // Compute dispatches (if any) go here - BEFORE the render pass
+        // begins, since compute work can't be recorded inside one. See
+        // DrawFrame's own header comment on recordComputeWork/
+        // ParticleSystemGPU::RecordPendingSteps for why this is the one
+        // spot in the frame where that's true. The barrier after it
+        // covers compute-shader-write -> vertex-shader-read, which is
+        // exactly what particle_point_gpu.vert needs before the render
+        // pass's draw calls run (see particleGPUCount below).
+        if (recordComputeWork)
+        {
+            recordComputeWork(cmd);
+
+            VkMemoryBarrier computeToVertexBarrier{};
+            computeToVertexBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            computeToVertexBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            computeToVertexBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
+                                  0, 1, &computeToVertexBarrier, 0, nullptr, 0, nullptr);
+        }
 
         std::array<VkClearValue, 2> clearValues{};
         clearValues[0].color = { { 0.02f, 0.02f, 0.05f, 1.0f } };
@@ -581,6 +900,113 @@ namespace Eden
             m_MeshRegistry[mesh].DrawInstanced(cmd, m_PipelineLayout.Get(), frame.instanceBuffer.Get(), byteOffset, count);
         }
 
+        // GPU-resident particles - entirely separate draw path from the
+        // mesh loop above (see RegisterParticleGPUSource's class
+        // comment): no InstanceData, no vertex buffer, position comes
+        // straight from the storage buffer via gl_InstanceIndex. Only
+        // fires once RegisterParticleGPUSource has actually been called
+        // (m_ParticleGPUStorageSet stays VK_NULL_HANDLE until then).
+        if (particleGPUCount > 0 && m_ParticleGPUStorageSet != VK_NULL_HANDLE)
+        {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_ParticlePointsGPUPipeline.Get());
+
+            std::array<VkDescriptorSet, 2> particleSets = { frame.descriptorSet, m_ParticleGPUStorageSet };
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_ParticleGPUPipelineLayout.Get(),
+                                     0, static_cast<uint32_t>(particleSets.size()), particleSets.data(), 0, nullptr);
+
+            vkCmdPushConstants(cmd, m_ParticleGPUPipelineLayout.Get(), VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(glm::vec4), &ParticleGPUColor);
+
+            // vertexCount=1: gl_VertexIndex is always 0, unused by
+            // particle_point_gpu.vert (position comes from
+            // gl_InstanceIndex into the storage buffer instead) -
+            // instanceCount=particleGPUCount is what actually produces
+            // one point per particle.
+            vkCmdDraw(cmd, 1, particleGPUCount, 0, 0);
+        }
+
+        // GPU-generated indirect-draw geometry (marching-cubes voxel
+        // volumes today, see VoxelDrawSource's comment in RendererTypes.h
+        // for why this isn't voxel-specific by name) - uses
+        // m_VoxelPipeline (same Blinn-Phong/texture shader every
+        // ordinary mesh uses, cullMode=NONE instead of m_GraphicsPipeline's
+        // BACK_BIT - see m_VoxelPipeline's comment in Renderer.h), fed
+        // from a compute-written buffer via vkCmdDrawIndirect instead of
+        // a CPU-uploaded one via vkCmdDrawIndexed. Rebinding the
+        // pipeline defensively here rather than trusting
+        // lastBoundPipeline from the mesh loop above - that loop may
+        // have left m_ParticlePointsPipeline (or now m_GraphicsPipeline)
+        // bound depending on what was drawn last.
+        if (!voxelSources.empty())
+        {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_VoxelPipeline.Get());
+
+            // Untextured - bind Eden's default white fallback at set 1,
+            // same as any untextured ordinary mesh (see CreateMesh's
+            // resolved TextureHandle). Set 0 (camera UBO) is already
+            // bound for the whole frame from above.
+            VkDescriptorSet defaultTextureSet = m_TextureRegistry[m_DefaultTextureHandle]->GetDescriptorSet();
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_PipelineLayout.Get(),
+                                     1, 1, &defaultTextureSet, 0, nullptr);
+
+            for (const VoxelDrawSource& source : voxelSources)
+            {
+                if (source.drawCount == 0 || source.vertexBuffer == VK_NULL_HANDLE || source.indirectBuffer == VK_NULL_HANDLE)
+                {
+                    continue;
+                }
+
+                // Binding 0 = this source's compute-generated geometry
+                // (advances per-vertex), binding 1 = its 1-entry
+                // instance buffer (advances per-instance, but every
+                // indirect draw below sets instanceCount=1 anyway - see
+                // VoxelSystemGPU::RegisterVolume) - same two-binding
+                // shape as Mesh::DrawInstanced, just sourced from
+                // different buffers.
+                VkBuffer vertexBuffers[] = { source.vertexBuffer, source.instanceBuffer };
+                VkDeviceSize offsets[] = { 0, 0 };
+                vkCmdBindVertexBuffers(cmd, 0, 2, vertexBuffers, offsets);
+
+                // drawCount indirect draws from ONE call - each chunk's
+                // VkDrawIndirectCommand entry (vertexCount/firstVertex
+                // set by VoxelSystemGPU) becomes its own vkCmdDraw-
+                // equivalent, back to back, with zero CPU-side looping
+                // per chunk.
+                vkCmdDrawIndirect(cmd, source.indirectBuffer, 0, source.drawCount, sizeof(VkDrawIndirectCommand));
+            }
+        }
+
+        // Raymarch pass - fullscreen sphere-tracing of every "raymarch
+        // object" (see Raymarch/RaymarchSystem.h), recorded after
+        // rasterized mesh/voxel geometry so this frame's depth buffer
+        // already holds terrain's real depth values (raymarch.frag
+        // relies on depth test being ON to composite correctly against
+        // that, and writes its own gl_FragDepth per hit so it can in
+        // turn be occluded by geometry drawn in a future frame's
+        // earlier passes - see that shader's depth-write comment).
+        if (!raymarchObjects.empty())
+        {
+            UpdateRaymarchDescriptors(raymarchObjects, raymarchDensityBuffer);
+
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_RaymarchPipeline.Get());
+
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_RaymarchPipelineLayout.Get(),
+                                     0, 1, &frame.descriptorSet, 0, nullptr);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_RaymarchPipelineLayout.Get(),
+                                     1, 1, &m_RaymarchSets[m_CurrentFrame], 0, nullptr);
+
+            RaymarchPushConstants pushConstants{};
+            pushConstants.objectCount = static_cast<int32_t>(std::min(raymarchObjects.size(),
+                                                                        static_cast<size_t>(kRaymarchMaxObjects)));
+            pushConstants.nearPlane = m_Camera.NearPlane;
+            pushConstants.farPlane = m_Camera.FarPlane;
+            vkCmdPushConstants(cmd, m_RaymarchPipelineLayout.Get(), VK_SHADER_STAGE_FRAGMENT_BIT,
+                               0, sizeof(RaymarchPushConstants), &pushConstants);
+
+            // No vertex/instance buffers bound - see raymarch.vert,
+            // vertices are generated from gl_VertexIndex.
+            vkCmdDraw(cmd, 3, 1, 0, 0);
+        }
+
         // Recorded last, within the same render pass, so UI draws on top
         // of the scene rather than being overwritten by it.
         ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd);
@@ -670,9 +1096,54 @@ namespace Eden
 
         m_CommandPool.Shutdown();
         m_GraphicsPipeline.Shutdown();
+        m_VoxelPipeline.Shutdown();
         m_ParticlePointsPipeline.Shutdown();
         m_PipelineLayout.Shutdown();
+
+        m_ParticlePointsGPUPipeline.Shutdown();
+        m_ParticleGPUPipelineLayout.Shutdown();
+        m_ParticleGPUDescriptorPool.Shutdown();
+        if (m_ParticleGPUSetLayout != VK_NULL_HANDLE)
+        {
+            vkDestroyDescriptorSetLayout(m_Context.Device().Get(), m_ParticleGPUSetLayout, nullptr);
+            m_ParticleGPUSetLayout = VK_NULL_HANDLE;
+        }
+
         m_RenderPass.Shutdown();
+
+        // Raymarch pass resources (see InitRaymarchPass) - these were
+        // previously never torn down at all (a pre-existing gap, not
+        // introduced by the bindless rewrite - m_RaymarchSetLayout has
+        // always been a plain VkDescriptorSetLayout with no destructor
+        // to rely on). Fixed here while this area was already being
+        // touched, following the same explicit-destroy pattern
+        // m_ParticleGPUSetLayout uses above.
+        m_RaymarchPipeline.Shutdown();
+        m_RaymarchPipelineLayout.Shutdown();
+        for (auto& buffer : m_RaymarchObjectBuffers)
+        {
+            buffer.Shutdown(); // was never torn down at all before - a separate pre-existing gap, fixed alongside the per-frame rework
+        }
+        for (VkDescriptorSet& set : m_RaymarchSets)
+        {
+            // No explicit vkFreeDescriptorSets call needed - destroying
+            // the pool below implicitly frees every set allocated from
+            // it (VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT was
+            // never requested, so per-set freeing isn't even available -
+            // this is just documenting that the pool destroy below is
+            // sufficient, not a missing step).
+            set = VK_NULL_HANDLE;
+        }
+        if (m_RaymarchDescriptorPool != VK_NULL_HANDLE)
+        {
+            vkDestroyDescriptorPool(m_Context.Device().Get(), m_RaymarchDescriptorPool, nullptr);
+            m_RaymarchDescriptorPool = VK_NULL_HANDLE;
+        }
+        if (m_RaymarchSetLayout != VK_NULL_HANDLE)
+        {
+            vkDestroyDescriptorSetLayout(m_Context.Device().Get(), m_RaymarchSetLayout, nullptr);
+            m_RaymarchSetLayout = VK_NULL_HANDLE;
+        }
 
         m_DepthImage.Shutdown();
 

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../Voxel/VoxelField.h"
+
 #include <glm/glm.hpp>
 
 namespace Eden
@@ -9,7 +11,24 @@ namespace Eden
         Sphere,
         Box,
         Capsule,
-        Plane
+        Plane,
+
+        // A registered VoxelSystemGPU volume (see voxelVolume below) -
+        // narrow phase queries its live densityCPU field directly
+        // (trilinear-sampled signed distance, same values SeedSphere/
+        // Carve/SeedFromParticles already write - see
+        // VoxelSystemGPU::SampleSignedDistance) instead of an analytic
+        // formula. Sphere-vs-Voxel is exact (a sphere really is just a
+        // point + radius against the field); Box/Capsule-vs-Voxel are
+        // multi-point approximations (see CollisionSystem.cpp's
+        // TestPointsVsVoxel/TestBoxVsVoxel/TestCapsuleVsVoxel) - close
+        // enough for this project's irregular voxel/reform surfaces,
+        // but not an exact closed-form narrow phase the way the 4
+        // analytic-vs-analytic pairs are.
+        // Always expected to be a Static RigidBodyComponent - see
+        // VoxelVolumeComponent's comment on why moving deformables
+        // aren't supported.
+        Voxel
     };
 
     // A collision shape attached to an entity. The actual analytic
@@ -39,7 +58,15 @@ namespace Eden
         // (e.g. Registry::View returning vector<Entity> instead of a
         // custom iterator).
         float radius = 0.5f;           // Sphere, Capsule
-        glm::vec3 halfExtents{ 0.5f }; // Box
+        // Box; also Voxel - the volume's own local AABB half-extents
+        // (from VoxelSystemGPU::GetVolumeBounds, computed once at
+        // registration since these volumes don't move/resize), used by
+        // AabbHalfExtents for broad-phase bucketing. NOT consulted by
+        // narrow phase for Voxel (TestSphereVsVoxel queries the live
+        // density field instead) - this is bounds-only, same
+        // "conservative, not exact" role AabbHalfExtents plays for
+        // every other shape.
+        glm::vec3 halfExtents{ 0.5f };
 
         // Capsule stands along local +Y (matching Eden's Y-up
         // convention). halfHeight is half the distance between the two
@@ -60,5 +87,9 @@ namespace Eden
         // normal parent-child offset would. Useful when a mesh's visual
         // origin isn't at its geometric center.
         glm::vec3 localOffset{ 0.0f };
+
+        // Voxel only - which registered VoxelSystemGPU volume this
+        // collider queries. Meaningless for every other shape.
+        VoxelVolumeHandle voxelVolume = InvalidVoxelVolumeHandle;
     };
 }

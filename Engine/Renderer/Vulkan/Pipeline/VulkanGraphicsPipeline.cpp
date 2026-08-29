@@ -11,7 +11,7 @@ namespace Eden
                                        const std::string& vertSpirvPath, const std::string& fragSpirvPath,
                                        const std::vector<VkVertexInputBindingDescription>& bindingDescriptions,
                                        const std::vector<VkVertexInputAttributeDescription>& attributeDescriptions,
-                                       VkPrimitiveTopology topology)
+                                       VkPrimitiveTopology topology, VkCullModeFlags cullMode)
     {
         m_DeviceHandle = device;
 
@@ -80,7 +80,7 @@ namespace Eden
         // VK_FRONT_FACE_CLOCKWISE instead. Either way nothing is actually
         // broken; depth testing alone already guarantees correct occlusion,
         // culling is purely a performance optimization on top of that.
-        rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
+        rasterizer.cullMode = cullMode;
         rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
 
         VkPipelineMultisampleStateCreateInfo multisampling{};

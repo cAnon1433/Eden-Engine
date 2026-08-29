@@ -7,6 +7,11 @@
 
 namespace Eden
 {
+    // Forward-declared, not #included - CollisionSystem.cpp is the only
+    // place that needs VoxelSystemGPU.h's full Vulkan-buffer-heavy
+    // definition, this header only needs a pointer type.
+    class VoxelSystemGPU;
+
     // Detects and resolves collisions between every entity that has both
     // TransformComponent and ColliderComponent. Call directly after
     // PhysicsSystem::Step() inside main.cpp's fixed-timestep accumulator -
@@ -138,7 +143,11 @@ namespace Eden
         bool adaptiveBroadPhaseCellSize = true;
         float broadPhaseCellSize = 4.0f;
 
-        void Step(Registry& registry, float fixedDeltaTime);
+        // voxelSystem is only consulted for Sphere-vs-Voxel contacts
+        // (see CollisionSystem.cpp's TestCollision/TestSphereVsVoxel) -
+        // pass nullptr if the scene has no Voxel colliders yet, or leave
+        // it defaulted; every other shape pair is unaffected either way.
+        void Step(Registry& registry, float fixedDeltaTime, const VoxelSystemGPU* voxelSystem = nullptr);
 
     private:
         // EMA-smoothed adaptive cell size, separate from the public

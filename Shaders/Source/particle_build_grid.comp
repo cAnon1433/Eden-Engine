@@ -1,0 +1,98 @@
+#version 450
+
+// Hash-based uniform grid build, one invocation per particle. This is the
+// GPU-resident replacement for ParticleSpatialHash.h's CPU counting-sort
+// grid - deliberately a DIFFERENT technique (Teschner et al. 2003 hash +
+// atomic bucket append), not a line-for-line port, because a true
+// counting sort needs a global prefix sum, which is real, separate work
+// (a parallel scan pass) not worth building for particle counts in the
+// low thousands. The tradeoff: two distinct 3D cells CAN collide onto the
+// same hash bucket, which very occasionally merges or drops a neighbor
+// contribution near that collision. Standard, accepted tradeoff for this
+// technique at this scale - see GPU_HASH_TABLE_SIZE's comment in
+// ParticleGPUTypes.h.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer PositionsBuffer { vec4 positions[]; };
+layout(std430, binding = 5) buffer CellCountsBuffer { uint cellCounts[]; };
+layout(std430, binding = 6) buffer CellBucketsBuffer { uint cellBuckets[]; };
+
+layout(push_constant) uniform SimParams
+{
+    uint particleCount;
+    uint numColliders;
+    uint hashTableSize;
+    uint maxPerCell;
+    float h;
+    float h2;
+    float mass;
+    float restDensity;
+    float stiffness;
+    float gamma;
+    float viscosity;
+    float dt;
+    float cellSize;
+    float particleRadius;
+    float boundaryRestitution;
+    float maxAcceleration;
+    uint maxSweepIterations;
+    float heatDecayRate;      // was _pad0
+    float heatColdMultiplier; // was _pad1
+    float boundaryFriction;   // was _pad2
+    vec4 gravity;
+
+    // Only particle_integrate.comp actually WRITES the void-kill
+    // sentinel, but this pass and density/force all need to READ it too
+    // (see main() below) - every particle that's crossed it must be
+    // excluded from the spatial hash here, not just skipped in
+    // collision. Reasoning: every void particle shares the exact SAME
+    // pinned Y (see particle_integrate.comp's sentinel), so the Y term
+    // of HashCell becomes an identical constant across all of them -
+    // their hash diversity collapses to whatever x/z spread they had
+    // when they fell out, which in a modest-sized scene can be narrow
+    // enough that hundreds/thousands of void particles all atomicAdd
+    // into the SAME handful of buckets. That's not just wasted work,
+    // it's serialized atomic contention on a few cache lines, and it
+    // gets WORSE the longer a session runs and the more particles
+    // accumulate in the void - measured regression, not a
+    // theoretical one.
+    float voidKillY;
+} sim;
+
+uint HashCell(ivec3 cell)
+{
+    uint h = (uint(cell.x) * 73856093u) ^ (uint(cell.y) * 19349663u) ^ (uint(cell.z) * 83492791u);
+    return h & (sim.hashTableSize - 1u); // hashTableSize is power-of-two
+}
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= sim.particleCount)
+    {
+        return;
+    }
+
+    vec3 p = positions[i].xyz;
+
+    // Void-killed particles (see particle_integrate.comp's sentinel and
+    // this file's SimParams comment on voidKillY) must never enter the
+    // grid - not an optimization nicety, a correctness-adjacent
+    // performance fix. Skipping this was the actual cause of a real,
+    // measured regression that got WORSE the longer a session ran.
+    if (p.y < sim.voidKillY)
+    {
+        return;
+    }
+
+    ivec3 cell = ivec3(floor(p / sim.cellSize));
+    uint hash = HashCell(cell);
+
+    uint slot = atomicAdd(cellCounts[hash], 1u);
+    if (slot < sim.maxPerCell)
+    {
+        cellBuckets[hash * sim.maxPerCell + slot] = i;
+    }
+    // else: bucket overflowed maxPerCell this frame - dropped, not
+    // written out of bounds. See GPU_MAX_PER_CELL's comment.
+}

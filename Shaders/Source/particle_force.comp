@@ -1,0 +1,228 @@
+#version 450
+
+// Pressure + viscosity force accumulation, one invocation per particle -
+// GPU mirror of ParticleSystem::ComputeForces. Same near-coincident-
+// particle fallback as the CPU version (deterministic pair-hash pseudo-
+// direction, antisymmetric by i/j order) - see that function's .cpp
+// comment for why this exists (prevents two particles landing on the
+// exact same point from staying stuck together with zero repulsion).
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer PositionsBuffer { vec4 positions[]; };
+layout(std430, binding = 1) readonly buffer VelocitiesBuffer { vec4 velocities[]; };
+layout(std430, binding = 2) readonly buffer DensitiesBuffer { float densities[]; };
+layout(std430, binding = 3) readonly buffer PressuresBuffer { float pressures[]; };
+layout(std430, binding = 4) buffer ForcesBuffer { vec4 forces[]; };
+layout(std430, binding = 5) readonly buffer CellCountsBuffer { uint cellCounts[]; };
+layout(std430, binding = 6) readonly buffer CellBucketsBuffer { uint cellBuckets[]; };
+
+// Heat/cooldown state - read-only here, only integrate.comp writes it.
+// This shader piggybacks a heat-conduction pass onto the SPH neighbor
+// loop it already has to do for pressure/viscosity (see main() below) -
+// see forces[i].w's comment for why the result rides along in the
+// otherwise-unused w component of ForcesBuffer instead of needing its
+// own buffer/binding.
+layout(std430, binding = 8) readonly buffer HeatBuffer { float heat[]; };
+
+layout(push_constant) uniform SimParams
+{
+    uint particleCount;
+    uint numColliders;
+    uint hashTableSize;
+    uint maxPerCell;
+    float h;
+    float h2;
+    float mass;
+    float restDensity;
+    float stiffness;
+    float gamma;
+    float viscosity;
+    float dt;
+    float cellSize;
+    float particleRadius;
+    float boundaryRestitution;
+    float maxAcceleration;
+    uint maxSweepIterations;
+    float heatDecayRate;      // was _pad0
+    float heatColdMultiplier; // was _pad1
+    float boundaryFriction;   // was _pad2
+    vec4 gravity;
+
+    // Read here too now (see main() below) as well as by
+    // particle_integrate.comp and particle_build_grid.comp - not just
+    // present for layout matching anymore.
+    float voidKillY;
+} sim;
+
+const float PI = 3.14159265358979323846;
+
+// grad W(r,h) = -45 / (pi * h^6) * (h - r)^2 * (rVec / r), for 0 < r <= h
+vec3 SpikyGradient(vec3 rVec, float r, float h)
+{
+    if (r <= 0.0 || r > h)
+    {
+        return vec3(0.0);
+    }
+    float coefficient = -45.0 / (PI * pow(h, 6.0));
+    float diff = h - r;
+    return coefficient * diff * diff * (rVec / r);
+}
+
+// lap W(r,h) = 45 / (pi * h^6) * (h - r), for 0 <= r <= h
+float ViscosityLaplacian(float r, float h)
+{
+    if (r > h)
+    {
+        return 0.0;
+    }
+    float coefficient = 45.0 / (PI * pow(h, 6.0));
+    return coefficient * (h - r);
+}
+
+uint HashCell(ivec3 cell)
+{
+    uint h = (uint(cell.x) * 73856093u) ^ (uint(cell.y) * 19349663u) ^ (uint(cell.z) * 83492791u);
+    return h & (sim.hashTableSize - 1u);
+}
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= sim.particleCount)
+    {
+        return;
+    }
+
+    vec3 pi = positions[i].xyz;
+
+    // Void-killed particles never got inserted into the grid (see
+    // particle_build_grid.comp's own check) and particle_integrate.comp
+    // returns before ever reading forces[i]/heat[i] for them (see its
+    // void-kill early-exit) - leaving this buffer's entry stale for
+    // them is harmless, and skipping the wasted 27-cell neighbor scan
+    // here is real, additive savings on top of the atomic-contention
+    // fix in particle_build_grid.comp.
+    if (pi.y < sim.voidKillY)
+    {
+        return;
+    }
+
+    vec3 vi = velocities[i].xyz;
+    float pressureI = pressures[i];
+    float heatI = heat[i];
+
+    vec3 pressureForce = vec3(0.0);
+    vec3 viscosityForce = vec3(0.0);
+
+    // Heat-conduction accumulators - see forces[i].w's comment below.
+    // Only touched when heatI >= 0.0 (this particle is actually part of
+    // the melt/reform system - see GPU_HEAT_NOT_MELTED in
+    // ParticleGPUTypes.h); ordinary liquid particles skip this
+    // entirely, same "not part of this system" boundary heat decay
+    // already respects in particle_integrate.comp.
+    float heatWeightedSum = 0.0;
+    float heatWeightTotal = 0.0;
+
+    ivec3 cell = ivec3(floor(pi / sim.cellSize));
+    const float kMinSeparation = 1e-4;
+
+    for (int dz = -1; dz <= 1; ++dz)
+    for (int dy = -1; dy <= 1; ++dy)
+    for (int dx = -1; dx <= 1; ++dx)
+    {
+        uint hash = HashCell(cell + ivec3(dx, dy, dz));
+        uint count = min(cellCounts[hash], sim.maxPerCell);
+        uint base = hash * sim.maxPerCell;
+
+        for (uint s = 0u; s < count; ++s)
+        {
+            uint j = cellBuckets[base + s];
+            if (j == i)
+            {
+                continue;
+            }
+
+            vec3 rVec = pi - positions[j].xyz;
+            float r = length(rVec);
+            if (r > sim.h)
+            {
+                continue;
+            }
+
+            vec3 effectiveRVec = rVec;
+            float effectiveR = r;
+
+            if (r < kMinSeparation)
+            {
+                // Deterministic pair-hash direction, antisymmetric by
+                // i/j order - see particle_force.comp's file comment /
+                // ParticleSystem::ComputeForces' identical CPU logic.
+                uint a = min(i, j);
+                uint b = max(i, j);
+                uint hash2 = (a * 73856093u) ^ (b * 19349663u);
+                float theta = float(hash2 % 6283u) / 1000.0;
+                float z = float((hash2 / 6283u) % 2000u) / 1000.0 - 1.0;
+                float ringRadius = sqrt(max(0.0, 1.0 - z * z));
+                vec3 direction = vec3(ringRadius * cos(theta), ringRadius * sin(theta), z);
+                if (i > j)
+                {
+                    direction = -direction;
+                }
+
+                effectiveR = kMinSeparation;
+                effectiveRVec = direction * effectiveR;
+            }
+
+            float rhoJ = densities[j];
+            if (rhoJ <= 0.0)
+            {
+                continue;
+            }
+
+            float pressureJ = pressures[j];
+            vec3 gradW = SpikyGradient(effectiveRVec, effectiveR, sim.h);
+            pressureForce -= sim.mass * (pressureI + pressureJ) / (2.0 * rhoJ) * gradW;
+
+            vec3 vj = velocities[j].xyz;
+            float lapW = ViscosityLaplacian(effectiveR, sim.h);
+            viscosityForce += sim.mass * (vj - vi) / rhoJ * lapW;
+
+            // Heat conduction toward SPH neighbors (same radius h
+            // pressure/viscosity already use - "close enough to
+            // interact" is a reasonable, already-computed proxy for
+            // "resting against/near each other"). Reuses lapW itself as
+            // the falloff weight, same Laplacian-smoothing role it plays
+            // for viscosity's velocity diffusion - heat diffusion is the
+            // same kind of process on a scalar instead of a vector, not
+            // a different mechanism. Only accumulates over OTHER
+            // melt-system particles (heatJ >= 0.0) - an ordinary liquid
+            // neighbor shouldn't pull a melted particle's heat around,
+            // it isn't part of this system.
+            if (heatI >= 0.0)
+            {
+                float heatJ = heat[j];
+                if (heatJ >= 0.0)
+                {
+                    heatWeightedSum += heatJ * lapW;
+                    heatWeightTotal += lapW;
+                }
+            }
+        }
+    }
+
+    viscosityForce *= sim.viscosity;
+
+    // Gravity NOT added here - applied as an acceleration in
+    // particle_integrate.comp, same convention as the CPU version.
+    //
+    // forces[i].w carries this particle's SPH-neighborhood-weighted
+    // average heat (not a force component - .w was always unused here,
+    // see the struct's own w=0.0 in the old version of this line) -
+    // particle_integrate.comp reads it back to pull heatI toward it each
+    // step (see that shader's "Heat conduction" block). Falls back to
+    // heatI itself (a no-op pull) when there were no eligible neighbors
+    // in range, e.g. an isolated melted particle with nothing nearby to
+    // conduct with.
+    float neighborAvgHeat = heatWeightTotal > 0.0 ? (heatWeightedSum / heatWeightTotal) : heatI;
+    forces[i] = vec4(pressureForce + viscosityForce, neighborAvgHeat);
+}

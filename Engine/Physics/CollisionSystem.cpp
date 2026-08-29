@@ -1,16 +1,20 @@
 #include "CollisionSystem.h"
 
 #include "ColliderComponent.h"
+#include "ColliderBounds.h"
 #include "RigidBodyComponent.h"
 #include "SDF.h"
 #include "../ECS/Components/TransformComponent.h"
+#include "../Voxel/VoxelSystemGPU.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <limits>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 #include <vector>
 
 namespace Eden
@@ -92,6 +96,226 @@ namespace Eden
             glm::vec3 normal = -(otherRotation * SDF::Normal(scaledOther, local));
             glm::vec3 point = sphereWorldPos + normal * sphereRadius; // sphere's surface point facing other
             return { true, normal, penetration, point };
+        }
+
+        // Sphere-vs-Voxel: same shape as TestSphereVsSDFShape just above
+        // (a sphere overlaps iff the SDF distance from its center to the
+        // other surface is less than its radius) but reads
+        // VoxelSystemGPU's live density field instead of an analytic
+        // SDF.h formula - see SampleSignedDistance/SampleGradient's
+        // comments. Voxel volumes never rotate (ColliderComponent::
+        // voxelVolume's comment), so unlike TestSphereVsSDFShape there's
+        // no SDF::WorldToLocal/rotation step - SampleSignedDistance
+        // already takes a world-space point directly.
+        ContactInfo TestSphereVsVoxel(const glm::vec3& sphereWorldPos, float sphereRadius,
+                                       const ColliderComponent& voxelCollider, const VoxelSystemGPU* voxelSystem)
+        {
+            if (voxelSystem == nullptr || voxelCollider.voxelVolume == InvalidVoxelVolumeHandle)
+            {
+                // No voxel system was passed to CollisionSystem::Step
+                // (see its header comment - voxelSystem is optional), or
+                // this collider's handle was never set. No contact
+                // rather than a crash.
+                return {};
+            }
+
+            float distanceToSurface = voxelSystem->SampleSignedDistance(voxelCollider.voxelVolume, sphereWorldPos);
+            float penetration = sphereRadius - distanceToSurface;
+            if (penetration <= 0.0f)
+            {
+                return {};
+            }
+
+            // Defensive clamp, specific to Voxel: a reformed/carved
+            // surface is genuinely irregular (union-of-spheres blobs,
+            // concave seams, coarse voxel resolution meeting much finer
+            // SmoothMin detail) in a way the 4 analytic shapes never
+            // are, so a single SampleSignedDistance read can occasionally
+            // report much deeper penetration than the body actually
+            // needs correcting by this step - CCD (above) now prevents
+            // the worst case (tunneling deep into the interior before
+            // detection), but doesn't guarantee every read near a sharp
+            // concave feature is exact. Capping at the sphere's own
+            // radius means a real contact still fully resolves within a
+            // couple of steps (positionalCorrectionPercent already only
+            // partially corrects per step - see CollisionSystem.h), just
+            // never in one explosive, physically-nonsensical shove. This
+            // is what was producing the reported repeated-upward-
+            // teleport on a reformed surface.
+            penetration = glm::min(penetration, sphereRadius);
+
+            // SampleGradient points away from solid material (outward,
+            // same convention as SDF::Normal) - i.e. voxel -> sphere.
+            // Negate for sphere -> voxel, matching every other Test*
+            // function's normal convention.
+            glm::vec3 normal = -voxelSystem->SampleGradient(voxelCollider.voxelVolume, sphereWorldPos);
+            glm::vec3 point = sphereWorldPos + normal * sphereRadius; // sphere's surface point facing the volume
+            return { true, normal, penetration, point };
+        }
+
+        // Box/Capsule-vs-Voxel share the same core idea, which is why
+        // both are built on this one helper: SampleSignedDistance only
+        // answers "what's the distance/gradient AT THIS ONE POINT" -
+        // exact for a sphere (one point + a radius IS the whole shape),
+        // but a box or capsule is an extended volume, so no single
+        // sample is enough on its own. This tests several representative
+        // WORLD-SPACE points against the field (each treated as its own
+        // tiny sphere-vs-voxel query, effectively) and returns whichever
+        // one penetrates deepest - the same "several point-samples,
+        // trust the worst one" shape TestSphereVsVoxel's own penetration
+        // clamp comment already gestures at being necessary for
+        // irregular reformed/carved surfaces, just applied here to
+        // MULTIPLE points instead of one.
+        //
+        // This is an approximation, not exact narrow-phase (a true
+        // box-vs-SDF test would need to find the actual closest surface
+        // point on the box to the field's isosurface, which has no
+        // closed form against an arbitrary density field) - it can miss
+        // a genuine contact that happens to fall between sample points,
+        // or report a contact normal that's slightly off from a
+        // corner/edge's true contact geometry. Acceptable for the same
+        // reason TestSphereVsVoxel's own penetration clamp is: this
+        // project's voxel/reform surfaces are irregular by nature
+        // (union-of-spheres blobs, carved terrain), so "close enough,
+        // corrects over a couple of steps" already describes how every
+        // Voxel narrow-phase result behaves here, sphere included - this
+        // isn't a new tradeoff, just extending an existing one to boxes
+        // and capsules.
+        //
+        // sampleRadius is the EFFECTIVE per-point contact radius at that
+        // sample - for Box this is 0 (a face-center point has no
+        // inherent radius, unlike a capsule's swept-sphere axis points),
+        // for Capsule this is the capsule's own radius (each axis sample
+        // really is a tiny sphere query, since a capsule genuinely IS a
+        // swept sphere).
+        ContactInfo TestPointsVsVoxel(const std::vector<glm::vec3>& worldPoints, float sampleRadius,
+                                       const ColliderComponent& voxelCollider, const VoxelSystemGPU* voxelSystem)
+        {
+            if (voxelSystem == nullptr || voxelCollider.voxelVolume == InvalidVoxelVolumeHandle)
+            {
+                return {}; // see TestSphereVsVoxel's identical check for why
+            }
+
+            bool found = false;
+            float deepestPenetration = 0.0f;
+            glm::vec3 deepestNormal{ 0.0f, 1.0f, 0.0f };
+            glm::vec3 deepestPoint{ 0.0f };
+
+            for (const glm::vec3& worldPoint : worldPoints)
+            {
+                float distanceToSurface = voxelSystem->SampleSignedDistance(voxelCollider.voxelVolume, worldPoint);
+                float penetration = sampleRadius - distanceToSurface;
+                if (penetration <= 0.0f)
+                {
+                    continue; // this sample point isn't in contact, check the rest
+                }
+
+                if (!found || penetration > deepestPenetration)
+                {
+                    found = true;
+                    // Same defensive clamp TestSphereVsVoxel applies,
+                    // same reasoning (irregular surface, occasional
+                    // over-reported penetration) - capped per-sample at
+                    // a generous-but-bounded value rather than
+                    // sampleRadius itself, since sampleRadius is 0 for
+                    // Box's face-center points (see this function's own
+                    // comment) and a 0-radius cap would zero out every
+                    // Box contact's correction entirely. 0.5 world units
+                    // matches the scale TestSphereVsVoxel's own clamp
+                    // operates at for this project's typical object
+                    // sizes (see that function's sphereRadius-based
+                    // clamp for comparison) without depending on a
+                    // per-shape radius that may not exist.
+                    deepestPenetration = glm::min(penetration, 0.5f);
+                    deepestNormal = -voxelSystem->SampleGradient(voxelCollider.voxelVolume, worldPoint); // outward, see TestSphereVsVoxel's normal comment
+                    deepestPoint = worldPoint + deepestNormal * sampleRadius;
+                }
+            }
+
+            if (!found)
+            {
+                return {};
+            }
+            return { true, deepestNormal, deepestPenetration, deepestPoint };
+        }
+
+        // 7 sample points: the box's own center plus its 6 face centers
+        // (center +/- halfExtents along each LOCAL axis, then rotated
+        // into world space) - covers the case a single center sample
+        // would miss (a box resting flat on a voxel surface, where the
+        // box's CENTER is well clear of the surface but its bottom face
+        // is already penetrating). Corners are deliberately NOT
+        // included (would be 8 more points, doubling the sample count)
+        // - face centers already catch the common "box resting on/
+        // pressed into a mostly-flat voxel surface" case this project's
+        // actual scenes produce (terrain, reform blobs), and TestPointsVsVoxel's
+        // own comment already documents that exact corner-vs-concave-
+        // seam contacts are an accepted approximation, not a guarantee,
+        // for every Voxel narrow-phase test in this file.
+        ContactInfo TestBoxVsVoxel(const ColliderComponent& boxCollider, const TransformComponent& boxTransform,
+                                    const ColliderComponent& voxelCollider, const VoxelSystemGPU* voxelSystem)
+        {
+            glm::mat3 rotation = SDF::RotationMatrixFromDegrees(boxTransform.rotationDegrees);
+            glm::vec3 center = boxTransform.position + rotation * boxCollider.localOffset;
+            // Scaled here at the call site, NOT assumed pre-scaled -
+            // TestCollision's callers pass raw ECS ColliderComponents
+            // (see TestCollision's own broad-phase call site), so every
+            // Test* function in this file is individually responsible
+            // for applying transform.scale itself. Matches TestBoxBox's
+            // identical halfA/halfB scaling exactly (see that function's
+            // comment for why scale is applied along the LOCAL axis
+            // before rotation).
+            glm::vec3 half = boxCollider.halfExtents * boxTransform.scale;
+
+            std::vector<glm::vec3> samplePoints;
+            samplePoints.reserve(7);
+            samplePoints.push_back(center);
+            samplePoints.push_back(center + rotation[0] * half.x);
+            samplePoints.push_back(center - rotation[0] * half.x);
+            samplePoints.push_back(center + rotation[1] * half.y);
+            samplePoints.push_back(center - rotation[1] * half.y);
+            samplePoints.push_back(center + rotation[2] * half.z);
+            samplePoints.push_back(center - rotation[2] * half.z);
+
+            return TestPointsVsVoxel(samplePoints, 0.0f, voxelCollider, voxelSystem);
+        }
+
+        // 3 sample points along the capsule's own local +Y axis (see
+        // SDF::Capsule's comment for that axis convention): both
+        // hemisphere centers (+/-halfHeight) plus the midpoint - each
+        // treated as its own sphere-vs-voxel query at the capsule's
+        // radius (a capsule genuinely IS two spheres swept along a
+        // segment, so this is a much closer approximation than Box's
+        // face-center sampling, not just "fewer points because capsules
+        // are simpler"). The midpoint sample catches a capsule lying
+        // flat against a voxel surface where both ends happen to clear
+        // it but the middle doesn't (rare given typical capsule
+        // proportions, but the cost of one extra sample is negligible
+        // next to correctness here).
+        ContactInfo TestCapsuleVsVoxel(const ColliderComponent& capsuleCollider, const TransformComponent& capsuleTransform,
+                                        const ColliderComponent& voxelCollider, const VoxelSystemGPU* voxelSystem)
+        {
+            glm::mat3 rotation = SDF::RotationMatrixFromDegrees(capsuleTransform.rotationDegrees);
+            glm::vec3 center = capsuleTransform.position + rotation * capsuleCollider.localOffset;
+            glm::vec3 axis = rotation[1]; // local +Y, see SDF::Capsule's comment
+            // Same scale convention TestCapsuleCapsule uses (see that
+            // function's comment): halfHeight scales along local Y,
+            // radius is isotropically averaged across local X/Z rather
+            // than per-axis (a capsule's cross-section is rotationally
+            // symmetric, so there's no well-defined "X radius" vs "Z
+            // radius" the way a box has independent extents per axis).
+            // NOT pre-scaled by the caller - see TestBoxVsVoxel's
+            // identical correction/comment for why.
+            float halfHeight = capsuleCollider.halfHeight * capsuleTransform.scale.y;
+            float radius = capsuleCollider.radius * 0.5f * (capsuleTransform.scale.x + capsuleTransform.scale.z);
+
+            std::vector<glm::vec3> samplePoints = {
+                center + axis * halfHeight,
+                center,
+                center - axis * halfHeight,
+            };
+
+            return TestPointsVsVoxel(samplePoints, radius, voxelCollider, voxelSystem);
         }
 
         // Oriented-box vs oriented-box, via the standard Separating Axis
@@ -533,11 +757,12 @@ namespace Eden
         // and negates the resulting normal instead of duplicating every
         // test with arguments reversed.
         ContactInfo TestCollision(const ColliderComponent& colliderA, const TransformComponent& transformA,
-                                   const ColliderComponent& colliderB, const TransformComponent& transformB)
+                                   const ColliderComponent& colliderB, const TransformComponent& transformB,
+                                   const VoxelSystemGPU* voxelSystem = nullptr)
         {
             if (ShapeOrder(colliderA.shape) > ShapeOrder(colliderB.shape))
             {
-                ContactInfo result = TestCollision(colliderB, transformB, colliderA, transformA);
+                ContactInfo result = TestCollision(colliderB, transformB, colliderA, transformA, voxelSystem);
                 result.normal = -result.normal;
                 return result;
             }
@@ -576,6 +801,9 @@ namespace Eden
                             // (see SDF.h) - only the sphere's own radiusA
                             // needs to be scaled here, at the call site.
                             return TestSphereVsSDFShape(posA, radiusA, colliderB, transformB);
+
+                        case ColliderShape::Voxel:
+                            return TestSphereVsVoxel(posA, radiusA, colliderB, voxelSystem);
                     }
                     break;
                 }
@@ -586,6 +814,7 @@ namespace Eden
                         case ColliderShape::Box:     return TestBoxBox(colliderA, transformA, colliderB, transformB);
                         case ColliderShape::Capsule: return TestBoxCapsule(colliderA, transformA, colliderB, transformB);
                         case ColliderShape::Plane:   return TestBoxPlane(colliderA, transformA, colliderB, transformB);
+                        case ColliderShape::Voxel:   return TestBoxVsVoxel(colliderA, transformA, colliderB, voxelSystem);
                         default: break; // Sphere never reaches here post-canonicalization
                     }
                     break;
@@ -595,6 +824,7 @@ namespace Eden
                     {
                         case ColliderShape::Capsule: return TestCapsuleCapsule(colliderA, transformA, colliderB, transformB);
                         case ColliderShape::Plane:   return TestCapsulePlane(colliderA, transformA, colliderB, transformB);
+                        case ColliderShape::Voxel:   return TestCapsuleVsVoxel(colliderA, transformA, colliderB, voxelSystem);
                         default: break;
                     }
                     break;
@@ -603,6 +833,18 @@ namespace Eden
                     // Only reachable for Plane-Plane once canonicalized -
                     // degenerate, deliberately unhandled (see
                     // CollisionSystem.h).
+                    break;
+
+                case ColliderShape::Voxel:
+                    // Only reachable for Voxel-Voxel once canonicalized -
+                    // two volumes of static world geometry never need to
+                    // collide with each other. Sphere/Box/Capsule-vs-
+                    // Voxel are all handled above, in each of THOSE
+                    // shapes' own switch cases (TestSphereVsVoxel/
+                    // TestBoxVsVoxel/TestCapsuleVsVoxel) - Voxel always
+                    // canonicalizes to the B side (highest ShapeOrder),
+                    // so this outer Voxel case genuinely only ever sees
+                    // Voxel-Voxel pairs, not a leftover gap.
                     break;
             }
 
@@ -696,6 +938,17 @@ namespace Eden
                     // this system either - small arbitrary fallback so
                     // this doesn't produce a zero-divide if one is ever
                     // created.
+                    localInertia = glm::vec3(mass * 0.1f);
+                    break;
+
+                case ColliderShape::Voxel:
+                    // Unreachable in practice - Voxel colliders are
+                    // always Static (see ColliderShape::Voxel's
+                    // comment), and the inverseMass <= 0.0f check above
+                    // already returns before this switch for any
+                    // non-positive-mass body. Same arbitrary-fallback
+                    // reasoning as Plane in case that assumption is ever
+                    // violated.
                     localInertia = glm::vec3(mass * 0.1f);
                     break;
             }
@@ -1079,7 +1332,8 @@ namespace Eden
                                                ComponentStorage<TransformComponent>& transforms,
                                                ComponentStorage<ColliderComponent>& colliders,
                                                ComponentStorage<RigidBodyComponent>& bodies,
-                                               float fixedDeltaTime, int maxIterations)
+                                               float fixedDeltaTime, int maxIterations,
+                                               const VoxelSystemGPU* voxelSystem)
         {
             for (Entity entity : entities)
             {
@@ -1146,17 +1400,42 @@ namespace Eden
                         const ColliderComponent& colliderOther = colliders.Get(other);
                         const TransformComponent& transformOther = transforms.Get(other);
 
-                        // SDF::Distance works uniformly for Sphere, Box,
-                        // Capsule, AND Plane - a real payoff of building
-                        // narrow phase on true distance fields instead of
-                        // one-off shape-pair code: this loop doesn't need
-                        // to know or care which shape `other` is.
-                        // `other`'s own scale applied via a scaled
-                        // COPY of its shape parameters, same reasoning as
-                        // TestSphereVsSDFShape - see SDF::ScaledCollider.
-                        ColliderComponent scaledOther = SDF::ScaledCollider(colliderOther, transformOther.scale);
-                        glm::vec3 local = SDF::WorldToLocal(position, transformOther, colliderOther);
-                        float distanceToOtherSurface = SDF::Distance(scaledOther, local) - approxRadius;
+                        float distanceToOtherSurface;
+                        if (colliderOther.shape == ColliderShape::Voxel)
+                        {
+                            // SDF::Distance (below) has no Voxel case -
+                            // route through the live density field
+                            // directly instead. This is the fix for a
+                            // real bug: silently skipping Voxel here (an
+                            // earlier version of this loop did) let a
+                            // fast-moving sphere tunnel past its own
+                            // radius INTO a voxel volume's interior
+                            // before the discrete pass ever saw it - the
+                            // discrete pass then read a large, garbage
+                            // penetration (sphere center already deep
+                            // inside solid) and ResolveContact corrected
+                            // it in one violent shove, every step,
+                            // because the sphere immediately fell back
+                            // in afterward. Marching against the real
+                            // surface here is what actually stops that.
+                            distanceToOtherSurface = (voxelSystem != nullptr && colliderOther.voxelVolume != InvalidVoxelVolumeHandle)
+                                ? voxelSystem->SampleSignedDistance(colliderOther.voxelVolume, position) - approxRadius
+                                : safeStep; // no voxel system available - can't march against it, don't let it shrink safeStep
+                        }
+                        else
+                        {
+                            // SDF::Distance works uniformly for Sphere, Box,
+                            // Capsule, AND Plane - a real payoff of building
+                            // narrow phase on true distance fields instead of
+                            // one-off shape-pair code: this loop doesn't need
+                            // to know or care which shape `other` is.
+                            // `other`'s own scale applied via a scaled
+                            // COPY of its shape parameters, same reasoning as
+                            // TestSphereVsSDFShape - see SDF::ScaledCollider.
+                            ColliderComponent scaledOther = SDF::ScaledCollider(colliderOther, transformOther.scale);
+                            glm::vec3 local = SDF::WorldToLocal(position, transformOther, colliderOther);
+                            distanceToOtherSurface = SDF::Distance(scaledOther, local) - approxRadius;
+                        }
 
                         if (distanceToOtherSurface < safeStep)
                         {
@@ -1234,79 +1513,10 @@ namespace Eden
         }
 
         // Rough AABB half-extents per shape in WORLD space, used only to
-        // decide which grid cells a collider touches - doesn't need to
-        // be tight, just conservative (never smaller than the shape's
-        // true rotated bounds). Sphere is rotation-invariant (a rotated
-        // sphere is the same sphere) so its local half-extents ARE its
-        // world ones; Box and Capsule need the actual rotation to bound
-        // correctly - a rotated box's world AABB is bigger than its own
-        // half-extents, and using the un-rotated bound here would let
-        // the broad phase miss cells a tilted box actually overlaps,
-        // silently dropping candidate pairs.
-        //
-        // `scale` applied FIRST (to collider.radius/halfExtents/
-        // halfHeight), before rotation - matching every other scale fix
-        // in this file, and matching TransformComponent::GetModelMatrix's
-        // own translate*rotate*scale order. Without this, a scaled-up
-        // collider's broad-phase AABB would stay authored-size, which
-        // could make the broad phase reject a pair that the (correctly
-        // scaled, post-SDF.h-fix) narrow phase would actually consider
-        // overlapping - a scaled collider silently failing to collide at
-        // all past a certain distance, not just responding at the wrong
-        // size.
-        glm::vec3 AabbHalfExtents(const ColliderComponent& collider, const glm::vec3& rotationDegrees, const glm::vec3& scale)
-        {
-            switch (collider.shape)
-            {
-                case ColliderShape::Sphere:
-                    // Isotropic shape under anisotropic scale - same
-                    // averaging approximation as TestCapsulePlane's
-                    // radius above (exact under uniform scale).
-                    return glm::vec3(collider.radius * (scale.x + scale.y + scale.z) / 3.0f);
-
-                case ColliderShape::Box:
-                {
-                    // Standard OBB -> AABB formula: the world half-extent
-                    // along each world axis is the sum, over the box's
-                    // own local axes, of |that axis's component along the
-                    // world axis| * the box's half-extent along that
-                    // local axis. Equivalent to transforming the
-                    // half-extent vector by the absolute value of the
-                    // rotation matrix.
-                    glm::mat3 rotation = SDF::RotationMatrixFromDegrees(rotationDegrees);
-                    glm::vec3 scaledHalf = collider.halfExtents * scale;
-                    glm::vec3 worldHalf(0.0f);
-                    for (int worldAxis = 0; worldAxis < 3; ++worldAxis)
-                    {
-                        worldHalf[worldAxis] =
-                            std::abs(rotation[0][worldAxis]) * scaledHalf.x +
-                            std::abs(rotation[1][worldAxis]) * scaledHalf.y +
-                            std::abs(rotation[2][worldAxis]) * scaledHalf.z;
-                    }
-                    return worldHalf;
-                }
-
-                case ColliderShape::Capsule:
-                {
-                    // A capsule's world AABB is its rotated axis
-                    // (scaled by halfHeight) plus radius padding in every
-                    // direction - bounds the two hemisphere caps
-                    // wherever the axis actually points, not just
-                    // straight up. halfHeight scales along local Y
-                    // (matching TestCapsulePlane); radius uses the same
-                    // isotropic X/Z-average approximation as above.
-                    glm::mat3 rotation = SDF::RotationMatrixFromDegrees(rotationDegrees);
-                    glm::vec3 axis = rotation * glm::vec3(0.0f, 1.0f, 0.0f);
-                    float scaledHalfHeight = collider.halfHeight * scale.y;
-                    float scaledRadius = collider.radius * 0.5f * (scale.x + scale.z);
-                    return glm::abs(axis) * scaledHalfHeight + glm::vec3(scaledRadius);
-                }
-
-                case ColliderShape::Plane:
-                    return glm::vec3(0.0f); // unused - planes bypass the grid, see below
-            }
-            return glm::vec3(0.5f);
-        }
+        // decide which grid cells a collider touches - see
+        // ColliderWorldAabbHalfExtents (ColliderBounds.h) for the actual
+        // implementation, shared with ParticleSystemGPU's collider cell
+        // mask now rather than duplicated here.
 
         // Uniform-grid broad phase: buckets every non-Plane collider's
         // AABB into grid cells (a collider spanning multiple cells is
@@ -1342,7 +1552,7 @@ namespace Eden
                     continue; // "infinite" - not a meaningful size sample
                 }
 
-                glm::vec3 half = AabbHalfExtents(collider, transforms.Get(entity).rotationDegrees, transforms.Get(entity).scale);
+                glm::vec3 half = ColliderWorldAabbHalfExtents(collider, transforms.Get(entity).rotationDegrees, transforms.Get(entity).scale);
                 totalDiameter += 2.0f * glm::max(half.x, glm::max(half.y, half.z));
                 ++count;
             }
@@ -1377,7 +1587,7 @@ namespace Eden
                 const TransformComponent& entityTransform = transforms.Get(entity);
                 glm::mat3 rotation = SDF::RotationMatrixFromDegrees(entityTransform.rotationDegrees);
                 glm::vec3 center = entityTransform.position + rotation * collider.localOffset;
-                glm::vec3 half = AabbHalfExtents(collider, entityTransform.rotationDegrees, entityTransform.scale);
+                glm::vec3 half = ColliderWorldAabbHalfExtents(collider, entityTransform.rotationDegrees, entityTransform.scale);
 
                 CellKey minCell = CellOf(center - half, cellSize);
                 CellKey maxCell = CellOf(center + half, cellSize);
@@ -1501,7 +1711,7 @@ namespace Eden
                 }
 
                 const TransformComponent& moverTransform = transforms.Get(mover);
-                glm::vec3 moverHalf = AabbHalfExtents(moverCollider, moverTransform.rotationDegrees, moverTransform.scale);
+                glm::vec3 moverHalf = ColliderWorldAabbHalfExtents(moverCollider, moverTransform.rotationDegrees, moverTransform.scale);
                 float moverApproxRadius = glm::min(moverHalf.x, glm::min(moverHalf.y, moverHalf.z));
                 if (moverApproxRadius <= 0.0f)
                 {
@@ -1623,7 +1833,7 @@ namespace Eden
         }
     }
 
-    void CollisionSystem::Step(Registry& registry, float fixedDeltaTime)
+    void CollisionSystem::Step(Registry& registry, float fixedDeltaTime, const VoxelSystemGPU* voxelSystem)
     {
         auto& transforms = registry.GetStorage<TransformComponent>();
         auto& colliders = registry.GetStorage<ColliderComponent>();
@@ -1748,7 +1958,7 @@ namespace Eden
 
         if (enableContinuousCollisionSweep)
         {
-            ConservativeAdvanceDynamicBodies(entities, transforms, colliders, bodies, fixedDeltaTime, maxSweepSubsteps);
+            ConservativeAdvanceDynamicBodies(entities, transforms, colliders, bodies, fixedDeltaTime, maxSweepSubsteps, voxelSystem);
         }
 
         if (adaptiveBroadPhaseCellSize)
@@ -1782,7 +1992,7 @@ namespace Eden
                 continue;
             }
 
-            ContactInfo info = TestCollision(colliders.Get(a), transforms.Get(a), colliders.Get(b), transforms.Get(b));
+            ContactInfo info = TestCollision(colliders.Get(a), transforms.Get(a), colliders.Get(b), transforms.Get(b), voxelSystem);
             if (info.colliding)
             {
                 contacts.push_back({ a, b, info.normal, info.penetration, info.point });
