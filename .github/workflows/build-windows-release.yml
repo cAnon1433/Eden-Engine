@@ -46,11 +46,48 @@ jobs:
       # exports VULKAN_SDK, which CMakeLists.txt's find_package(Vulkan
       # REQUIRED) picks up automatically - no extra CMake flags needed
       # on top of what already works locally.
+      #
+      # cache: false, DELIBERATELY (this was cache: true and is the
+      # likely root cause of a real failure): a prior run's install may
+      # have been interrupted after only Bin/ was populated, and with
+      # caching on, every run since was silently restoring that same
+      # incomplete SDK - directory listing showed only Bin/ present,
+      # Include/ genuinely missing on disk, confirmed by CMake's own
+      # generate-time path-existence check failing on it. Turning
+      # caching off forces a real, complete download every run. Safe to
+      # re-enable later once confirmed stable, but not worth the risk
+      # of silently reintroducing the same failure to save ~a minute of
+      # download time per run.
       - name: Install Vulkan SDK
         uses: humbletim/install-vulkan-sdk@v1.2
         with:
           version: latest
-          cache: true
+          cache: false
+
+      # Fails fast with a clear message here rather than three steps
+      # later as a confusing CMake "Imported target ... includes non-
+      # existent path" error at generate time - this is exactly the
+      # failure mode that happened above, and if it happens again (e.g.
+      # a genuinely broken upstream SDK release) this makes it obvious
+      # in seconds instead of needing another full log round-trip to
+      # diagnose.
+      - name: Verify Vulkan SDK install
+        shell: pwsh
+        run: |
+          Write-Host "VULKAN_SDK = $env:VULKAN_SDK"
+          $missing = @()
+          foreach ($sub in "Include", "Lib") {
+            $p = Join-Path $env:VULKAN_SDK $sub
+            if (-not (Test-Path $p)) { $missing += $p }
+          }
+          if ($missing.Count -gt 0) {
+            Write-Host "Vulkan SDK install is incomplete - missing:"
+            $missing | ForEach-Object { Write-Host "  $_" }
+            Write-Host "Full contents of VULKAN_SDK:"
+            Get-ChildItem "$env:VULKAN_SDK" -Recurse -Depth 1 -ErrorAction SilentlyContinue
+            exit 1
+          }
+          Write-Host "Vulkan SDK install looks complete."
 
       # Same generator/config as Package Eden for Testers (Windows).bat,
       # so a CI-built zip and a locally-packaged zip are the same shape.
@@ -88,24 +125,13 @@ jobs:
       - name: Configure
         shell: pwsh
         run: |
-          # Diagnostic first: if this still fails, the log will show
-          # exactly what VULKAN_SDK actually resolved to (or that it's
-          # empty/missing entirely) instead of leaving that a guess.
-          Write-Host "VULKAN_SDK = $env:VULKAN_SDK"
-          if ($env:VULKAN_SDK) { Get-ChildItem "$env:VULKAN_SDK" -ErrorAction SilentlyContinue }
-
-          # Passing Vulkan_INCLUDE_DIR/Vulkan_LIBRARY explicitly rather
-          # than relying on FindVulkan.cmake's own $ENV{VULKAN_SDK}
-          # auto-detection, which is what actually failed last run
-          # ("missing: Vulkan_LIBRARY Vulkan_INCLUDE_DIR") despite
-          # VULKAN_SDK apparently being set - GitHub Actions runner
-          # environment propagation across steps should make that env
-          # var visible here regardless of the MSVC dev-environment
-          # step in between, so rather than keep guessing why CMake's
-          # own auto-detection isn't finding it, this hands CMake the
-          # exact paths directly - correct as long as VULKAN_SDK points
-          # at a standard-layout SDK install (Include/, Lib/), which
-          # every official LunarG-distributed SDK does.
+          # Vulkan_INCLUDE_DIR/Vulkan_LIBRARY passed explicitly rather
+          # than relying purely on FindVulkan.cmake's own $ENV{VULKAN_SDK}
+          # auto-detection - now that the Verify step above guarantees
+          # Include/ and Lib/ actually exist first, this is just a
+          # small extra robustness margin against find_package's own
+          # search logic disagreeing with the env var for any reason,
+          # not a workaround for a real problem the way it was before.
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
             -DVulkan_INCLUDE_DIR="$env:VULKAN_SDK\Include" `
             -DVulkan_LIBRARY="$env:VULKAN_SDK\Lib\vulkan-1.lib"
