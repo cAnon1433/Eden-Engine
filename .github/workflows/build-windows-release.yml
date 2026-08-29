@@ -1,0 +1,88 @@
+name: Build & Release Eden (Windows)
+
+# Manual trigger ONLY (the "Run workflow" button under the Actions tab
+# on GitHub) - deliberately NOT on every push to main. The push-on-
+# close prompt in Run Eden (Mac).command pushes to main quite casually
+# (every session close, potentially several times a day, sometimes
+# mid-work) - tying a full build + a new public Release to every one
+# of those would spam the Releases page and occasionally publish a
+# build made from an in-progress commit. Building only when explicitly
+# asked for keeps a Release meaning "this is worth testers grabbing."
+#
+# If a fully automatic release-on-push-to-main ever becomes more
+# useful than this, uncomment the "push" trigger below - the rest of
+# the workflow doesn't need to change either way.
+on:
+  workflow_dispatch: {}
+  # push:
+  #   branches: [ main ]
+
+permissions:
+  contents: write   # required to publish a Release with an attached asset
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # humbletim/install-vulkan-sdk installs the full Vulkan SDK and
+      # exports VULKAN_SDK, which CMakeLists.txt's find_package(Vulkan
+      # REQUIRED) picks up automatically - no extra CMake flags needed
+      # on top of what already works locally.
+      - name: Install Vulkan SDK
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: latest
+          cache: true
+
+      # Same generator/config as Package Eden for Testers (Windows).bat,
+      # so a CI-built zip and a locally-packaged zip are the same shape.
+      # No need to pass a static-CRT flag here - CMakeLists.txt already
+      # sets CMAKE_MSVC_RUNTIME_LIBRARY globally, so this Release build
+      # is self-contained (no VC++ redistributable needed by whoever
+      # downloads it) without any CI-specific configuration.
+      - name: Configure
+        run: cmake -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/Eden-Windows | Out-Null
+          Copy-Item -Path "build/Release/*" -Destination "dist/Eden-Windows/" -Recurse -Force
+          # .pdb/.ilk are debug-info/incremental-link byproducts - meaningless
+          # to a tester and just extra download size.
+          Remove-Item -Path "dist/Eden-Windows/*.pdb" -ErrorAction SilentlyContinue
+          Remove-Item -Path "dist/Eden-Windows/*.ilk" -ErrorAction SilentlyContinue
+          Compress-Archive -Path "dist/Eden-Windows/*" -DestinationPath "dist/Eden-Windows.zip" -Force
+
+      # Also uploaded as a plain workflow artifact (visible under the
+      # Actions run itself, expires after 90 days) as a lightweight
+      # sanity-check path - the actual thing testers should be pointed
+      # at is the Release created below, which doesn't expire.
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Eden-Windows
+          path: dist/Eden-Windows.zip
+
+      # Every run gets its own uniquely-tagged Release (build-<run
+      # number>) rather than one shared "latest" tag that gets moved/
+      # overwritten each time - avoids the extra tag-deletion step a
+      # rolling release needs, and GitHub already marks whichever
+      # Release is newest as "Latest" in its own UI, so there's no
+      # extra step needed for someone landing on the Releases page to
+      # find the current build. Older Releases just accumulate until
+      # you delete them manually - a much simpler failure mode than a
+      # rolling-tag update silently going wrong.
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: "Eden - build ${{ github.run_number }}"
+          files: dist/Eden-Windows.zip
+          generate_release_notes: true
