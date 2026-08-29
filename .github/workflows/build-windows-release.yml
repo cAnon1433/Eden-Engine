@@ -58,21 +58,53 @@ jobs:
       # sets CMAKE_MSVC_RUNTIME_LIBRARY globally, so this Release build
       # is self-contained (no VC++ redistributable needed by whoever
       # downloads it) without any CI-specific configuration.
+      #
+      # DELIBERATE DIVERGENCE from the local .bat scripts here: those
+      # use the "Visual Studio 17 2022" CMake generator (a multi-config
+      # generator, output lands in build/Release/) because it gives
+      # Hawkins a real .sln to open and debug in the VS IDE locally.
+      # On this runner, that exact generator failed with "could not
+      # find any instance of Visual Studio" - a known, occasionally-
+      # flaky vswhere-based detection issue in CMake's VS-generator
+      # path, unrelated to whether Visual Studio is actually present
+      # (windows-latest ships with VS 2022 preinstalled). The robust,
+      # widely-used workaround - and what's used here - is to sidestep
+      # that detection entirely: activate the MSVC developer
+      # environment directly (ilammy/msvc-dev-cmd, i.e. vcvarsall.bat)
+      # so cl.exe is just on PATH, then build with Ninja, a single-
+      # config generator that has no VS-instance lookup of its own at
+      # all. Nobody needs a .sln on this runner - it only ever produces
+      # a zip - so losing that isn't a real loss here.
+      #
+      # Ninja is a SINGLE-config generator: output lands directly in
+      # build/Eden.exe (NOT build/Release/Eden.exe like the VS
+      # generator produces locally) - see the Package step below, which
+      # is written for this layout, not the local scripts' layout.
+      - name: Set up MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Configure
-        run: cmake -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
-        run: cmake --build build --config Release
+        run: cmake --build build
 
       - name: Package
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist/Eden-Windows | Out-Null
-          Copy-Item -Path "build/Release/*" -Destination "dist/Eden-Windows/" -Recurse -Force
-          # .pdb/.ilk are debug-info/incremental-link byproducts - meaningless
-          # to a tester and just extra download size.
-          Remove-Item -Path "dist/Eden-Windows/*.pdb" -ErrorAction SilentlyContinue
-          Remove-Item -Path "dist/Eden-Windows/*.ilk" -ErrorAction SilentlyContinue
+          # Explicit paths, not a wildcard "build/*" copy - Ninja's
+          # single-config layout puts Eden.exe directly alongside CMake's
+          # own build-system files (build.ninja, CMakeCache.txt,
+          # CMakeFiles/, etc.) in the SAME directory, unlike the VS
+          # generator's build/Release/ which only ever holds real output.
+          # Listing exactly what a distributable needs avoids packaging
+          # any of that build-system cruft into the zip.
+          Copy-Item -Path "build/Eden.exe" -Destination "dist/Eden-Windows/"
+          Copy-Item -Path "build/Shaders" -Destination "dist/Eden-Windows/Shaders" -Recurse
+          Copy-Item -Path "build/Assets" -Destination "dist/Eden-Windows/Assets" -Recurse
           Compress-Archive -Path "dist/Eden-Windows/*" -DestinationPath "dist/Eden-Windows.zip" -Force
 
       # Also uploaded as a plain workflow artifact (visible under the
