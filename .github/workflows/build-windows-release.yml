@@ -86,7 +86,29 @@ jobs:
           arch: x64
 
       - name: Configure
-        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+        shell: pwsh
+        run: |
+          # Diagnostic first: if this still fails, the log will show
+          # exactly what VULKAN_SDK actually resolved to (or that it's
+          # empty/missing entirely) instead of leaving that a guess.
+          Write-Host "VULKAN_SDK = $env:VULKAN_SDK"
+          if ($env:VULKAN_SDK) { Get-ChildItem "$env:VULKAN_SDK" -ErrorAction SilentlyContinue }
+
+          # Passing Vulkan_INCLUDE_DIR/Vulkan_LIBRARY explicitly rather
+          # than relying on FindVulkan.cmake's own $ENV{VULKAN_SDK}
+          # auto-detection, which is what actually failed last run
+          # ("missing: Vulkan_LIBRARY Vulkan_INCLUDE_DIR") despite
+          # VULKAN_SDK apparently being set - GitHub Actions runner
+          # environment propagation across steps should make that env
+          # var visible here regardless of the MSVC dev-environment
+          # step in between, so rather than keep guessing why CMake's
+          # own auto-detection isn't finding it, this hands CMake the
+          # exact paths directly - correct as long as VULKAN_SDK points
+          # at a standard-layout SDK install (Include/, Lib/), which
+          # every official LunarG-distributed SDK does.
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            -DVulkan_INCLUDE_DIR="$env:VULKAN_SDK\Include" `
+            -DVulkan_LIBRARY="$env:VULKAN_SDK\Lib\vulkan-1.lib"
 
       - name: Build
         run: cmake --build build
