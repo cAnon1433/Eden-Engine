@@ -18,7 +18,7 @@ namespace Eden
     // Voxel/marching-cubes deformable geometry - the "SDF-as-visual-
     // geometry" fork the physics planning notes left open. A registered
     // volume's actual visible surface is extracted from a density field
-    // by marching cubes (MarchingCubesTables.h), not authored/loaded
+    // by marching cubes (MarchingCubesTables33.h), not authored/loaded
     // triangle data - carving a region of the field and re-marching is
     // how corrosion works, without ever touching a CPU-side mesh asset.
     //
@@ -139,6 +139,34 @@ namespace Eden
         void SeedFromParticles(VoxelVolumeHandle handle, const std::vector<glm::vec3>& localPositions, float particleRadius,
                                 float smoothRadius = 0.0f);
 
+        // Terrain seeding (Terrain Gen Phase 1 - see planning notes
+        // addendum's "scenes" section, this is the non-streaming proof-
+        // of-pipeline step before chunk loading/LOD gets built on top).
+        // Writes a pseudo-SDF heightfield: density = worldY - terrainHeight(worldX,worldZ),
+        // where terrainHeight is baseHeight plus a multi-octave (fBm)
+        // glm::perlin sum. NOT an exact signed distance off-flat (a true
+        // SDF to a sloped/noisy surface needs distance-to-nearest-point,
+        // not a vertical offset) - the vertical-offset shortcut is only
+        // accurate for surfaces close to horizontal, same "good enough,
+        // not exact" tradeoff SeedFromParticles' hard-union documents
+        // for its own approximation. Fine for the current "flat-ish"
+        // terrain target; revisit with a real distance estimate (e.g.
+        // gradient-corrected offset) if amplitude/frequency ever produce
+        // steep enough slopes for the approximation to visibly distort
+        // collision or the marched surface.
+        //
+        // frequency is in world-units^-1 (matches glm::perlin's own
+        // input scale - smaller = broader features). octaves > 1 layers
+        // progressively higher-frequency, lower-amplitude noise on top
+        // (each octave halves amplitude, doubles frequency - standard
+        // fBm). seed offsets the sample domain so different seeds don't
+        // just look like a panned copy of the same noise.
+        //
+        // Same "full CPU loop + full upload + mark everything dirty,
+        // caller marches after" contract as SeedSphere/SeedBox.
+        void SeedHeightfieldNoise(VoxelVolumeHandle handle, float baseHeight, float amplitude,
+                                   float frequency, int octaves, uint32_t seed);
+
         // Re-triangulates every chunk currently flagged dirty (every
         // chunk, right after a Seed* call; a small touched subset after
         // a Carve() call) via voxel_march.comp - the one remaining GPU
@@ -258,6 +286,17 @@ namespace Eden
             float voxelSize = 0.1f;
         };
         VolumeBounds GetVolumeBounds(VoxelVolumeHandle handle) const;
+
+        // Ghost-sample neighbor wiring for terrain tiles - see
+        // Volume::neighborNegX etc.'s comment and voxel_march.comp's
+        // DensityAt. Pass InvalidVoxelVolumeHandle for any direction
+        // with no neighbor (a grid edge tile, or any non-terrain
+        // volume - which simply never calls this at all). One-time
+        // setup call, meant to run once after every terrain tile is
+        // registered, not per-frame; takes effect on that volume's next
+        // MarchDirtyChunks call.
+        void SetVolumeNeighbors(VoxelVolumeHandle handle, VoxelVolumeHandle negX, VoxelVolumeHandle posX,
+                                 VoxelVolumeHandle negZ, VoxelVolumeHandle posZ);
 
         // Frees a volume's per-volume GPU resources (vertex/indirect/
         // dirtyFlags/instance buffers), reclaims its region of the
@@ -406,11 +445,15 @@ namespace Eden
             // VoxelSystemGPU::m_SharedDensityBuffer's comment for why
             // this moved to one buffer shared across every volume.
             // densityOffsetElements is this volume's starting index
-            // (in float ELEMENTS, not bytes) within that shared buffer,
-            // aligned to m_StorageBufferOffsetAlignment (queried once at
-            // Init time) so it's always legal to bind as a
-            // VkDescriptorBufferInfo::offset for voxel_march.comp's
-            // per-volume compute set (see RegisterVolume).
+            // (in float ELEMENTS, not bytes) within that shared buffer.
+            // Still allocated aligned to m_StorageBufferOffsetAlignment
+            // (queried once at Init time) even though binding 0 no
+            // longer uses this as a VkDescriptorBufferInfo::offset (see
+            // RegisterVolume's comment on why binding 0 is now the full
+            // buffer) - harmless to keep, and this value is also what
+            // gets handed to other volumes as a ghost-sample neighbor
+            // offset (see SetVolumeNeighbors/MarchDirtyChunks), so
+            // nothing here actually needed to change.
             VkDeviceSize densityOffsetElements = 0;
             VulkanBuffer vertices;   // Vertex, desc.NumChunks() * kVoxelMaxVerticesPerChunk entries
             VulkanBuffer indirect;   // VkDrawIndirectCommand, desc.NumChunks() entries
@@ -453,6 +496,19 @@ namespace Eden
             // The cheap per-chunk collision flag - see Carve()'s comment
             // in the header for what "cheap" means here.
             std::vector<bool> chunkSolid;
+
+            // Ghost-sample neighbors for gradient continuity across
+            // terrain tile boundaries - see SetVolumeNeighbors and
+            // voxel_march.comp's DensityAt. InvalidVoxelVolumeHandle
+            // (the default) means "no neighbor in that direction," which
+            // is every volume except terrain tiles that aren't on the
+            // grid's outer edge - a small test shape or a reform blob
+            // simply never has these set, so it keeps the exact old
+            // clamp-at-edge behavior with zero extra cost.
+            VoxelVolumeHandle neighborNegX = InvalidVoxelVolumeHandle;
+            VoxelVolumeHandle neighborPosX = InvalidVoxelVolumeHandle;
+            VoxelVolumeHandle neighborNegZ = InvalidVoxelVolumeHandle;
+            VoxelVolumeHandle neighborPosZ = InvalidVoxelVolumeHandle;
         };
 
         void CreateComputeLayout();
@@ -615,11 +671,13 @@ namespace Eden
         VkDeviceSize m_StorageBufferOffsetAlignmentBytes = 1;
 
         // Shared, uploaded once at Init - every volume's compute
-        // descriptor set binds the SAME table buffers (read-only,
-        // never change), only their density/vertex/indirect/dirty
-        // buffers differ per volume. See MarchingCubesTables.h.
-        VulkanBuffer m_EdgeTable;
-        VulkanBuffer m_TriTable;
+        // descriptor set binds the SAME table buffer (read-only,
+        // never changes), only their density/vertex/indirect/dirty
+        // buffers differ per volume. Single buffer (was two - edge
+        // table + tri table) since the MC33 rewrite packs every table
+        // Lewiner's algorithm needs into one blob - see
+        // MarchingCubesTables33.h's provenance comment for why.
+        VulkanBuffer m_MC33Table;
 
         VkDescriptorSetLayout m_ComputeSetLayout = VK_NULL_HANDLE;
         VulkanDescriptorPool m_ComputeDescriptorPool;

@@ -25,6 +25,7 @@
 #include <imgui.h>
 
 #include <iostream>
+#include <cstdio>
 #include <cstdlib>
 #include <cmath>
 #include <algorithm>
@@ -183,6 +184,64 @@ namespace
     // for a first interactive test, worth revisiting (a deferred-
     // dispatch pattern like ParticleSystemGPU's RecordPendingSteps) if
     // "drill while holding" ever becomes the actual desired feel.
+    // Cheap ray-vs-AABB slab test, world-space - used to skip candidates
+    // in FindTargetedVolume whose bounds the ray doesn't actually come
+    // near, BEFORE calling RaycastSurfaceSegments. Real bug this fixes,
+    // not just a performance nicety: SampleDensityTrilinear CLAMPS any
+    // out-of-bounds query to the volume's nearest edge sample rather than
+    // reporting "not near this volume" - harmless when there was one
+    // terrain volume (or small, localized test shapes) in the candidate
+    // list, but with terrain now split into a 3x3 chunk grid
+    // (RegisterTerrainChunks below), every click raycasts against 9
+    // volumes, most of which the camera isn't anywhere near. For those,
+    // every sample along the ray got clamped to that chunk's boundary
+    // column, which can read as a false "solid" hit right at the ray
+    // origin - and FindTargetedVolume keeps whichever candidate's hit is
+    // CLOSEST, so a spurious near-origin false-positive on some far-off
+    // chunk could beat the real hit on the ground actually being looked
+    // at. Returns false (skip) only when the ray provably never comes
+    // within maxDistance of the box - true positives always still reach
+    // the real raycast.
+    bool RayIntersectsAABB(const glm::vec3& rayOrigin, const glm::vec3& rayDir, float maxDistance,
+                            const glm::vec3& aabbMin, const glm::vec3& aabbMax)
+    {
+        float tMin = 0.0f;
+        float tMax = maxDistance;
+
+        for (int axis = 0; axis < 3; ++axis)
+        {
+            float origin = rayOrigin[axis];
+            float dir = rayDir[axis];
+            float boxMin = aabbMin[axis];
+            float boxMax = aabbMax[axis];
+
+            if (std::abs(dir) < 1e-8f)
+            {
+                // Parallel to this axis' slab - miss unless already
+                // inside it on this axis.
+                if (origin < boxMin || origin > boxMax)
+                {
+                    return false;
+                }
+                continue;
+            }
+
+            float invDir = 1.0f / dir;
+            float t0 = (boxMin - origin) * invDir;
+            float t1 = (boxMax - origin) * invDir;
+            if (t0 > t1) std::swap(t0, t1);
+
+            tMin = std::max(tMin, t0);
+            tMax = std::min(tMax, t1);
+            if (tMin > tMax)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     // Raycasts every candidate volume and returns whichever one the
     // camera is actually looking at (closest hit's entry point across
     // all candidates), plus that hit's surface segments - or nullopt if
@@ -198,9 +257,18 @@ namespace
     {
         std::optional<Eden::VoxelVolumeHandle> best;
         float bestDistanceSq = std::numeric_limits<float>::max();
+        glm::vec3 rayDir = glm::normalize(camera.Front);
 
         for (Eden::VoxelVolumeHandle handle : candidates)
         {
+            // AABB pre-check - see RayIntersectsAABB's own comment for
+            // why this is a correctness fix, not just an optimization.
+            Eden::VoxelSystemGPU::VolumeBounds bounds = voxelSystem.GetVolumeBounds(handle);
+            if (!RayIntersectsAABB(camera.Position, rayDir, maxDistance, bounds.worldMin, bounds.worldMax))
+            {
+                continue;
+            }
+
             std::vector<std::pair<glm::vec3, glm::vec3>> segments;
             if (!voxelSystem.RaycastSurfaceSegments(handle, camera.Position, camera.Front, maxDistance, segments))
             {
@@ -268,8 +336,148 @@ namespace
         }
     }
 
+    // Cross-tile carve helper. Terrain is 9 separate VoxelVolumeHandles
+    // (see the terrain registration loop's own comment on why), and
+    // Carve() only ever touches ONE handle. Previously that meant a
+    // carve brush reaching into a neighboring tile's territory left that
+    // tile completely untouched - a PERMANENT stale seam at every tile
+    // boundary, no matter how correct the within-one-volume chunk sync
+    // is (that's a different bug, already fixed - see Carve()'s chunkMin
+    // BUGFIX comment. Confirmed by testing: internal chunk boundaries
+    // are clean now, only tile boundaries still show a seam - this is
+    // the cross-volume version of that exact same "shared boundary
+    // sample" problem, one level up).
+    //
+    // Fix: carve every terrain tile whose bounds the (padded) brush
+    // could plausibly reach, not just whichever one FindTargetedVolume
+    // picked as the primary target - not "detect a crossing," just
+    // unconditionally check all of them, since Carve() already clamps
+    // gracefully (see its own "BOUNDARY CLAMPED" logging) when a request
+    // mostly falls outside a volume's bounds, so carving a tile that
+    // turns out not to actually be touched is a safe, cheap no-op, not a
+    // correctness risk.
+    //
+    // Only applies when the primary target IS a terrain tile - the
+    // small test sphere and any ReformSystem blob are isolated objects
+    // with no "neighbor" concept, so this is skipped entirely for those
+    // (checked via terrainTileHandles, not by shape/size, since that's
+    // the actual thing that determines whether "neighbor" means
+    // anything here).
+    std::vector<Eden::VoxelVolumeHandle> CarveAcrossTerrainTiles(Eden::VoxelSystemGPU& voxelSystem,
+                                                                   const std::vector<Eden::VoxelVolumeHandle>& terrainTileHandles,
+                                                                   Eden::VoxelVolumeHandle primaryTarget,
+                                                                   const glm::vec3& worldPos, float radius)
+    {
+        std::vector<Eden::VoxelVolumeHandle> touched;
+        touched.push_back(primaryTarget);
+        voxelSystem.Carve(primaryTarget, worldPos, radius);
+
+        auto sameHandle = [](Eden::VoxelVolumeHandle a, Eden::VoxelVolumeHandle b)
+        {
+            return a == b; // VoxelVolumeHandle is a packed generational uint64_t (see VoxelField.h) - plain equality already compares both index and generation
+        };
+
+        bool primaryIsTerrainTile = false;
+        for (Eden::VoxelVolumeHandle tile : terrainTileHandles)
+        {
+            if (sameHandle(tile, primaryTarget))
+            {
+                primaryIsTerrainTile = true;
+                break;
+            }
+        }
+        if (!primaryIsTerrainTile)
+        {
+            return touched;
+        }
+
+        // Same margin Carve() itself already uses internally (1 voxel of
+        // padding beyond the brush radius) - a neighbor only needs
+        // carving at all if the brush could plausibly reach even one
+        // sample into its territory. This is generous on purpose, not
+        // just "1 voxel": a straight face-adjacent neighbor only ever
+        // has ONE axis out of bounds, so the distance-to-AABB check
+        // below reduces to that single axis and a small margin is
+        // plenty - but a DIAGONAL corner neighbor has TWO axes out of
+        // bounds simultaneously, and the Euclidean distance combines
+        // them (sqrt(dx^2+dz^2)), which climbs past a tight margin fast
+        // even when the carve is genuinely close to the corner. Confirmed
+        // real, not theoretical: a logged corner carve measured 1.42
+        // units from the diagonal tile's nearest point while the old
+        // margin was 1.3 - missed by a hair, every single time near that
+        // corner, leaving it permanently uncarved while its two edge-
+        // adjacent neighbors kept getting carved. Being this generous
+        // costs nothing - Carve() already no-ops cleanly on a tile the
+        // sphere doesn't actually reach (see its own "BOUNDARY CLAMPED"
+        // logging), so a few extra harmless calls near a corner is a
+        // fine trade for not silently skipping the diagonal tile.
+        float margin = radius + 2.0f;
+
+        for (Eden::VoxelVolumeHandle tile : terrainTileHandles)
+        {
+            if (sameHandle(tile, primaryTarget) || !voxelSystem.IsValid(tile))
+            {
+                continue;
+            }
+
+            Eden::VoxelSystemGPU::VolumeBounds bounds = voxelSystem.GetVolumeBounds(tile);
+            glm::vec3 closestPoint = glm::clamp(worldPos, bounds.worldMin, bounds.worldMax);
+            float distance = glm::length(worldPos - closestPoint);
+            if (distance <= margin)
+            {
+                voxelSystem.Carve(tile, worldPos, radius);
+                touched.push_back(tile);
+            }
+        }
+
+        // TEMP DEBUG - corner-crack investigation. When this carve
+        // touched 3+ tiles (a corner, not just a shared edge - an edge
+        // only ever touches 2), sample the density at the exact carve
+        // position from EVERY nearby terrain tile - not just the ones
+        // this function decided to touch - and print them side by
+        // side. All tiles seed from the same global noise function, so
+        // pre-carve these should already closely agree; if one of them
+        // still shows a meaningfully different (uncarved-looking) value
+        // right after a carve that was supposed to reach it, that's
+        // direct, undeniable proof of exactly which tile got missed and
+        // by how much - not a proxy metric like [AmbiguousScan]. Remove
+        // once the corner bug is actually understood.
+        if (touched.size() >= 3)
+        {
+            std::printf("[CornerDensityCheck] worldPos=(%.3f,%.3f,%.3f) touchedCount=%zu\n",
+                        worldPos.x, worldPos.y, worldPos.z, touched.size());
+            for (Eden::VoxelVolumeHandle tile : terrainTileHandles)
+            {
+                if (!voxelSystem.IsValid(tile))
+                {
+                    continue;
+                }
+                Eden::VoxelSystemGPU::VolumeBounds bounds = voxelSystem.GetVolumeBounds(tile);
+                glm::vec3 closest = glm::clamp(worldPos, bounds.worldMin, bounds.worldMax);
+                float distToTile = glm::length(worldPos - closest);
+                if (distToTile <= 3.0f) // only print tiles actually anywhere near this corner
+                {
+                    float density = voxelSystem.SampleSignedDistance(tile, worldPos);
+                    bool wasTouched = sameHandle(tile, primaryTarget);
+                    for (Eden::VoxelVolumeHandle t : touched)
+                    {
+                        if (sameHandle(t, tile))
+                        {
+                            wasTouched = true;
+                        }
+                    }
+                    std::printf("[CornerDensityCheck]   tile density=%.4f touched=%s distToBounds=%.3f\n",
+                                density, wasTouched ? "YES" : "no", distToTile);
+                }
+            }
+        }
+
+        return touched;
+    }
+
     void ProcessVoxelCarveInput(GLFWwindow* window, Eden::Renderer& renderer, Eden::Registry& registry,
-                                 Eden::VoxelSystemGPU& voxelSystem, const std::vector<Eden::VoxelVolumeHandle>& candidates)
+                                 Eden::VoxelSystemGPU& voxelSystem, const std::vector<Eden::VoxelVolumeHandle>& candidates,
+                                 const std::vector<Eden::VoxelVolumeHandle>& terrainTileHandles)
     {
         if (!g_CursorLocked)
         {
@@ -303,6 +511,34 @@ namespace
                 constexpr float kCarveRadius = 0.3f; // world units - back down from 1.5. That bump was never a real fix, just a workaround that traded away precision - RecomputeExactDistances (called below) is what actually fixes stale-margin false collisions now, so radius can go back to a size that's actually useful for detail carving (a bite-sized chunk, not the whole sphere).
                 float carveStep = kCarveRadius * 1.2f; // slight overlap so a tunnel has no gaps
 
+                // Every volume actually touched this gesture (primary
+                // target plus any terrain-tile neighbor CarveAcrossTerrainTiles
+                // reached into) - deduplicated so a volume that gets
+                // carved multiple times in one drag (common - the drill-
+                // through loop below steps in small increments) only
+                // gets ONE march/recompute/wake pass afterward, not one
+                // per carve ball.
+                std::vector<Eden::VoxelVolumeHandle> touchedVolumes;
+                auto recordTouched = [&touchedVolumes](const std::vector<Eden::VoxelVolumeHandle>& newlyTouched)
+                {
+                    for (Eden::VoxelVolumeHandle h : newlyTouched)
+                    {
+                        bool alreadyRecorded = false;
+                        for (Eden::VoxelVolumeHandle existing : touchedVolumes)
+                        {
+                            if (existing == h)
+                            {
+                                alreadyRecorded = true;
+                                break;
+                            }
+                        }
+                        if (!alreadyRecorded)
+                        {
+                            touchedVolumes.push_back(h);
+                        }
+                    }
+                };
+
                 bool drillThrough = glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS;
                 if (drillThrough)
                 {
@@ -315,7 +551,8 @@ namespace
                         glm::vec3 segmentDir = segmentLength > 1e-5f ? (exit - entry) / segmentLength : glm::vec3(0.0f);
                         for (float d = 0.0f; d <= segmentLength; d += carveStep)
                         {
-                            voxelSystem.Carve(voxelVolume, entry + segmentDir * d, kCarveRadius);
+                            recordTouched(CarveAcrossTerrainTiles(voxelSystem, terrainTileHandles, voxelVolume,
+                                                                   entry + segmentDir * d, kCarveRadius));
                         }
                     }
                 }
@@ -323,32 +560,37 @@ namespace
                 {
                     // Single bite at the FIRST (nearest) segment's entry
                     // point only - the easy-to-test default.
-                    voxelSystem.Carve(voxelVolume, segments.front().first, kCarveRadius);
+                    recordTouched(CarveAcrossTerrainTiles(voxelSystem, terrainTileHandles, voxelVolume,
+                                                           segments.front().first, kCarveRadius));
                 }
 
-                // One march for the whole click's worth of carving, not
-                // one per carve ball or per segment - see Carve()'s own
-                // comment on why it's split from MarchDirtyChunks.
-                voxelSystem.MarchDirtyChunks(voxelVolume);
+                // One march per touched volume for the whole click's
+                // worth of carving, not one per carve ball or per
+                // segment - see Carve()'s own comment on why it's split
+                // from MarchDirtyChunks.
+                for (Eden::VoxelVolumeHandle touched : touchedVolumes)
+                {
+                    voxelSystem.MarchDirtyChunks(touched);
 
-                // The actual fix for stale-margin false collisions (see
-                // RecomputeExactDistances' own comment for the full
-                // mechanism) - run once per completed carve gesture,
-                // same batching reasoning as MarchDirtyChunks above, not
-                // once per carve ball. Correctness no longer depends on
-                // carve radius or coverage after this runs.
-                voxelSystem.RecomputeExactDistances(voxelVolume);
+                    // The actual fix for stale-margin false collisions (see
+                    // RecomputeExactDistances' own comment for the full
+                    // mechanism) - run once per completed carve gesture,
+                    // same batching reasoning as MarchDirtyChunks above, not
+                    // once per carve ball. Correctness no longer depends on
+                    // carve radius or coverage after this runs.
+                    voxelSystem.RecomputeExactDistances(touched);
 
-                // TEMP DEBUG - testing whether marching cubes' classic
-                // face-ambiguity case is actually present at carve
-                // sites before committing to a table rewrite over it.
-                // Remove once the crack bug is understood.
-                voxelSystem.DebugScanAmbiguousCells(voxelVolume);
+                    // TEMP DEBUG - testing whether marching cubes' classic
+                    // face-ambiguity case is actually present at carve
+                    // sites before committing to a table rewrite over it.
+                    // Remove once the crack bug is understood.
+                    voxelSystem.DebugScanAmbiguousCells(touched);
 
-                // See WakeSleepingBodiesNearVolume's comment - a body
-                // asleep on this volume needs to be told its shape just
-                // changed, or it never falls into what was just carved.
-                WakeSleepingBodiesNearVolume(registry, voxelSystem, voxelVolume);
+                    // See WakeSleepingBodiesNearVolume's comment - a body
+                    // asleep on this volume needs to be told its shape just
+                    // changed, or it never falls into what was just carved.
+                    WakeSleepingBodiesNearVolume(registry, voxelSystem, touched);
+                }
             }
         }
         g_CarveMouseWasDown = mouseDown;
@@ -461,6 +703,110 @@ namespace
 
         return e;
     }
+
+    // --- Terrain Phase 3: chunk-level resident/sleep state -------------
+    // Planning-notes addendum's "scenes" section flags this as an
+    // explicit requirement, distinct from the existing per-RIGID-BODY
+    // sleep/wake system (union-find islands, WakeSleepingBodiesNearVolume
+    // above) - that one is triggered by physical rest/disturbance of a
+    // single body. This is a per-REGION concept layered on top: is a
+    // given terrain chunk within simulation range of the player at all,
+    // independent of whether anything resting on it happens to be
+    // physically at rest.
+    //
+    // What "sleep" actually gates for a terrain chunk today: removing
+    // ColliderComponent (excludes it from CollisionSystem::Step's
+    // registry.View<TransformComponent, ColliderComponent>() AND
+    // ParticleSystemGPU's identical collider-gathering view - both
+    // re-query the registry fresh every step, so this is a REAL
+    // per-frame cost reduction, not cosmetic), plus exclusion from the
+    // render draw-source list and the carve/melt candidate list (no
+    // point raycasting or drawing a chunk nobody's near). It does NOT
+    // gate any kind of reduced tick rate, because nothing currently
+    // ticks on a resting terrain chunk every frame in the first place -
+    // the addendum's own open question ("what ticks at reduced rate vs
+    // not at all") doesn't have material to apply to yet for inert
+    // static geometry. Revisit once something (heat decay, energy
+    // propagation) actually runs per-frame against terrain.
+    //
+    // Known, deliberately unaddressed gap: a dynamic body resting on a
+    // chunk that goes to sleep will fall through - the addendum
+    // explicitly flags "how chunk wake/sleep transitions avoid a
+    // visible pop/stutter" as real, open, undecided design work, and
+    // this doesn't attempt to solve it. Acceptable for now because
+    // sleep only triggers well outside the area being actively played
+    // in for this small test map.
+    struct TerrainChunkState
+    {
+        Eden::VoxelVolumeHandle handle;
+        Eden::Entity entity;
+        glm::vec3 worldCenterXZ; // Y intentionally unused - see UpdateTerrainChunkResidency's own comment on why this is an XZ-only distance check
+        bool resident = true;   // every chunk starts resident - matches Phase 2's "everything registered and marched at startup" behavior
+    };
+
+    // Hysteresis (wake < sleep) instead of one shared threshold - a
+    // chunk exactly at the boundary distance would otherwise flicker
+    // resident/sleeping every frame as the player's position jitters by
+    // fractions of a unit. Doesn't solve the addendum's "visible pop"
+    // concern (there's still a hard cut when a chunk does cross), just
+    // stops it from thrashing at the edge.
+    //
+    // These two numbers are tuned to this SPECIFIC 60x60m test map, not
+    // a real target for a large world: kTerrainWakeRadius (30) is set
+    // just past the farthest chunk-center-to-map-center distance
+    // (~28.3m, the corner chunks) so every chunk starts resident at
+    // spawn with no immediate pop-out, and the whole mechanism only
+    // becomes observable by deliberately walking past the terrain's own
+    // edge into the void beyond it. A real large world would want both
+    // numbers much smaller relative to total world size.
+    constexpr float kTerrainWakeRadius = 30.0f;
+    constexpr float kTerrainSleepRadius = 38.0f;
+
+    void UpdateTerrainChunkResidency(Eden::Registry& registry, Eden::VoxelSystemGPU& voxelSystem,
+                                      std::vector<TerrainChunkState>& chunks, const glm::vec3& playerPosition)
+    {
+        for (TerrainChunkState& chunk : chunks)
+        {
+            if (!voxelSystem.IsValid(chunk.handle) || !registry.IsAlive(chunk.entity))
+            {
+                continue; // editor-destroyed or otherwise gone - not this function's job to handle
+            }
+
+            // XZ-only distance - vertical offset between the player's
+            // eye height and a chunk's center is a near-constant
+            // "standing height above ground" term that shouldn't count
+            // toward residency the way horizontal distance should, same
+            // reasoning real open-world streaming systems use.
+            glm::vec2 delta(playerPosition.x - chunk.worldCenterXZ.x, playerPosition.z - chunk.worldCenterXZ.z);
+            float distance = glm::length(delta);
+
+            if (chunk.resident && distance > kTerrainSleepRadius)
+            {
+                chunk.resident = false;
+                registry.RemoveComponent<Eden::ColliderComponent>(chunk.entity);
+                std::printf("[TerrainLOD] chunk sleeping (distance %.1fm)\n", distance);
+            }
+            else if (!chunk.resident && distance < kTerrainWakeRadius)
+            {
+                chunk.resident = true;
+
+                Eden::VoxelSystemGPU::VolumeBounds bounds = voxelSystem.GetVolumeBounds(chunk.handle);
+                Eden::ColliderComponent collider;
+                collider.shape = Eden::ColliderShape::Voxel;
+                collider.voxelVolume = chunk.handle;
+                collider.halfExtents = (bounds.worldMax - bounds.worldMin) * 0.5f;
+                registry.AddComponent(chunk.entity, collider);
+
+                // Same reasoning as the carve/melt call sites above -
+                // static geometry just reappeared under whatever's
+                // nearby; a sleeping dynamic body resting near it won't
+                // re-evaluate contact on its own until nudged.
+                WakeSleepingBodiesNearVolume(registry, voxelSystem, chunk.handle);
+                std::printf("[TerrainLOD] chunk waking (distance %.1fm)\n", distance);
+            }
+        }
+    }
+
 
     // Spawns one raymarch-rendered box: registers a small VoxelSystemGPU
     // volume sized to halfExtents, seeds it via SeedBox, and builds one
@@ -880,6 +1226,129 @@ int main()
         // test cube above it).
         particleSystem.EmitBox(particleSpawnOrigin - glm::vec3(0.5f), particleSpawnOrigin + glm::vec3(0.5f));
 
+        // --- Terrain (Phase 2: grid of independent chunk volumes) -------
+        // Phase 1 (previous update) proved noise generation + marching
+        // cubes at ~60m scale as ONE VoxelVolumeHandle. This splits that
+        // into a real grid of independently-registered handles - the
+        // actual precondition Phase 3 (resident-radius load/unload,
+        // planning-notes addendum's chunk-LOD/sleep section) needs to
+        // exist against. Streaming/LOD itself is still NOT built here -
+        // every chunk below is registered and marched unconditionally at
+        // startup, same as Phase 1 was. This only changes WHAT the world
+        // is made of (many small volumes instead of one big one), not
+        // when they're resident.
+        //
+        // 3x3 grid, 20m per chunk = 60x60m total footprint, matching
+        // Phase 1's coverage exactly. voxelSize dropped slightly (0.75 ->
+        // 0.625) so 20m divides evenly into whole voxels (20 / (8*0.625)
+        // = 4 exactly) - chunkDims (4,1,4) per chunk: 4*8=32 voxels
+        // horizontal (20m), 1*8=8 voxels vertical (5m, -4..+1 around
+        // baseHeight=0 - slightly less carve depth than Phase 1's 6m,
+        // still comfortable). 9 chunks * 33x9x33 = 9,801 samples each =
+        // 88,209 samples total - still comfortably inside
+        // kSharedDensityBufferCapacityElements alongside the other
+        // smoke-test volumes.
+        //
+        // Real, immediate payoff from splitting now rather than later:
+        // RecomputeExactDistances (see Phase 1's own flagged concern)
+        // is a whole-VOLUME Dijkstra, and a carve only ever targets ONE
+        // volume (FindTargetedVolume picks whichever chunk the raycast
+        // actually hit). So a carve here recomputes over ~9,801 samples
+        // instead of the old single volume's ~59,049 - about 6x cheaper
+        // per carve, for free, just from chunking existing.
+        //
+        // Noise seams: each chunk samples SeedHeightfieldNoise's fBm at
+        // its own absolute worldPos (VoxelVolumeDesc::origin + local
+        // offset) - since every chunk uses the IDENTICAL baseHeight/
+        // amplitude/frequency/octaves/seed, the underlying noise field
+        // is one continuous function of world space regardless of how
+        // many volumes sample it, so adjacent chunks' edges line up with
+        // no visible seam. This only holds as long as every chunk here
+        // shares those five values - don't let a future per-biome
+        // variation pass drift them apart without handling the boundary.
+        constexpr float kTerrainVoxelSize = 0.625f;
+        constexpr glm::ivec3 kTerrainChunkDims{ 4, 1, 4 }; // per world-chunk: 20m x 5m x 20m
+        constexpr int kTerrainGridSize = 3;                // 3x3 world-chunks
+        constexpr float kTerrainChunkWorldSize = 20.0f;    // kTerrainChunkDims.x * 8 * kTerrainVoxelSize
+        constexpr float kTerrainGridWorldMin = -30.0f;     // -(kTerrainGridSize * kTerrainChunkWorldSize) / 2
+        constexpr float kTerrainOriginY = -4.0f;
+
+        constexpr float kTerrainBaseHeight = 0.0f;
+        constexpr float kTerrainAmplitude = 0.5f;
+        constexpr float kTerrainFrequency = 0.05f;
+        constexpr int kTerrainOctaves = 3;
+        constexpr uint32_t kTerrainSeed = 1;
+        constexpr glm::vec4 kTerrainTint{ 0.32f, 0.4f, 0.22f, 1.0f };
+
+        std::vector<TerrainChunkState> terrainChunks;
+        terrainChunks.reserve(kTerrainGridSize * kTerrainGridSize);
+        for (int cz = 0; cz < kTerrainGridSize; ++cz)
+        for (int cx = 0; cx < kTerrainGridSize; ++cx)
+        {
+            Eden::VoxelVolumeDesc chunkDesc;
+            chunkDesc.origin = glm::vec3(kTerrainGridWorldMin + cx * kTerrainChunkWorldSize, kTerrainOriginY,
+                                          kTerrainGridWorldMin + cz * kTerrainChunkWorldSize);
+            chunkDesc.voxelSize = kTerrainVoxelSize;
+            chunkDesc.chunkDims = kTerrainChunkDims;
+            Eden::VoxelVolumeHandle chunk = voxelSystem.RegisterVolume(chunkDesc);
+
+            voxelSystem.SeedHeightfieldNoise(chunk, kTerrainBaseHeight, kTerrainAmplitude,
+                                              kTerrainFrequency, kTerrainOctaves, kTerrainSeed);
+            // MarchDirtyChunks deliberately NOT called here yet - see the
+            // neighbor-wiring pass right after this loop for why: this
+            // tile's ghost-sample neighbors (ADJACENT tiles, some of
+            // which haven't been registered yet at this point in the
+            // loop) need to be wired up BEFORE the first march, or that
+            // march bakes in the old clamped-at-edge gradients along
+            // every seam and nothing after startup ever corrects it
+            // unless that specific chunk happens to get carved later.
+            voxelSystem.SetTransform(chunk, glm::mat4(1.0f), kTerrainTint);
+
+            // Real collision, same as every other voxel volume - Voxel is
+            // the project-wide default (queries the live density field),
+            // so carving/melting this later automatically stays correct
+            // without any collider bookkeeping. particleSystem's existing
+            // GPU boundary-collision path already handles
+            // ColliderShape::Voxel (see ParticleGPUTypes.h's voxelParams),
+            // so SPH particles get this for free too.
+            Eden::Entity chunkEntity = RegisterVoxelPhysicsEntity(registry, voxelSystem, chunk);
+
+            // Center for TerrainChunkState's residency check - reusing
+            // GetVolumeBounds rather than recomputing from chunkDesc so
+            // this always matches RegisterVoxelPhysicsEntity's own idea
+            // of "center" exactly.
+            Eden::VoxelSystemGPU::VolumeBounds chunkBounds = voxelSystem.GetVolumeBounds(chunk);
+            glm::vec3 chunkCenter = (chunkBounds.worldMin + chunkBounds.worldMax) * 0.5f;
+
+            terrainChunks.push_back(TerrainChunkState{ chunk, chunkEntity, chunkCenter, true });
+        }
+
+        // Ghost-sample neighbor wiring, then the FIRST march of every
+        // tile - both deferred until all 9 tiles exist. terrainChunks is
+        // in the same cz-major/cx-minor order as the registration loop
+        // above (index = cz*kTerrainGridSize+cx), so a tile's grid
+        // neighbors are just +-1 steps in that same indexing, no need to
+        // search. Increasing cx/cz is increasing world X/Z (see
+        // chunkDesc.origin above), so cx-1 is the -X neighbor, cx+1 the
+        // +X neighbor, and the same pattern for cz/Z. A grid-edge tile's
+        // missing side(s) correctly get InvalidVoxelVolumeHandle - the
+        // terrain's own outer boundary has no neighbor to ghost-sample
+        // from, same as it always did.
+        for (int cz = 0; cz < kTerrainGridSize; ++cz)
+        for (int cx = 0; cx < kTerrainGridSize; ++cx)
+        {
+            int index = cz * kTerrainGridSize + cx;
+            Eden::VoxelVolumeHandle negX = (cx > 0) ? terrainChunks[index - 1].handle : Eden::InvalidVoxelVolumeHandle;
+            Eden::VoxelVolumeHandle posX = (cx < kTerrainGridSize - 1) ? terrainChunks[index + 1].handle : Eden::InvalidVoxelVolumeHandle;
+            Eden::VoxelVolumeHandle negZ = (cz > 0) ? terrainChunks[index - kTerrainGridSize].handle : Eden::InvalidVoxelVolumeHandle;
+            Eden::VoxelVolumeHandle posZ = (cz < kTerrainGridSize - 1) ? terrainChunks[index + kTerrainGridSize].handle : Eden::InvalidVoxelVolumeHandle;
+            voxelSystem.SetVolumeNeighbors(terrainChunks[index].handle, negX, posX, negZ, posZ);
+        }
+        for (const TerrainChunkState& chunk : terrainChunks)
+        {
+            voxelSystem.MarchDirtyChunks(chunk.handle);
+        }
+
         // --- Voxel/marching-cubes deformable volume smoke test --------
         // First real user of Engine/Voxel/VoxelSystemGPU - registers one
         // small volume (2x2x2 chunks = 16^3 voxels, see
@@ -1088,22 +1557,86 @@ int main()
                                 [&voxelSystem](Eden::VoxelVolumeHandle h) { return !voxelSystem.IsValid(h); }),
                 reformedVolumes.end());
 
+            // Terrain Phase 3 residency gate - see UpdateTerrainChunkResidency's
+            // own comment for what this does and doesn't cover. Camera
+            // position stands in for "player position" the same way
+            // FindTargetedVolume already treats it - there's no separate
+            // player-controller entity yet.
+            UpdateTerrainChunkResidency(registry, voxelSystem, terrainChunks, renderer.GetCamera().Position);
+
             // Every hardened volume that currently exists - the
             // original test sphere plus anything ReformSystem has
-            // created since - so carving and melting can target ANY of
-            // them (see FindTargetedVolume), not just the original.
-            // Rebuilt each frame since reformedVolumes can grow between
-            // frames (H key).
+            // created since - so carving can target ANY of them (see
+            // FindTargetedVolume), not just the original. Terrain chunks
+            // ARE carvable (that's the whole point), so they're included
+            // here. Rebuilt each frame since reformedVolumes can grow
+            // between frames (H key).
             std::vector<Eden::VoxelVolumeHandle> allVoxelVolumes;
-            allVoxelVolumes.reserve(1 + reformedVolumes.size());
+            allVoxelVolumes.reserve(1 + terrainChunks.size() + reformedVolumes.size());
+            // UNFILTERED list of every terrain tile, resident or not -
+            // needed by CarveAcrossTerrainTiles' neighbor scan (not the
+            // full TerrainChunkState, which isn't visible at that
+            // function's point in the file). Deliberately NOT filtered
+            // by residency the way allVoxelVolumes below is: sleeping
+            // only removes a tile's ColliderComponent (physics), it does
+            // NOT touch that tile's density field or mesh at all -
+            // Carve()/MarchDirtyChunks work identically regardless of
+            // residency. Filtering this list was a real, confirmed bug:
+            // a corner carve reaching into a tile that happened to still
+            // be asleep (hadn't woken up yet from the player's own
+            // recent movement - see [TerrainLOD] sleeping/waking in the
+            // console log) silently skipped that tile entirely, not
+            // because of margin math but because it wasn't even a
+            // candidate. Depending on approach direction this could make
+            // some corners work and others not in a way that looked
+            // coordinate-dependent without actually being about
+            // coordinates - it was about which tiles happened to be
+            // awake at that exact moment.
+            std::vector<Eden::VoxelVolumeHandle> allTerrainHandles;
+            allTerrainHandles.reserve(terrainChunks.size());
+            for (const TerrainChunkState& chunk : terrainChunks)
+            {
+                if (voxelSystem.IsValid(chunk.handle))
+                {
+                    allTerrainHandles.push_back(chunk.handle);
+                }
+                if (chunk.resident && voxelSystem.IsValid(chunk.handle)) // only resident chunks are carve TARGETS (aiming/FindTargetedVolume) - sleeping ones aren't being looked at anyway
+                {
+                    allVoxelVolumes.push_back(chunk.handle);
+                }
+            }
             if (voxelSystem.IsValid(voxelVolume)) // same reasoning - the original test sphere is also editor-destroyable
             {
                 allVoxelVolumes.push_back(voxelVolume);
             }
             allVoxelVolumes.insert(allVoxelVolumes.end(), reformedVolumes.begin(), reformedVolumes.end());
 
-            ProcessVoxelCarveInput(window, renderer, registry, voxelSystem, allVoxelVolumes);
-            ProcessMeltInput(window, renderer, registry, voxelSystem, allVoxelVolumes, particleSystem);
+            // Separate, DELIBERATELY narrower list for melt - terrain is
+            // NOT included. Melt's whole-volume->particle conversion
+            // (see MeltSystem) spawns particles for the volume's entire
+            // solid mass at once; that's fine for the small test sphere
+            // it was built against, but a 20x5x20m terrain chunk holds
+            // orders of magnitude more solid volume than anything it's
+            // been tried on before - melting one dumps a huge number of
+            // overlapping SPH particles into the same space in a single
+            // frame, and the resulting pressure spike from that much
+            // initial overlap is what read as "a huge explosion." This
+            // isn't a case of tuning melt to be gentler; it's terrain
+            // being fundamentally the wrong scale for a mechanic that
+            // was designed around small, discrete objects. Excluding it
+            // from the candidate list here means FindTargetedVolume
+            // simply never considers a terrain chunk when melting - a
+            // real scope decision, not a workaround pending a real fix.
+            std::vector<Eden::VoxelVolumeHandle> meltableVolumes;
+            meltableVolumes.reserve(1 + reformedVolumes.size());
+            if (voxelSystem.IsValid(voxelVolume))
+            {
+                meltableVolumes.push_back(voxelVolume);
+            }
+            meltableVolumes.insert(meltableVolumes.end(), reformedVolumes.begin(), reformedVolumes.end());
+
+            ProcessVoxelCarveInput(window, renderer, registry, voxelSystem, allVoxelVolumes, allTerrainHandles);
+            ProcessMeltInput(window, renderer, registry, voxelSystem, meltableVolumes, particleSystem);
             ProcessReformInput(window, registry, particleSystem, voxelSystem, reformedVolumes);
 
             // TEMP DEBUG - remove after diagnosing.
@@ -1193,7 +1726,15 @@ int main()
                 // on a destroyed volume now throws instead of silently
                 // reading freed memory).
                 std::vector<Eden::VoxelDrawSource> sources;
-                sources.reserve(1 + reformedVolumes.size());
+                sources.reserve(1 + terrainChunks.size() + reformedVolumes.size());
+                for (const TerrainChunkState& chunk : terrainChunks) // sleeping chunks skip the draw call too - real per-frame draw-count reduction, see UpdateTerrainChunkResidency
+                {
+                    if (chunk.resident && voxelSystem.IsValid(chunk.handle))
+                    {
+                        sources.push_back({ voxelSystem.GetVertexBuffer(chunk.handle), voxelSystem.GetIndirectBuffer(chunk.handle),
+                                             voxelSystem.GetInstanceBuffer(chunk.handle), voxelSystem.GetChunkCount(chunk.handle) });
+                    }
+                }
                 if (voxelSystem.IsValid(voxelVolume))
                 {
                     sources.push_back({ voxelSystem.GetVertexBuffer(voxelVolume), voxelSystem.GetIndirectBuffer(voxelVolume),

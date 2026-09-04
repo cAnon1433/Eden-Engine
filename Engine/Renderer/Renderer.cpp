@@ -723,7 +723,25 @@ namespace Eden
         // a real ECS-driven light (position/color/intensity as component
         // data, Renderer reading it from the registry each frame) once
         // more than one light - or any control over this one - is needed.
-        ubo.lightDirection = glm::normalize(glm::vec3(0.4f, -1.0f, 0.3f));
+        //
+        // Expressed as a zenith angle (degrees off straight-down) instead
+        // of a raw direction vector, kept as a named constant rather than
+        // baked into the vec3 - a raw (0.4,-1.0,0.3) direction doesn't
+        // communicate "how steep is this sun" the way a zenith angle
+        // does, and this is exactly the kind of value someone will want
+        // to retune by eye. 33 degrees (bumped up from the original,
+        // much steeper ~26-degree-elevation default) - shallow enough
+        // that even gentle terrain slopes produce real dot(N,L) contrast
+        // instead of reading as flat. Azimuth (the original 0.4/0.3 XZ
+        // ratio - light coming from the +X/+Z-ish direction) is preserved
+        // exactly, only the steepness changes.
+        constexpr float kSunZenithDegrees = 33.0f;
+        float sunZenithRad = glm::radians(kSunZenithDegrees);
+        glm::vec2 sunAzimuthDir = glm::normalize(glm::vec2(0.4f, 0.3f));
+        ubo.lightDirection = glm::normalize(glm::vec3(
+            sunAzimuthDir.x * glm::sin(sunZenithRad),
+            -glm::cos(sunZenithRad),
+            sunAzimuthDir.y * glm::sin(sunZenithRad)));
         ubo.lightColor = glm::vec3(1.0f, 1.0f, 0.95f);
         ubo.ambientColor = glm::vec3(0.15f, 0.15f, 0.18f);
         frame.UpdateUniformBuffer(ubo);
@@ -940,10 +958,24 @@ namespace Eden
         {
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_VoxelPipeline.Get());
 
+            // Explicitly rebind set 0 (camera UBO) here, not just set 1 -
+            // it does NOT reliably survive from the frame-start bind
+            // (line ~806) through to here. The particle pass just above
+            // rebinds set 0 itself using m_ParticleGPUPipelineLayout,
+            // which has different push constant ranges than
+            // m_PipelineLayout - per Vulkan's pipeline layout
+            // compatibility rules, that invalidates set 0's binding for
+            // any layout that isn't compatible with it, and rebinding
+            // set 1 alone below doesn't restore it. (The raymarch pass
+            // right after this block already rebinds set 0 for the same
+            // reason - this block was the one place that didn't.)
+            VkDescriptorSet cameraSet = frame.descriptorSet;
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_PipelineLayout.Get(),
+                                     0, 1, &cameraSet, 0, nullptr);
+
             // Untextured - bind Eden's default white fallback at set 1,
             // same as any untextured ordinary mesh (see CreateMesh's
-            // resolved TextureHandle). Set 0 (camera UBO) is already
-            // bound for the whole frame from above.
+            // resolved TextureHandle).
             VkDescriptorSet defaultTextureSet = m_TextureRegistry[m_DefaultTextureHandle]->GetDescriptorSet();
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_PipelineLayout.Get(),
                                      1, 1, &defaultTextureSet, 0, nullptr);
@@ -966,12 +998,37 @@ namespace Eden
                 VkDeviceSize offsets[] = { 0, 0 };
                 vkCmdBindVertexBuffers(cmd, 0, 2, vertexBuffers, offsets);
 
-                // drawCount indirect draws from ONE call - each chunk's
-                // VkDrawIndirectCommand entry (vertexCount/firstVertex
-                // set by VoxelSystemGPU) becomes its own vkCmdDraw-
-                // equivalent, back to back, with zero CPU-side looping
-                // per chunk.
-                vkCmdDrawIndirect(cmd, source.indirectBuffer, 0, source.drawCount, sizeof(VkDrawIndirectCommand));
+                // One vkCmdDrawIndirect per chunk, NOT one call with
+                // drawCount=source.drawCount - that relied on the
+                // multiDrawIndirect device feature (multiple indirect
+                // commands consumed from one call), which is NEVER
+                // enabled (see VulkanDevice.cpp - deviceFeatures is
+                // zero-initialized aside from largePoints). Per the
+                // Vulkan spec, drawCount must be 0 or 1 without that
+                // feature - anything higher is undefined behavior, not
+                // just a validation warning to silence. This had been
+                // silently wrong since the very first multi-chunk
+                // volume (chunkDims=(2,2,2)=8 chunks on the original
+                // test sphere), apparently tolerated well enough in
+                // practice at that scale to go unnoticed - terrain's
+                // 16-chunk volumes made it actually visible as missing
+                // squares of geometry along chunk boundaries, which is
+                // what surfaced this.
+                //
+                // Looping here (rather than querying and conditionally
+                // enabling multiDrawIndirect) is the deliberately more
+                // portable fix - this project targets Mac (MoltenVK) and
+                // Windows, and this way rendering is correct on ANY
+                // device regardless of whether that feature happens to
+                // be supported, with no runtime feature-detection branch
+                // to maintain. CPU cost is negligible - source.drawCount
+                // cheap indirect-draw calls per source per frame, not
+                // per-chunk CPU geometry work.
+                for (uint32_t chunkIndex = 0; chunkIndex < source.drawCount; ++chunkIndex)
+                {
+                    VkDeviceSize chunkOffset = static_cast<VkDeviceSize>(chunkIndex) * sizeof(VkDrawIndirectCommand);
+                    vkCmdDrawIndirect(cmd, source.indirectBuffer, chunkOffset, 1, sizeof(VkDrawIndirectCommand));
+                }
             }
         }
 

@@ -6,18 +6,30 @@
 namespace Eden
 {
     // --- Fixed capacities --------------------------------------------------
-    // Voxels per axis within one chunk. 8^3 = 512 cells, worst case 5
-    // triangles/cell (a single saddle-heavy MC case) = 2560 triangles =
-    // 7680 vertices - the per-chunk vertex slot size every chunk reserves
-    // in VoxelSystemGPU's shared vertex buffer, whether or not it actually
-    // uses that much. Smaller than the particle system's "one big buffer"
-    // approach because this is a per-chunk worst-case reservation - 16
-    // wastes 8x the memory for the same reasoning; revisit only if chunks
-    // start feeling too coarse-grained for how localized carving needs to
-    // be (see class comment on chunking in VoxelSystemGPU.h).
+    // Voxels per axis within one chunk. 8^3 = 512 cells. Worst case is
+    // 12 triangles/cell, not 5 - raised when voxel_march.comp switched
+    // from the plain Lorensen table (5 triangles/case max) to the full
+    // Lewiner MC33 disambiguated algorithm, whose case 13.4 subconfigs
+    // can legitimately produce 12 triangles for a single cell (see
+    // MarchingCubesTables33's TILING13_4 / voxel_march.comp's
+    // BuildCaseTriangulation). 12 * 512 cells = 6144 triangles = 18432
+    // vertices - the per-chunk vertex slot size every chunk reserves in
+    // VoxelSystemGPU's shared vertex buffer, whether or not it actually
+    // uses that much. This is a real, meaningful memory increase (roughly
+    // 2.4x this constant's old value) - worth watching total VRAM if
+    // chunk counts grow much further, but the crack fix isn't optional
+    // and there's no correct way to reserve less than the true worst
+    // case without risking dropped triangles (see voxel_march.comp's
+    // overflow guard - it discards rather than overwrites a neighbor's
+    // slots if this is ever undersized). Smaller than the particle
+    // system's "one big buffer" approach because this is a per-chunk
+    // worst-case reservation - 16 wastes 8x the memory for the same
+    // reasoning; revisit only if chunks start feeling too coarse-grained
+    // for how localized carving needs to be (see class comment on
+    // chunking in VoxelSystemGPU.h).
     constexpr uint32_t kVoxelChunkSize = 8;
     constexpr uint32_t kVoxelCellsPerChunk = kVoxelChunkSize * kVoxelChunkSize * kVoxelChunkSize;
-    constexpr uint32_t kVoxelMaxTrianglesPerChunk = 5 * kVoxelCellsPerChunk;
+    constexpr uint32_t kVoxelMaxTrianglesPerChunk = 12 * kVoxelCellsPerChunk;
     constexpr uint32_t kVoxelMaxVerticesPerChunk = kVoxelMaxTrianglesPerChunk * 3;
 
     // Hard ceiling on how many volumes VoxelSystemGPU will register -
@@ -114,9 +126,30 @@ namespace Eden
         int32_t maxVerticesPerChunk = static_cast<int32_t>(kVoxelMaxVerticesPerChunk);
 
         float isoLevel = kVoxelIsoLevel;
+        // This volume's own starting element offset within the shared
+        // density buffer - binding 0 is now the FULL shared buffer, not
+        // a per-volume sub-range (see RegisterVolume's comment on why),
+        // so every density read needs this added explicitly, including
+        // in-range ones.
+        int32_t ownDensityElementOffset = 0;
+        // Ghost-sample neighbor lookup, horizontal axes only (terrain
+        // tiles don't neighbor each other vertically) - each is the
+        // *neighboring* volume's own ownDensityElementOffset, or -1 if
+        // this volume has no neighbor in that direction (every non-
+        // terrain volume, and terrain tiles on the grid's outer edge).
+        // See voxel_march.comp's DensityAt for how these get used - this
+        // is what lets a boundary cell's gradient read one real sample
+        // past its own edge instead of clamping/duplicating its last
+        // sample, which was the confirmed cause of mismatched normals
+        // (and, compounded with any density disagreement right at a
+        // seam, visible cracks) between adjacent terrain tiles.
+        int32_t neighborDensityOffsetNegX = -1;
+        int32_t neighborDensityOffsetPosX = -1;
+        int32_t neighborDensityOffsetNegZ = -1;
+
+        int32_t neighborDensityOffsetPosZ = -1;
         int32_t _pad0 = 0;
         int32_t _pad1 = 0;
-        int32_t _pad2 = 0;
     };
 
     static_assert(sizeof(VoxelParamsGPU) <= 128, "VoxelParamsGPU exceeds the guaranteed minimum Vulkan push constant size");

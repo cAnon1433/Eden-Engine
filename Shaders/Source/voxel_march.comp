@@ -14,6 +14,29 @@
 // atomically-allocated offset), which is also directly consumable as a
 // vertex buffer by Renderer's existing triangle pipeline - see
 // RendererTypes.h's Vertex layout, matched field-for-field below.
+//
+// TRIANGULATION ALGORITHM (rewritten - was the plain Lorensen & Cline
+// 1987 table, which has NO ambiguous-face disambiguation and was the
+// confirmed root cause of the marching-cubes crack bug): this now ports
+// Lewiner, Lopes, Vieira & Tavares' "Marching Cubes 33" algorithm
+// (Journal of Graphics Tools 8(2), 2003), specifically the verified,
+// widely-used implementation from scikit-image's
+// _marching_cubes_lewiner_cy.pyx (BSD-licensed, fetched from
+// github.com/scikit-image/scikit-image tag v0.24.0 and mechanically
+// converted - not hand-transcribed - into the table blob in
+// MarchingCubesTables33.h; see that file's header comment for the exact
+// provenance and the conversion script's own verification notes).
+//
+// Two things confirmed by direct comparison against that reference
+// before porting (see conversation history, not repeated in full here):
+// (1) Lewiner's v0..v7 corner numbering and 0-11 edge numbering are
+// BOTH identical to this project's existing kCornerOffset/kEdgeCorners
+// convention below - no remapping needed. (2) Lewiner's edge-crossing
+// interpolation is algebraically equivalent to the plain linear
+// interpolation this shader already used - so that part (edgeVertex/
+// edgeNormal below) is UNCHANGED from before. Only the case/table
+// dispatch that decides WHICH edges make up WHICH triangles - the part
+// that actually caused the ambiguous-face cracks - is new.
 layout(local_size_x = 64) in;
 
 // Output vertex layout: NOT a GLSL struct - see the comment below on
@@ -43,15 +66,26 @@ layout(local_size_x = 64) in;
 // re-deriving its std430 layout by hand first.
 const int kFloatsPerVertex = 11;
 
+// Binding 0 is the FULL shared density buffer, not a per-volume sub-
+// range like it used to be - ghost-sample neighbor reads (see
+// DensityAt) need to be able to reach into an adjacent terrain tile's
+// region of this same buffer, which a sub-range view can't do. Every
+// density read - including this volume's own in-range samples - goes
+// through params.ownDensityElementOffset now; nothing is implicit via
+// the binding anymore.
 layout(std430, binding = 0) readonly buffer DensityBuffer { float density[]; };
 layout(std430, binding = 1) buffer VertexBuffer { float vertexData[]; };
 // Mirrors VkDrawIndirectCommand's 4 uint32 fields per chunk - see
 // VoxelSystemGPU.cpp's IndirectCommand struct. commands[chunkIndex*4+0]
 // is vertexCount, the one field this shader ever writes (via atomicAdd).
 layout(std430, binding = 2) buffer IndirectBuffer { uint commands[]; };
-layout(std430, binding = 3) readonly buffer EdgeTableBuffer { uint edgeTable[256]; };
-layout(std430, binding = 4) readonly buffer TriTableBuffer { int triTable[256 * 16]; };
-layout(std430, binding = 5) readonly buffer DirtyFlagsBuffer { uint dirtyFlags[]; };
+// Single flat table blob replacing the old separate edge-table/tri-table
+// bindings - see MarchingCubesTables33.h for what's packed in here and
+// why one buffer instead of ~46 (MoltenVK's maxPerStageDescriptorStorageBuffers=31
+// ceiling, already a hard constraint elsewhere in this project, made
+// "one binding per table" a non-starter).
+layout(std430, binding = 3) readonly buffer MC33TableBuffer { int mc33[]; };
+layout(std430, binding = 4) readonly buffer DirtyFlagsBuffer { uint dirtyFlags[]; };
 
 layout(push_constant) uniform VoxelParams
 {
@@ -65,27 +99,48 @@ layout(push_constant) uniform VoxelParams
     int maxVerticesPerChunk;
 
     float isoLevel;
+    // Own offset + up to 4 horizontal neighbor offsets into the shared
+    // density buffer (binding 0 is now bound as the FULL shared buffer,
+    // not a per-volume sub-range - see RegisterVolume's comment) -
+    // ghost-sample support for gradient continuity across terrain tile
+    // boundaries. -1 = no neighbor in that direction. See DensityAt.
+    int ownDensityElementOffset;
+    int neighborDensityOffsetNegX;
+    int neighborDensityOffsetPosX;
+
+    int neighborDensityOffsetNegZ;
+    int neighborDensityOffsetPosZ;
     int _pad0;
     int _pad1;
-    int _pad2;
 } params;
 
-// Standard cube corner offsets (Bourke/Lorensen-Cline numbering, the
-// same convention kMarchingCubesEdgeTable/kMarchingCubesTriTable were
-// built against - do not renumber these without regenerating the
-// tables to match).
+// Standard cube corner offsets (Bourke/Lorensen-Cline numbering - and,
+// confirmed by direct comparison, also exactly Lewiner et al.'s own v0..v7
+// numbering, so the MC33 table blob can be used against these same
+// corners with no remapping).
 const ivec3 kCornerOffset[8] = ivec3[8](
     ivec3(0, 0, 0), ivec3(1, 0, 0), ivec3(1, 1, 0), ivec3(0, 1, 0),
     ivec3(0, 0, 1), ivec3(1, 0, 1), ivec3(1, 1, 1), ivec3(0, 1, 1)
 );
 
 // Which two corners each of the 12 cube edges connects - same
-// convention the reference edge/tri tables assume.
+// convention the MC33 tables assume (also confirmed identical to
+// Lewiner et al.'s own edge numbering by direct comparison - see this
+// file's top comment).
 const ivec2 kEdgeCorners[12] = ivec2[12](
     ivec2(0, 1), ivec2(1, 2), ivec2(2, 3), ivec2(3, 0),
     ivec2(4, 5), ivec2(5, 6), ivec2(6, 7), ivec2(7, 4),
     ivec2(0, 4), ivec2(1, 5), ivec2(2, 6), ivec2(3, 7)
 );
+
+// Small-number guard against divide-by-zero in the tests below. The
+// reference (float64 Cython) uses float64 machine epsilon (~1.1e-16),
+// which is meaningless as a guard once everything here is float32 (any
+// float32 value added to something of normal magnitude just vanishes at
+// that scale) - using this shader's own existing float32 edge-interpolation
+// epsilon (see edgeVertex's t computation below) instead, for an epsilon
+// that's actually load-bearing at this precision.
+const float kMCEpsilon = 1e-6;
 
 uint SampleIndex(ivec3 s)
 {
@@ -93,10 +148,89 @@ uint SampleIndex(ivec3 s)
          + uint(s.z) * uint(params.sampleDims.x) * uint(params.sampleDims.y);
 }
 
+// Ghost-sample density read. For an in-range coordinate this is exactly
+// what it always was (just with an explicit offset add now that binding
+// 0 is the full shared buffer - see its own comment). For a coordinate
+// exactly 1 past this volume's own edge on the X or Z axis, and ONLY
+// when a neighbor is configured for that direction, this reads the
+// REAL sample from the neighboring terrain tile's own region of the
+// same buffer instead of clamping to this volume's edge.
+//
+// Confirmed by direct measurement (not assumed) that this is worth
+// doing: SampleSignedDistance queried at the exact same world position
+// from two adjacent tiles was returning meaningfully different density
+// (some measured over 2x apart) - not from the carve being applied
+// inconsistently (verified that isn't the cause - both tiles' CSG
+// carve values agree at their own true corresponding samples), but from
+// each tile's OWN gradient/interpolation only ever having its own data
+// to work with, one-sided at the very edge instead of centered. This
+// is what that fixes - it does NOT change where any vertex sits, only
+// what a boundary cell's normal (and any interpolation reaching past
+// the edge) is computed from.
+//
+// Never needs a DIAGONAL neighbor: this is only ever called with one
+// axis offset by 1 from an otherwise-valid corner coordinate (corner
+// sampling itself never leaves [0, sampleDims-1] - see cornerDensity's
+// own loop in main() - only GradientAt's +-1 central difference can),
+// so X and Z are never simultaneously out of range in a single call.
 float DensityAt(ivec3 s)
 {
-    ivec3 clamped = clamp(s, ivec3(0), params.sampleDims - ivec3(1));
-    return density[SampleIndex(clamped)];
+    ivec3 local = s;
+    int densityBase = params.ownDensityElementOffset;
+
+    if (local.x < 0)
+    {
+        if (params.neighborDensityOffsetNegX >= 0)
+        {
+            local.x = params.sampleDims.x - 1 + local.x; // -1 -> sampleDims.x-2 (that neighbor's own second-to-last sample - see this file's header comment on why not its last)
+            densityBase = params.neighborDensityOffsetNegX;
+        }
+        else
+        {
+            local.x = 0;
+        }
+    }
+    else if (local.x >= params.sampleDims.x)
+    {
+        if (params.neighborDensityOffsetPosX >= 0)
+        {
+            local.x = local.x - params.sampleDims.x + 1; // sampleDims.x -> 1 (that neighbor's own second sample)
+            densityBase = params.neighborDensityOffsetPosX;
+        }
+        else
+        {
+            local.x = params.sampleDims.x - 1;
+        }
+    }
+
+    if (local.z < 0)
+    {
+        if (params.neighborDensityOffsetNegZ >= 0)
+        {
+            local.z = params.sampleDims.z - 1 + local.z;
+            densityBase = params.neighborDensityOffsetNegZ;
+        }
+        else
+        {
+            local.z = 0;
+        }
+    }
+    else if (local.z >= params.sampleDims.z)
+    {
+        if (params.neighborDensityOffsetPosZ >= 0)
+        {
+            local.z = local.z - params.sampleDims.z + 1;
+            densityBase = params.neighborDensityOffsetPosZ;
+        }
+        else
+        {
+            local.z = params.sampleDims.z - 1;
+        }
+    }
+
+    local.y = clamp(local.y, 0, params.sampleDims.y - 1); // terrain tiles never neighbor vertically - Y always just clamps, same as before
+
+    return density[densityBase + int(SampleIndex(local))];
 }
 
 // Central-difference gradient of the density field at a sample point -
@@ -130,6 +264,389 @@ void WriteVertex(uint vertexIndex, vec3 position, vec3 color, vec2 texCoord, vec
     vertexData[base + 8] = normal.x;
     vertexData[base + 9] = normal.y;
     vertexData[base + 10] = normal.z;
+}
+
+// ============================================================================
+// Mechanically generated MC33 table accessors. Offsets/strides below are
+// generated directly from the verified Lewiner et al. reference tables
+// (see MarchingCubesTables33.h for provenance) - do not hand-edit;
+// regenerate from the source data if the table set ever changes.
+int MC_CASES(int i0, int i1) { return mc33[0 + i0*2 + i1]; }
+int MC_TILING1(int i0, int i1) { return mc33[512 + i0*3 + i1]; }
+int MC_TILING2(int i0, int i1) { return mc33[560 + i0*6 + i1]; }
+int MC_TILING3_1(int i0, int i1) { return mc33[704 + i0*6 + i1]; }
+int MC_TILING3_2(int i0, int i1) { return mc33[848 + i0*12 + i1]; }
+int MC_TILING4_1(int i0, int i1) { return mc33[1136 + i0*6 + i1]; }
+int MC_TILING4_2(int i0, int i1) { return mc33[1184 + i0*18 + i1]; }
+int MC_TILING5(int i0, int i1) { return mc33[1328 + i0*9 + i1]; }
+int MC_TILING6_1_1(int i0, int i1) { return mc33[1760 + i0*9 + i1]; }
+int MC_TILING6_1_2(int i0, int i1) { return mc33[2192 + i0*27 + i1]; }
+int MC_TILING6_2(int i0, int i1) { return mc33[3488 + i0*15 + i1]; }
+int MC_TILING7_1(int i0, int i1) { return mc33[4208 + i0*9 + i1]; }
+int MC_TILING7_2(int i0, int i1, int i2) { return mc33[4352 + i0*45 + i1*15 + i2]; }
+int MC_TILING7_3(int i0, int i1, int i2) { return mc33[5072 + i0*81 + i1*27 + i2]; }
+int MC_TILING7_4_1(int i0, int i1) { return mc33[6368 + i0*15 + i1]; }
+int MC_TILING7_4_2(int i0, int i1) { return mc33[6608 + i0*27 + i1]; }
+int MC_TILING8(int i0, int i1) { return mc33[7040 + i0*6 + i1]; }
+int MC_TILING9(int i0, int i1) { return mc33[7076 + i0*12 + i1]; }
+int MC_TILING10_1_1(int i0, int i1) { return mc33[7172 + i0*12 + i1]; }
+int MC_TILING10_1_1_(int i0, int i1) { return mc33[7244 + i0*12 + i1]; }
+int MC_TILING10_1_2(int i0, int i1) { return mc33[7316 + i0*24 + i1]; }
+int MC_TILING10_2(int i0, int i1) { return mc33[7460 + i0*24 + i1]; }
+int MC_TILING10_2_(int i0, int i1) { return mc33[7604 + i0*24 + i1]; }
+int MC_TILING11(int i0, int i1) { return mc33[7748 + i0*12 + i1]; }
+int MC_TILING12_1_1(int i0, int i1) { return mc33[7892 + i0*12 + i1]; }
+int MC_TILING12_1_1_(int i0, int i1) { return mc33[8180 + i0*12 + i1]; }
+int MC_TILING12_1_2(int i0, int i1) { return mc33[8468 + i0*24 + i1]; }
+int MC_TILING12_2(int i0, int i1) { return mc33[9044 + i0*24 + i1]; }
+int MC_TILING12_2_(int i0, int i1) { return mc33[9620 + i0*24 + i1]; }
+int MC_TILING13_1(int i0, int i1) { return mc33[10196 + i0*12 + i1]; }
+int MC_TILING13_1_(int i0, int i1) { return mc33[10220 + i0*12 + i1]; }
+int MC_TILING13_2(int i0, int i1, int i2) { return mc33[10244 + i0*108 + i1*18 + i2]; }
+int MC_TILING13_2_(int i0, int i1, int i2) { return mc33[10460 + i0*108 + i1*18 + i2]; }
+int MC_TILING13_3(int i0, int i1, int i2) { return mc33[10676 + i0*360 + i1*30 + i2]; }
+int MC_TILING13_3_(int i0, int i1, int i2) { return mc33[11396 + i0*360 + i1*30 + i2]; }
+int MC_TILING13_4(int i0, int i1, int i2) { return mc33[12116 + i0*144 + i1*36 + i2]; }
+int MC_TILING13_5_1(int i0, int i1, int i2) { return mc33[12404 + i0*72 + i1*18 + i2]; }
+int MC_TILING13_5_2(int i0, int i1, int i2) { return mc33[12548 + i0*120 + i1*30 + i2]; }
+int MC_TILING14(int i0, int i1) { return mc33[12788 + i0*12 + i1]; }
+int MC_TEST3(int i0) { return mc33[12932 + i0]; }
+int MC_TEST4(int i0) { return mc33[12956 + i0]; }
+int MC_TEST6(int i0, int i1) { return mc33[12964 + i0*3 + i1]; }
+int MC_TEST7(int i0, int i1) { return mc33[13108 + i0*5 + i1]; }
+int MC_TEST10(int i0, int i1) { return mc33[13188 + i0*3 + i1]; }
+int MC_TEST12(int i0, int i1) { return mc33[13206 + i0*4 + i1]; }
+int MC_TEST13(int i0, int i1) { return mc33[13302 + i0*7 + i1]; }
+int MC_SUBCONFIG13(int i0) { return mc33[13316 + i0]; }
+// ============================================================================
+
+// Face ambiguity test (Nielson & Hamann / the "asymptotic decider") -
+// direct port of Lewiner et al.'s test_face. Returns true if the surface
+// passes through (separates the same-sign diagonal corners of) the given
+// face. cellValue[8] are the 8 corner densities with isoLevel already
+// subtracted (so "positive" means outside/empty, matching Lewiner's own
+// convention - see this file's top comment on why bit convention had to
+// be flipped from this project's old cubeIndex).
+bool TestFace(float cellValue[8], int face)
+{
+    int absFace = face < 0 ? -face : face;
+    float A, B, C, D;
+    if (absFace == 1)      { A = cellValue[0]; B = cellValue[4]; C = cellValue[5]; D = cellValue[1]; }
+    else if (absFace == 2) { A = cellValue[1]; B = cellValue[5]; C = cellValue[6]; D = cellValue[2]; }
+    else if (absFace == 3) { A = cellValue[2]; B = cellValue[6]; C = cellValue[7]; D = cellValue[3]; }
+    else if (absFace == 4) { A = cellValue[3]; B = cellValue[7]; C = cellValue[4]; D = cellValue[0]; }
+    else if (absFace == 5) { A = cellValue[0]; B = cellValue[3]; C = cellValue[2]; D = cellValue[1]; }
+    else                   { A = cellValue[4]; B = cellValue[7]; C = cellValue[6]; D = cellValue[5]; } // absFace == 6
+
+    float AC_BD = A * C - B * D;
+    if (AC_BD > -kMCEpsilon && AC_BD < kMCEpsilon)
+    {
+        return face >= 0;
+    }
+    return (float(face) * A * AC_BD) >= 0.0;
+}
+
+// Interior/tunnel ambiguity test - direct port of Lewiner et al.'s
+// test_internal. Only called for cases 4, 6, 7, 10, 12, 13, each of
+// which has already resolved which face(s) it needs this for via
+// TestFace above.
+//
+// NOTE on test==5/test==10 with a false inner condition: the reference
+// Cython source (scikit-image _marching_cubes_lewiner_cy.pyx, the
+// verified implementation this was ported from) has NO explicit return
+// in that specific branch - it falls through to the end of an int-
+// returning function. That's almost certainly equivalent to returning
+// false in the compiled reference (falling off the end of a `noexcept`
+// cdef int function), so that's what's implemented here - but this is
+// the one spot in this port that isn't a direct line-for-line
+// transcription of an explicit statement, flagging it honestly rather
+// than silently guessing. It's an extremely rare sub-branch (only
+// reached for specific ambiguous interior configurations within cases
+// 4/6/7/10/12/13), so low-risk either way, but worth knowing if a crack
+// is ever traced back to exactly this path.
+bool TestInternal(int cse, int tilingConfig, int subconfig, int s, float cellValue[8])
+{
+    float At = 0.0, Bt = 0.0, Ct = 0.0, Dt = 0.0;
+    int test = 0;
+
+    if (cse == 4 || cse == 10)
+    {
+        float a = (cellValue[4] - cellValue[0]) * (cellValue[6] - cellValue[2])
+                - (cellValue[7] - cellValue[3]) * (cellValue[5] - cellValue[1]);
+        float b = cellValue[2] * (cellValue[4] - cellValue[0]) + cellValue[0] * (cellValue[6] - cellValue[2])
+                - cellValue[1] * (cellValue[7] - cellValue[3]) - cellValue[3] * (cellValue[5] - cellValue[1]);
+        float t = -b / (2.0 * a + kMCEpsilon);
+        if (t < 0.0 || t > 1.0)
+        {
+            return s > 0;
+        }
+
+        At = cellValue[0] + (cellValue[4] - cellValue[0]) * t;
+        Bt = cellValue[3] + (cellValue[7] - cellValue[3]) * t;
+        Ct = cellValue[2] + (cellValue[6] - cellValue[2]) * t;
+        Dt = cellValue[1] + (cellValue[5] - cellValue[1]) * t;
+    }
+    else // cse == 6, 7, 12, or 13
+    {
+        int edge = -1;
+        if (cse == 6)       edge = MC_TEST6(tilingConfig, 2);
+        else if (cse == 7)  edge = MC_TEST7(tilingConfig, 4);
+        else if (cse == 12) edge = MC_TEST12(tilingConfig, 3);
+        else                edge = MC_TILING13_5_1(tilingConfig, subconfig, 0); // cse == 13
+
+        if (edge == 0)       { float t = cellValue[0] / (cellValue[0] - cellValue[1] + kMCEpsilon); Bt = cellValue[3] + (cellValue[2] - cellValue[3]) * t; Ct = cellValue[7] + (cellValue[6] - cellValue[7]) * t; Dt = cellValue[4] + (cellValue[5] - cellValue[4]) * t; }
+        else if (edge == 1)  { float t = cellValue[1] / (cellValue[1] - cellValue[2] + kMCEpsilon); Bt = cellValue[0] + (cellValue[3] - cellValue[0]) * t; Ct = cellValue[4] + (cellValue[7] - cellValue[4]) * t; Dt = cellValue[5] + (cellValue[6] - cellValue[5]) * t; }
+        else if (edge == 2)  { float t = cellValue[2] / (cellValue[2] - cellValue[3] + kMCEpsilon); Bt = cellValue[1] + (cellValue[0] - cellValue[1]) * t; Ct = cellValue[5] + (cellValue[4] - cellValue[5]) * t; Dt = cellValue[6] + (cellValue[7] - cellValue[6]) * t; }
+        else if (edge == 3)  { float t = cellValue[3] / (cellValue[3] - cellValue[0] + kMCEpsilon); Bt = cellValue[2] + (cellValue[1] - cellValue[2]) * t; Ct = cellValue[6] + (cellValue[5] - cellValue[6]) * t; Dt = cellValue[7] + (cellValue[4] - cellValue[7]) * t; }
+        else if (edge == 4)  { float t = cellValue[4] / (cellValue[4] - cellValue[5] + kMCEpsilon); Bt = cellValue[7] + (cellValue[6] - cellValue[7]) * t; Ct = cellValue[3] + (cellValue[2] - cellValue[3]) * t; Dt = cellValue[0] + (cellValue[1] - cellValue[0]) * t; }
+        else if (edge == 5)  { float t = cellValue[5] / (cellValue[5] - cellValue[6] + kMCEpsilon); Bt = cellValue[4] + (cellValue[7] - cellValue[4]) * t; Ct = cellValue[0] + (cellValue[3] - cellValue[0]) * t; Dt = cellValue[1] + (cellValue[2] - cellValue[1]) * t; }
+        else if (edge == 6)  { float t = cellValue[6] / (cellValue[6] - cellValue[7] + kMCEpsilon); Bt = cellValue[5] + (cellValue[4] - cellValue[5]) * t; Ct = cellValue[1] + (cellValue[0] - cellValue[1]) * t; Dt = cellValue[2] + (cellValue[3] - cellValue[2]) * t; }
+        else if (edge == 7)  { float t = cellValue[7] / (cellValue[7] - cellValue[4] + kMCEpsilon); Bt = cellValue[6] + (cellValue[5] - cellValue[6]) * t; Ct = cellValue[2] + (cellValue[1] - cellValue[2]) * t; Dt = cellValue[3] + (cellValue[0] - cellValue[3]) * t; }
+        else if (edge == 8)  { float t = cellValue[0] / (cellValue[0] - cellValue[4] + kMCEpsilon); Bt = cellValue[3] + (cellValue[7] - cellValue[3]) * t; Ct = cellValue[2] + (cellValue[6] - cellValue[2]) * t; Dt = cellValue[1] + (cellValue[5] - cellValue[1]) * t; }
+        else if (edge == 9)  { float t = cellValue[1] / (cellValue[1] - cellValue[5] + kMCEpsilon); Bt = cellValue[0] + (cellValue[4] - cellValue[0]) * t; Ct = cellValue[3] + (cellValue[7] - cellValue[3]) * t; Dt = cellValue[2] + (cellValue[6] - cellValue[2]) * t; }
+        else if (edge == 10) { float t = cellValue[2] / (cellValue[2] - cellValue[6] + kMCEpsilon); Bt = cellValue[1] + (cellValue[5] - cellValue[1]) * t; Ct = cellValue[0] + (cellValue[4] - cellValue[0]) * t; Dt = cellValue[3] + (cellValue[7] - cellValue[3]) * t; }
+        else if (edge == 11) { float t = cellValue[3] / (cellValue[3] - cellValue[7] + kMCEpsilon); Bt = cellValue[2] + (cellValue[6] - cellValue[2]) * t; Ct = cellValue[1] + (cellValue[5] - cellValue[1]) * t; Dt = cellValue[0] + (cellValue[4] - cellValue[0]) * t; }
+        At = 0.0;
+    }
+
+    if (At >= 0.0) test += 1;
+    if (Bt >= 0.0) test += 2;
+    if (Ct >= 0.0) test += 4;
+    if (Dt >= 0.0) test += 8;
+
+    if (test == 5)  { return (At * Ct - Bt * Dt < kMCEpsilon) ? (s > 0) : false; }  // see NOTE above
+    if (test == 10) { return (At * Ct - Bt * Dt >= kMCEpsilon) ? (s > 0) : false; } // see NOTE above
+    if (test == 7 || test == 11 || test == 13 || test == 14 || test == 15) { return s < 0; }
+    return s > 0; // covers test == 0,1,2,3,4,6,8,9,12
+}
+
+// Faithful port of Lewiner et al.'s "the_big_switch" - together with the
+// tables in MarchingCubesTables33.h, this is where the actual
+// disambiguation happens. Returns the number of triangles (0 if none),
+// filling triEdges[0 .. nt*3-1] with edge indices (0-11 = a standard
+// cube edge, matching kEdgeCorners; 12 = the interpolated cube-center
+// vertex some subcases need - see the centerPos/centerNormal computation
+// in main()).
+int BuildCaseTriangulation(int cse, int tilingConfig, float cellValue[8], out int triEdges[36])
+{
+    int subconfig = 0;
+
+    if (cse == 1)
+    {
+        triEdges[0] = MC_TILING1(tilingConfig, 0);
+        triEdges[1] = MC_TILING1(tilingConfig, 1);
+        triEdges[2] = MC_TILING1(tilingConfig, 2);
+        return 1;
+    }
+    else if (cse == 2)
+    {
+        for (int i = 0; i < 6; ++i) triEdges[i] = MC_TILING2(tilingConfig, i);
+        return 2;
+    }
+    else if (cse == 3)
+    {
+        if (TestFace(cellValue, MC_TEST3(tilingConfig)))
+        {
+            for (int i = 0; i < 12; ++i) triEdges[i] = MC_TILING3_2(tilingConfig, i);
+            return 4;
+        }
+        for (int i = 0; i < 6; ++i) triEdges[i] = MC_TILING3_1(tilingConfig, i);
+        return 2;
+    }
+    else if (cse == 4)
+    {
+        if (TestInternal(cse, tilingConfig, subconfig, MC_TEST4(tilingConfig), cellValue))
+        {
+            for (int i = 0; i < 6; ++i) triEdges[i] = MC_TILING4_1(tilingConfig, i);
+            return 2;
+        }
+        for (int i = 0; i < 18; ++i) triEdges[i] = MC_TILING4_2(tilingConfig, i);
+        return 6;
+    }
+    else if (cse == 5)
+    {
+        for (int i = 0; i < 9; ++i) triEdges[i] = MC_TILING5(tilingConfig, i);
+        return 3;
+    }
+    else if (cse == 6)
+    {
+        if (TestFace(cellValue, MC_TEST6(tilingConfig, 0)))
+        {
+            for (int i = 0; i < 15; ++i) triEdges[i] = MC_TILING6_2(tilingConfig, i);
+            return 5;
+        }
+        if (TestInternal(cse, tilingConfig, subconfig, MC_TEST6(tilingConfig, 1), cellValue))
+        {
+            for (int i = 0; i < 9; ++i) triEdges[i] = MC_TILING6_1_1(tilingConfig, i);
+            return 3;
+        }
+        for (int i = 0; i < 27; ++i) triEdges[i] = MC_TILING6_1_2(tilingConfig, i);
+        return 9;
+    }
+    else if (cse == 7)
+    {
+        if (TestFace(cellValue, MC_TEST7(tilingConfig, 0))) subconfig += 1;
+        if (TestFace(cellValue, MC_TEST7(tilingConfig, 1))) subconfig += 2;
+        if (TestFace(cellValue, MC_TEST7(tilingConfig, 2))) subconfig += 4;
+
+        if (subconfig == 0) { for (int i = 0; i < 9; ++i) triEdges[i] = MC_TILING7_1(tilingConfig, i); return 3; }
+        if (subconfig == 1) { for (int i = 0; i < 15; ++i) triEdges[i] = MC_TILING7_2(tilingConfig, 0, i); return 5; }
+        if (subconfig == 2) { for (int i = 0; i < 15; ++i) triEdges[i] = MC_TILING7_2(tilingConfig, 1, i); return 5; }
+        if (subconfig == 3) { for (int i = 0; i < 27; ++i) triEdges[i] = MC_TILING7_3(tilingConfig, 0, i); return 9; }
+        if (subconfig == 4) { for (int i = 0; i < 15; ++i) triEdges[i] = MC_TILING7_2(tilingConfig, 2, i); return 5; }
+        if (subconfig == 5) { for (int i = 0; i < 27; ++i) triEdges[i] = MC_TILING7_3(tilingConfig, 1, i); return 9; }
+        if (subconfig == 6) { for (int i = 0; i < 27; ++i) triEdges[i] = MC_TILING7_3(tilingConfig, 2, i); return 9; }
+        // subconfig == 7
+        if (TestInternal(cse, tilingConfig, subconfig, MC_TEST7(tilingConfig, 3), cellValue))
+        {
+            for (int i = 0; i < 27; ++i) triEdges[i] = MC_TILING7_4_2(tilingConfig, i);
+            return 9;
+        }
+        for (int i = 0; i < 15; ++i) triEdges[i] = MC_TILING7_4_1(tilingConfig, i);
+        return 5;
+    }
+    else if (cse == 8)
+    {
+        for (int i = 0; i < 6; ++i) triEdges[i] = MC_TILING8(tilingConfig, i);
+        return 2;
+    }
+    else if (cse == 9)
+    {
+        for (int i = 0; i < 12; ++i) triEdges[i] = MC_TILING9(tilingConfig, i);
+        return 4;
+    }
+    else if (cse == 10)
+    {
+        if (TestFace(cellValue, MC_TEST10(tilingConfig, 0)))
+        {
+            if (TestFace(cellValue, MC_TEST10(tilingConfig, 1)))
+            {
+                for (int i = 0; i < 12; ++i) triEdges[i] = MC_TILING10_1_1_(tilingConfig, i);
+                return 4;
+            }
+            for (int i = 0; i < 24; ++i) triEdges[i] = MC_TILING10_2(tilingConfig, i);
+            return 8;
+        }
+        if (TestFace(cellValue, MC_TEST10(tilingConfig, 1)))
+        {
+            for (int i = 0; i < 24; ++i) triEdges[i] = MC_TILING10_2_(tilingConfig, i);
+            return 8;
+        }
+        if (TestInternal(cse, tilingConfig, subconfig, MC_TEST10(tilingConfig, 2), cellValue))
+        {
+            for (int i = 0; i < 12; ++i) triEdges[i] = MC_TILING10_1_1(tilingConfig, i);
+            return 4;
+        }
+        for (int i = 0; i < 24; ++i) triEdges[i] = MC_TILING10_1_2(tilingConfig, i);
+        return 8;
+    }
+    else if (cse == 11)
+    {
+        for (int i = 0; i < 12; ++i) triEdges[i] = MC_TILING11(tilingConfig, i);
+        return 4;
+    }
+    else if (cse == 12)
+    {
+        if (TestFace(cellValue, MC_TEST12(tilingConfig, 0)))
+        {
+            if (TestFace(cellValue, MC_TEST12(tilingConfig, 1)))
+            {
+                for (int i = 0; i < 12; ++i) triEdges[i] = MC_TILING12_1_1_(tilingConfig, i);
+                return 4;
+            }
+            for (int i = 0; i < 24; ++i) triEdges[i] = MC_TILING12_2(tilingConfig, i);
+            return 8;
+        }
+        if (TestFace(cellValue, MC_TEST12(tilingConfig, 1)))
+        {
+            for (int i = 0; i < 24; ++i) triEdges[i] = MC_TILING12_2_(tilingConfig, i);
+            return 8;
+        }
+        if (TestInternal(cse, tilingConfig, subconfig, MC_TEST12(tilingConfig, 2), cellValue))
+        {
+            for (int i = 0; i < 12; ++i) triEdges[i] = MC_TILING12_1_1(tilingConfig, i);
+            return 4;
+        }
+        for (int i = 0; i < 24; ++i) triEdges[i] = MC_TILING12_1_2(tilingConfig, i);
+        return 8;
+    }
+    else if (cse == 13)
+    {
+        if (TestFace(cellValue, MC_TEST13(tilingConfig, 0))) subconfig += 1;
+        if (TestFace(cellValue, MC_TEST13(tilingConfig, 1))) subconfig += 2;
+        if (TestFace(cellValue, MC_TEST13(tilingConfig, 2))) subconfig += 4;
+        if (TestFace(cellValue, MC_TEST13(tilingConfig, 3))) subconfig += 8;
+        if (TestFace(cellValue, MC_TEST13(tilingConfig, 4))) subconfig += 16;
+        if (TestFace(cellValue, MC_TEST13(tilingConfig, 5))) subconfig += 32;
+
+        subconfig = MC_SUBCONFIG13(subconfig);
+
+        // Ranges below are a direct, verified simplification of the
+        // reference's 46 individually-listed `elif subconfig==N:`
+        // branches (each just picks a sequential row within one of the
+        // tables below) - not a behavioral change, see conversation
+        // history for the per-value check against the reference this
+        // was collapsed from.
+        if (subconfig == 0)
+        {
+            for (int i = 0; i < 12; ++i) triEdges[i] = MC_TILING13_1(tilingConfig, i);
+            return 4;
+        }
+        if (subconfig >= 1 && subconfig <= 6)
+        {
+            int s = subconfig - 1;
+            for (int i = 0; i < 18; ++i) triEdges[i] = MC_TILING13_2(tilingConfig, s, i);
+            return 6;
+        }
+        if (subconfig >= 7 && subconfig <= 18)
+        {
+            int s = subconfig - 7;
+            for (int i = 0; i < 30; ++i) triEdges[i] = MC_TILING13_3(tilingConfig, s, i);
+            return 10;
+        }
+        if (subconfig >= 19 && subconfig <= 22)
+        {
+            int s = subconfig - 19;
+            for (int i = 0; i < 36; ++i) triEdges[i] = MC_TILING13_4(tilingConfig, s, i);
+            return 12;
+        }
+        if (subconfig >= 23 && subconfig <= 26)
+        {
+            int s = subconfig - 23; // reference reassigns subconfig to 0-3 here before the test_internal call
+            if (TestInternal(cse, tilingConfig, s, MC_TEST13(tilingConfig, 6), cellValue))
+            {
+                for (int i = 0; i < 18; ++i) triEdges[i] = MC_TILING13_5_1(tilingConfig, s, i);
+                return 6;
+            }
+            for (int i = 0; i < 30; ++i) triEdges[i] = MC_TILING13_5_2(tilingConfig, s, i);
+            return 10;
+        }
+        if (subconfig >= 27 && subconfig <= 38)
+        {
+            int s = subconfig - 27;
+            for (int i = 0; i < 30; ++i) triEdges[i] = MC_TILING13_3_(tilingConfig, s, i);
+            return 10;
+        }
+        if (subconfig >= 39 && subconfig <= 44)
+        {
+            int s = subconfig - 39;
+            for (int i = 0; i < 18; ++i) triEdges[i] = MC_TILING13_2_(tilingConfig, s, i);
+            return 6;
+        }
+        if (subconfig == 45)
+        {
+            for (int i = 0; i < 12; ++i) triEdges[i] = MC_TILING13_1_(tilingConfig, i);
+            return 4;
+        }
+        return 0; // "Impossible case 13" per the reference - should not happen
+    }
+    else if (cse == 14)
+    {
+        for (int i = 0; i < 12; ++i) triEdges[i] = MC_TILING14(tilingConfig, i);
+        return 4;
+    }
+
+    return 0;
 }
 
 void main()
@@ -168,35 +685,51 @@ void main()
 
     float cornerDensity[8];
     vec3 cornerGradient[8];
+    vec3 cornerPos[8];
     for (int i = 0; i < 8; ++i)
     {
         ivec3 s = cell + kCornerOffset[i];
         cornerDensity[i] = DensityAt(s);
         cornerGradient[i] = GradientAt(s);
+        cornerPos[i] = vec3(s) * params.voxelSize;
     }
 
-    int cubeIndex = 0;
+    // Isovalue-relative corner values, in Lewiner's own bit convention:
+    // positive = outside/empty. This is the OPPOSITE of this project's
+    // old cubeIndex convention (which set a bit when density was BELOW
+    // isoLevel, i.e. solid) - confirmed by directly reading set_cube()
+    // in the reference before porting; get this backwards and every
+    // cell.index/config lookup below silently produces the complement
+    // surface instead of a compile error, so it's called out here
+    // explicitly rather than left implicit in the bit-shift below.
+    float cellValue[8];
+    int cellIndex = 0;
     for (int i = 0; i < 8; ++i)
     {
-        if (cornerDensity[i] < params.isoLevel)
+        cellValue[i] = cornerDensity[i] - params.isoLevel;
+        if (cellValue[i] > 0.0)
         {
-            cubeIndex |= (1 << i);
+            cellIndex |= (1 << i);
         }
     }
 
-    if (edgeTable[cubeIndex] == 0u)
+    int cse = MC_CASES(cellIndex, 0);
+    if (cse <= 0)
     {
         return; // fully inside or fully outside - no surface through this cell
     }
+    int tilingConfig = MC_CASES(cellIndex, 1);
 
+    // All 12 standard edge vertices, always computed unconditionally
+    // (simpler and safer than reconstructing an edge-active bitmask from
+    // the new tables - 12 cheap linear interpolations per cell is not a
+    // meaningful cost here). Math unchanged from before this rewrite -
+    // see this file's top comment on why Lewiner's edge interpolation is
+    // algebraically equivalent to this.
     vec3 edgeVertex[12];
     vec3 edgeNormal[12];
     for (int e = 0; e < 12; ++e)
     {
-        if ((edgeTable[cubeIndex] & (1u << e)) == 0u)
-        {
-            continue;
-        }
         int c0 = kEdgeCorners[e].x;
         int c1 = kEdgeCorners[e].y;
         float d0 = cornerDensity[c0];
@@ -204,23 +737,62 @@ void main()
         float t = abs(d1 - d0) > 1e-6 ? (params.isoLevel - d0) / (d1 - d0) : 0.5;
         t = clamp(t, 0.0, 1.0);
 
-        vec3 p0 = vec3(cell + kCornerOffset[c0]) * params.voxelSize;
-        vec3 p1 = vec3(cell + kCornerOffset[c1]) * params.voxelSize;
-        edgeVertex[e] = mix(p0, p1, t);
+        edgeVertex[e] = mix(cornerPos[c0], cornerPos[c1], t);
         edgeNormal[e] = normalize(mix(cornerGradient[c0], cornerGradient[c1], t));
     }
 
+    int triEdges[36];
+    int nt = BuildCaseTriangulation(cse, tilingConfig, cellValue, triEdges);
+    if (nt <= 0)
+    {
+        return;
+    }
+
+    // Center vertex some subcases need (edge index 12) - computed
+    // unconditionally whenever this cell produced any triangles at all,
+    // rather than scanning triEdges first to check: it's 8 divisions and
+    // a weighted sum, cheap enough that "always compute, sometimes
+    // unused" is simpler and safer than the alternative. Position is an
+    // inverse-density-weighted centroid of the 8 corners (direct port of
+    // Lewiner's calculate_center_vertex's weighting - verified
+    // algebraically equivalent given it's a linear combination of corner
+    // positions). Normal deliberately does NOT replicate Lewiner's own
+    // internal one-directional-difference gradient scheme (self.vg[]) -
+    // it reuses this shader's own proper central-difference
+    // cornerGradient[], the same source every other vertex's normal
+    // already comes from, which is a strictly better gradient estimate
+    // than what the reference computes internally for this one purpose.
+    float centerWeight[8];
+    float centerWeightSum = 0.0;
+    for (int i = 0; i < 8; ++i)
+    {
+        centerWeight[i] = 1.0 / (kMCEpsilon + abs(cellValue[i]));
+        centerWeightSum += centerWeight[i];
+    }
+    vec3 centerPos = vec3(0.0);
+    vec3 centerGradSum = vec3(0.0);
+    for (int i = 0; i < 8; ++i)
+    {
+        centerPos += centerWeight[i] * cornerPos[i];
+        centerGradSum += centerWeight[i] * cornerGradient[i];
+    }
+    centerPos /= centerWeightSum;
+    vec3 centerNormal = normalize(centerGradSum);
+
     uint chunkVertexBase = uint(chunkIndex) * uint(params.maxVerticesPerChunk);
 
-    for (int tri = 0; tri < 15; tri += 3)
+    for (int tri = 0; tri < nt * 3; tri += 3)
     {
-        int i0 = triTable[cubeIndex * 16 + tri];
-        if (i0 < 0)
-        {
-            break;
-        }
-        int i1 = triTable[cubeIndex * 16 + tri + 1];
-        int i2 = triTable[cubeIndex * 16 + tri + 2];
+        int i0 = triEdges[tri];
+        int i1 = triEdges[tri + 1];
+        int i2 = triEdges[tri + 2];
+
+        vec3 p0 = (i0 == 12) ? centerPos : edgeVertex[i0];
+        vec3 p1 = (i1 == 12) ? centerPos : edgeVertex[i1];
+        vec3 p2 = (i2 == 12) ? centerPos : edgeVertex[i2];
+        vec3 n0 = (i0 == 12) ? centerNormal : edgeNormal[i0];
+        vec3 n1 = (i1 == 12) ? centerNormal : edgeNormal[i1];
+        vec3 n2 = (i2 == 12) ? centerNormal : edgeNormal[i2];
 
         // Reserve 3 vertex slots for this triangle. commands[chunkIndex*4]
         // is the chunk's vertexCount field (see IndirectBuffer's layout
@@ -235,7 +807,10 @@ void main()
             // triangle rather than writing past this chunk's slot range
             // into its neighbor's. Same "known limitation, not a
             // crash" tradeoff as MAX_INSTANCES_PER_FRAME.
-            atomicAdd(commands[chunkIndex * 4 + 0], uint(-3));
+            // Undo the reservation via unsigned wraparound (matches
+            // atomicAdd's own uint domain - avoids any ambiguity from
+            // casting a negative literal to uint).
+            atomicAdd(commands[chunkIndex * 4 + 0], 0u - 3u);
             continue;
         }
 
@@ -243,12 +818,11 @@ void main()
         // surface was being culled, showing the sphere's inside/far
         // wall instead - "always looking at the inside" is exactly what
         // wrong-handed culling looks like). Swapped i1/i2 here to flip
-        // it, project-wide, in this one place - see kEdgeCorners/
-        // triTable's construction for why the raw table order came out
-        // opposite-handed from what this pipeline's CCW-front-face
-        // culling expects.
-        WriteVertex(chunkVertexBase + slot + 0, edgeVertex[i0] + params.origin, vec3(1.0), vec2(0.0), edgeNormal[i0]);
-        WriteVertex(chunkVertexBase + slot + 1, edgeVertex[i2] + params.origin, vec3(1.0), vec2(0.0), edgeNormal[i2]);
-        WriteVertex(chunkVertexBase + slot + 2, edgeVertex[i1] + params.origin, vec3(1.0), vec2(0.0), edgeNormal[i1]);
+        // it, project-wide, in this one place - unrelated to and
+        // unaffected by the table rewrite above (this is purely about
+        // this pipeline's own CCW-front-face culling convention).
+        WriteVertex(chunkVertexBase + slot + 0, p0 + params.origin, vec3(1.0), vec2(0.0), n0);
+        WriteVertex(chunkVertexBase + slot + 1, p2 + params.origin, vec3(1.0), vec2(0.0), n2);
+        WriteVertex(chunkVertexBase + slot + 2, p1 + params.origin, vec3(1.0), vec2(0.0), n1);
     }
 }

@@ -1,7 +1,9 @@
 #include "VoxelSystemGPU.h"
-#include "MarchingCubesTables.h"
+#include "MarchingCubesTables33.h"
 #include "../Renderer/Vulkan/RendererTypes.h"
 #include "../Physics/SDF.h"
+
+#include <glm/gtc/noise.hpp> // glm::perlin - used by SeedHeightfieldNoise only; already vendored, no new ThirdParty dependency (GTC noise is stable, no GLM_ENABLE_EXPERIMENTAL needed)
 
 #include <stdexcept>
 #include <cstdio>
@@ -114,15 +116,11 @@ namespace Eden
                                     VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
 
         // Uploaded once, read-only forever after - every volume's
-        // compute descriptor set points at these SAME two buffers (see
+        // compute descriptor set points at this SAME buffer (see
         // CreateComputeLayout's per-volume descriptor writes).
-        m_EdgeTable.Init(m_Allocator, sizeof(kMarchingCubesEdgeTable),
+        m_MC33Table.Init(m_Allocator, sizeof(kMC33TableData),
                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
-        UploadRange(m_EdgeTable.Get(), 0, kMarchingCubesEdgeTable, sizeof(kMarchingCubesEdgeTable));
-
-        m_TriTable.Init(m_Allocator, sizeof(kMarchingCubesTriTable),
-                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
-        UploadRange(m_TriTable.Get(), 0, kMarchingCubesTriTable, sizeof(kMarchingCubesTriTable));
+        UploadRange(m_MC33Table.Get(), 0, kMC33TableData, sizeof(kMC33TableData));
 
         CreateComputeLayout();
         CreateComputePipelines();
@@ -133,7 +131,7 @@ namespace Eden
 
     void VoxelSystemGPU::CreateComputeLayout()
     {
-        std::array<VkDescriptorSetLayoutBinding, 6> bindings{};
+        std::array<VkDescriptorSetLayoutBinding, 5> bindings{};
         for (uint32_t i = 0; i < bindings.size(); ++i)
         {
             bindings[i].binding = i;
@@ -142,10 +140,12 @@ namespace Eden
             bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         }
         // 0 = density, 1 = vertices (out), 2 = indirect commands (atomic
-        // vertexCount), 3 = edge table, 4 = tri table, 5 = dirty flags -
-        // all read by voxel_march.comp; density is written from the CPU
-        // side only now (UploadDensity), never by a compute shader - see
-        // the class comment in VoxelSystemGPU.h.
+        // vertexCount), 3 = MC33 table blob, 4 = dirty flags - all read
+        // by voxel_march.comp; density is written from the CPU side only
+        // now (UploadDensity), never by a compute shader - see the class
+        // comment in VoxelSystemGPU.h. (Was 6 bindings, edge table + tri
+        // table separately, before the MC33 rewrite packed every table
+        // into one buffer - see MarchingCubesTables33.h.)
 
         VkDescriptorSetLayoutCreateInfo layoutInfo{};
         layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
@@ -209,8 +209,7 @@ namespace Eden
             m_ComputeSetLayout = VK_NULL_HANDLE;
         }
 
-        m_TriTable.Shutdown();
-        m_EdgeTable.Shutdown();
+        m_MC33Table.Shutdown();
     }
 
     // Identical shape to ParticleSystemGPU::UploadRange - see that
@@ -525,29 +524,28 @@ namespace Eden
         volume.chunkSolid.assign(numChunks, true);
         volume.dirtyChunkIndices.clear();
 
-        std::array<VkDescriptorBufferInfo, 6> bufferInfos{};
-        // Bound as a SUB-RANGE of the shared buffer (offset in bytes,
-        // range limited to exactly this volume's sample count) rather
-        // than VK_WHOLE_SIZE from offset 0 - this is what makes
-        // voxel_march.comp's `density[0]` transparently land on THIS
-        // volume's first sample within the shared buffer, with zero
-        // shader changes required (see m_SharedDensityBuffer's own
-        // comment). The range limit also means this compute set can
-        // never accidentally read/be validated against another
-        // volume's region even though they share one underlying
-        // VkBuffer.
-        bufferInfos[0] = {
-            m_SharedDensityBuffer.Get(),
-            volume.densityOffsetElements * sizeof(float),
-            static_cast<VkDeviceSize>(numSamples) * sizeof(float)
-        };
+        std::array<VkDescriptorBufferInfo, 5> bufferInfos{};
+        // Binding 0 is now the FULL shared density buffer (offset 0,
+        // VK_WHOLE_SIZE), not a per-volume sub-range like it used to be.
+        // Ghost-sample neighbor reads (voxel_march.comp's DensityAt)
+        // need a volume's compute set to be able to reach into an
+        // ADJACENT terrain tile's region of this same buffer for
+        // gradient continuity across tile boundaries - a sub-range view
+        // can't do that, Vulkan won't let a shader read outside a
+        // binding's declared range. Every density read now goes through
+        // an explicit element offset from push constants
+        // (ownDensityElementOffset for this volume's own samples, or
+        // one of the 4 neighborDensityOffset* fields when a boundary
+        // cell's gradient reaches into a neighbor) instead of relying on
+        // the binding's offset to do it implicitly - see
+        // VoxelParamsGPU's own comment for why.
+        bufferInfos[0] = { m_SharedDensityBuffer.Get(), 0, VK_WHOLE_SIZE };
         bufferInfos[1] = { volume.vertices.Get(), 0, VK_WHOLE_SIZE };
         bufferInfos[2] = { volume.indirect.Get(), 0, VK_WHOLE_SIZE };
-        bufferInfos[3] = { m_EdgeTable.Get(), 0, VK_WHOLE_SIZE };
-        bufferInfos[4] = { m_TriTable.Get(), 0, VK_WHOLE_SIZE };
-        bufferInfos[5] = { volume.dirtyFlags.Get(), 0, VK_WHOLE_SIZE };
+        bufferInfos[3] = { m_MC33Table.Get(), 0, VK_WHOLE_SIZE };
+        bufferInfos[4] = { volume.dirtyFlags.Get(), 0, VK_WHOLE_SIZE };
 
-        std::array<VkWriteDescriptorSet, 6> writes{};
+        std::array<VkWriteDescriptorSet, 5> writes{};
         for (uint32_t b = 0; b < writes.size(); ++b)
         {
             writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -981,6 +979,80 @@ namespace Eden
         }
     }
 
+    void VoxelSystemGPU::SeedHeightfieldNoise(VoxelVolumeHandle handle, float baseHeight, float amplitude,
+                                               float frequency, int octaves, uint32_t seed)
+    {
+        Volume& volume = GetVolume(handle);
+        glm::ivec3 sampleDims = volume.desc.SampleDims();
+
+        // Arbitrary irrational multipliers so nearby integer seeds don't
+        // just look like a panned copy of the same noise field - not
+        // meant to be a real hash, just enough decorrelation that
+        // seed=1 and seed=2 read as genuinely different terrain.
+        glm::vec2 seedOffset(static_cast<float>(seed) * 6180.339887f, static_cast<float>(seed) * 3141.592653f);
+
+        for (int32_t z = 0; z < sampleDims.z; ++z)
+        for (int32_t y = 0; y < sampleDims.y; ++y)
+        for (int32_t x = 0; x < sampleDims.x; ++x)
+        {
+            glm::vec3 localPos = glm::vec3(x, y, z) * volume.desc.voxelSize;
+            glm::vec3 worldPos = volume.desc.origin + localPos;
+
+            // Standard fBm: each octave halves amplitude and doubles
+            // frequency of the previous one. Only x/z feed the noise -
+            // this is a 2D heightfield, not 3D noise (no overhangs/caves
+            // yet - see this function's header comment on scope).
+            float height = 0.0f;
+            float amp = amplitude;
+            float freq = frequency;
+            for (int o = 0; o < octaves; ++o)
+            {
+                height += glm::perlin(glm::vec2(worldPos.x, worldPos.z) * freq + seedOffset) * amp;
+                amp *= 0.5f;
+                freq *= 2.0f;
+            }
+
+            float terrainHeight = baseHeight + height;
+
+            // Detail layer, separate from the macro fBm loop above and
+            // deliberately NOT just "one more octave" of it - doubling
+            // frequency/halving amplitude each octave decays amplitude
+            // far faster than frequency climbs into a range that
+            // actually reads as surface texture at normal viewing
+            // distance (reaching a ~2m period this way would need ~7
+            // more octaves, by which point amplitude is under a
+            // millimeter - invisible). This is a single fixed high-
+            // frequency, low-amplitude term instead, scaled off the
+            // caller's own amplitude (so amplitude=0 disables it too,
+            // and it stays sensible if the macro amplitude changes)
+            // purely to give the surface enough per-vertex normal
+            // variation for Blinn-Phong shading to show something on an
+            // otherwise near-flat field - NOT meant to be geometrically
+            // significant enough to affect carving or particle rest
+            // behavior. Different seed multiplier than the macro
+            // offset so the detail ripple doesn't visibly correlate
+            // with the macro shape.
+            float detailHeight = glm::perlin(glm::vec2(worldPos.x, worldPos.z) * (frequency * 12.0f) + seedOffset * 1.7f)
+                                  * (amplitude * 0.08f);
+            terrainHeight += detailHeight;
+
+            // Vertical-offset pseudo-SDF (see header comment for why
+            // this isn't an exact distance off-flat) - negative below
+            // the surface (solid), positive above (empty), matching
+            // every other Seed*'s inside-is-negative convention.
+            float d = worldPos.y - terrainHeight;
+            volume.densityCPU[SampleIndex(volume.desc, glm::ivec3(x, y, z))] = d;
+        }
+
+        UploadDensity(volume);
+
+        volume.dirtyChunkIndices.resize(volume.desc.NumChunks());
+        for (uint32_t i = 0; i < volume.desc.NumChunks(); ++i)
+        {
+            volume.dirtyChunkIndices[i] = i;
+        }
+    }
+
     void VoxelSystemGPU::MarchDirtyChunks(VoxelVolumeHandle handle)
     {
         Volume& volume = GetVolume(handle);
@@ -998,6 +1070,20 @@ namespace Eden
         params.chunkDims = volume.desc.chunkDims;
         params.maxVerticesPerChunk = static_cast<int32_t>(kVoxelMaxVerticesPerChunk);
         params.isoLevel = kVoxelIsoLevel;
+
+        // Ghost-sample offsets - see VoxelParamsGPU's own comment and
+        // voxel_march.comp's DensityAt. ownDensityElementOffset always
+        // needs setting now (binding 0 is the full shared buffer, not a
+        // per-volume sub-range - see RegisterVolume); the 4 neighbor
+        // offsets stay -1 (their default) for any direction
+        // SetVolumeNeighbors was never called for, or was called with
+        // InvalidVoxelVolumeHandle for - which is every non-terrain
+        // volume and every terrain tile on the grid's outer edge.
+        params.ownDensityElementOffset = static_cast<int32_t>(volume.densityOffsetElements);
+        if (IsValid(volume.neighborNegX)) params.neighborDensityOffsetNegX = static_cast<int32_t>(GetVolume(volume.neighborNegX).densityOffsetElements);
+        if (IsValid(volume.neighborPosX)) params.neighborDensityOffsetPosX = static_cast<int32_t>(GetVolume(volume.neighborPosX).densityOffsetElements);
+        if (IsValid(volume.neighborNegZ)) params.neighborDensityOffsetNegZ = static_cast<int32_t>(GetVolume(volume.neighborNegZ).densityOffsetElements);
+        if (IsValid(volume.neighborPosZ)) params.neighborDensityOffsetPosZ = static_cast<int32_t>(GetVolume(volume.neighborPosZ).densityOffsetElements);
 
         VkCommandBufferAllocateInfo cmdAllocInfo{};
         cmdAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -1142,7 +1228,22 @@ namespace Eden
         // producing a seam/hole with no closing wall on one side. Using
         // cellMax + 1 (clamped) here matches the +1 padding sampleMax
         // already uses below, so the chunk range and sample range agree.
-        glm::ivec3 chunkMin = ChunkCoordFromCellClamped(volume.desc, cellMin);
+        //
+        // BUGFIX 2: chunkMin needs the EXACT mirror-image fix, previously
+        // missing entirely - sampleMin is the first touched sample, and
+        // that same sample is the FAR corner of the cell just BELOW
+        // cellMin (cell sampleMin-1 spans samples sampleMin-1 and
+        // sampleMin). Deriving chunkMin from cellMin directly missed
+        // that cell's chunk whenever sampleMin landed exactly on a chunk
+        // boundary - the asymmetric version of the exact bug described
+        // above, just on the low side instead of the high side. This was
+        // real and reproducible, not theoretical: a carve with
+        // cellMin=(16,...) logged chunkMin=(2,...) (chunk 10 only) even
+        // though sample x=16 is chunk 9's last cell's far corner - chunk
+        // 9 never got marked dirty, leaving a permanent stale seam
+        // exactly at that boundary. cellMin - 1 (clamped) mirrors
+        // cellMax + 1 above.
+        glm::ivec3 chunkMin = ChunkCoordFromCellClamped(volume.desc, glm::max(cellMin - glm::ivec3(1), glm::ivec3(0)));
         glm::ivec3 chunkMax = ChunkCoordFromCellClamped(volume.desc, glm::min(cellMax + glm::ivec3(1), voxelDims - glm::ivec3(1)));
 
         for (int32_t cz = chunkMin.z; cz <= chunkMax.z; ++cz)
@@ -1410,11 +1511,43 @@ namespace Eden
                 }
             }
 
+            // Real correctness check, not just a symptom count: compute
+            // the SAME cellIndex bit pattern voxel_march.comp does
+            // (Lewiner's own convention - bit set when density is ABOVE
+            // isoLevel, the OPPOSITE of this function's own `solid[]`,
+            // which is why this isn't just `!solid[i]`) and look it up
+            // in the actual MC33 CASES table this build uploads to the
+            // GPU. Every cell reaching this point already has at least
+            // one solid and one non-solid corner (the anySolid/allSolid
+            // filter above), which makes case<=0 here IMPOSSIBLE if the
+            // lookup is wired correctly - CASES only returns <=0 for the
+            // two fully-uniform configs (0 and 255), both already
+            // excluded. If this ever fires, it's conclusive proof of an
+            // indexing/convention bug in the MC33 port (wrong bit
+            // convention, wrong table offset, etc.) - not a case of
+            // "normal ambiguity," which this check can't produce a false
+            // positive for.
+            int cellIndex = 0;
+            for (int i = 0; i < 8; ++i)
+            {
+                if (d[i] > kVoxelIsoLevel)
+                {
+                    cellIndex |= (1 << i);
+                }
+            }
+            int mc33Case = kMC33TableData[kMC33Offset_CASES + cellIndex * 2 + 0];
+            if (mc33Case <= 0)
+            {
+                std::printf("[MC33_BUG] cell=(%d,%d,%d) cellIndex=%d got case=%d despite being a genuine "
+                            "surface crossing - this is a real indexing bug, not expected ambiguity\n",
+                            x, y, z, cellIndex, mc33Case);
+            }
+
             if (cellIsAmbiguous)
             {
                 ambiguousCount++;
-                std::printf("[AmbiguousCell] cell=(%d,%d,%d) face=%d corners_solid=[%d,%d,%d,%d,%d,%d,%d,%d] density=[%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f]\n",
-                            x, y, z, ambiguousFace,
+                std::printf("[AmbiguousCell] cell=(%d,%d,%d) face=%d cellIndex=%d mc33Case=%d corners_solid=[%d,%d,%d,%d,%d,%d,%d,%d] density=[%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f]\n",
+                            x, y, z, ambiguousFace, cellIndex, mc33Case,
                             solid[0],solid[1],solid[2],solid[3],solid[4],solid[5],solid[6],solid[7],
                             d[0],d[1],d[2],d[3],d[4],d[5],d[6],d[7]);
             }
@@ -1534,6 +1667,16 @@ namespace Eden
         bounds.worldMax = volume.desc.origin + glm::vec3(volume.desc.VoxelDims()) * volume.desc.voxelSize;
         bounds.voxelSize = volume.desc.voxelSize;
         return bounds;
+    }
+
+    void VoxelSystemGPU::SetVolumeNeighbors(VoxelVolumeHandle handle, VoxelVolumeHandle negX, VoxelVolumeHandle posX,
+                                             VoxelVolumeHandle negZ, VoxelVolumeHandle posZ)
+    {
+        Volume& volume = GetVolume(handle);
+        volume.neighborNegX = negX;
+        volume.neighborPosX = posX;
+        volume.neighborNegZ = negZ;
+        volume.neighborPosZ = posZ;
     }
 
     void VoxelSystemGPU::ClearVolume(VoxelVolumeHandle handle)
