@@ -87,6 +87,11 @@ layout(push_constant) uniform SimParams
     // scene layout (main.cpp), not this engine subsystem - defaults far
     // below any real scene so it's a no-op until something sets it.
     float voidKillY;
+
+    // Cohesion coefficient - unused in this pass, present only to keep
+    // this push-constant block byte-identical across all four compute
+    // shaders (see ParticleGPUTypes.h's SimParamsGPU::cohesion comment).
+    float cohesion;
 } sim;
 
 // --- SDF math (Engine/Physics/SDF.h port) --------------------------------

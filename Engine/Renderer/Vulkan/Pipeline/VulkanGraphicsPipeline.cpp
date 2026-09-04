@@ -11,7 +11,8 @@ namespace Eden
                                        const std::string& vertSpirvPath, const std::string& fragSpirvPath,
                                        const std::vector<VkVertexInputBindingDescription>& bindingDescriptions,
                                        const std::vector<VkVertexInputAttributeDescription>& attributeDescriptions,
-                                       VkPrimitiveTopology topology, VkCullModeFlags cullMode)
+                                       VkPrimitiveTopology topology, VkCullModeFlags cullMode,
+                                       bool depthTestEnable, bool depthWriteEnable)
     {
         m_DeviceHandle = device;
 
@@ -90,8 +91,8 @@ namespace Eden
 
         VkPipelineDepthStencilStateCreateInfo depthStencil{};
         depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-        depthStencil.depthTestEnable = VK_TRUE;
-        depthStencil.depthWriteEnable = VK_TRUE;
+        depthStencil.depthTestEnable = depthTestEnable ? VK_TRUE : VK_FALSE;
+        depthStencil.depthWriteEnable = depthWriteEnable ? VK_TRUE : VK_FALSE;
         depthStencil.depthCompareOp = VK_COMPARE_OP_LESS;
         depthStencil.depthBoundsTestEnable = VK_FALSE;
         depthStencil.stencilTestEnable = VK_FALSE;

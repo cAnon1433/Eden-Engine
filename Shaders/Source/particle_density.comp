@@ -44,6 +44,11 @@ layout(push_constant) uniform SimParams
     // particle_integrate.comp and particle_build_grid.comp - not just
     // present for layout matching anymore.
     float voidKillY;
+
+    // Cohesion coefficient - unused in this pass, present only to keep
+    // this push-constant block byte-identical across all four compute
+    // shaders (see ParticleGPUTypes.h's SimParamsGPU::cohesion comment).
+    float cohesion;
 } sim;
 
 const float PI = 3.14159265358979323846;

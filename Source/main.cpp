@@ -1004,13 +1004,18 @@ namespace
         if (keyDown && !g_ReformKeyWasDown)
         {
             // clusterRadius deliberately much wider than smoothingRadius
-            // - this fluid has no cohesion/surface-tension force, so it
-            // doesn't clump into one blob when it settles, it spreads
+            // - a cohesion/surface-tension force now exists
+            // (SimParamsGPU::cohesion, see particle_force.comp) but
+            // defaults to 0/off, so out of the box this fluid still
+            // doesn't clump into one blob when it settles - it spreads
             // into a puddle with gaps between locally-packed groups.
             // clusterRadius only controls which particles get batched
             // together for reform - it does NOT control whether the
             // resulting geometry visually fuses (see reformBlobRadius
-            // below for that).
+            // below for that). If cohesion ever gets tuned up high
+            // enough to change resting-pool shape meaningfully,
+            // revisit whether clusterRadius still needs to be this
+            // wide.
             //
             // reformBlobRadius (passed as SeedFromParticles' sphere
             // radius) is deliberately NOT particleSystem.boundaryRadius.
@@ -1698,6 +1703,38 @@ int main()
                 ImGui::Text("Particle count: %u / %u", particleSystem.ParticleCount(), particleSystem.Capacity());
                 ImGui::SliderFloat("Point size", &renderer.ParticlePointSize, 1.0f, 32.0f);
                 ImGui::ColorEdit3("Color", &renderer.ParticleGPUColor.x);
+
+                // Live SPH tunables - added alongside the cohesion force
+                // (see SimParamsGPU::cohesion's comment) so tuning
+                // "bouncy droplets vs cohesive liquid" and "explodes/
+                // jitters on impact" doesn't require a rebuild per
+                // attempt. BuildSimParams() reads these fields fresh
+                // every Step() call, so changes here take effect next
+                // physics substep, live.
+                if (ImGui::CollapsingHeader("SPH tuning", ImGuiTreeNodeFlags_DefaultOpen))
+                {
+                    ImGui::SliderFloat("Stiffness", &particleSystem.stiffness, 500.0f, 8000.0f);
+                    ImGui::SliderFloat("Viscosity", &particleSystem.viscosityCoefficient, 0.0f, 5.0f);
+                    ImGui::SliderFloat("Cohesion", &particleSystem.cohesion, 0.0f, 8000.0f);
+                    ImGui::SliderFloat("Boundary friction", &particleSystem.boundaryFriction, 0.0f, 1.0f);
+                    ImGui::SliderFloat("Max acceleration", &particleSystem.maxAcceleration, 50.0f, 2000.0f);
+                    ImGui::SliderInt("Substeps", &particleSystem.substeps, 1, 8);
+                }
+
+                // Screen-space fluid surface (see Renderer::FluidSurfaceEnabled's
+                // comment) - the actual "looks like connected liquid, not
+                // a cloud of dots" fix. Toggle-able rather than always-on
+                // so this can be A/B'd against the old raw-point path, or
+                // turned off as a fallback if the new render pass turns
+                // out to have a problem this session's build/test pass
+                // hasn't surfaced yet.
+                if (ImGui::CollapsingHeader("Fluid surface render", ImGuiTreeNodeFlags_DefaultOpen))
+                {
+                    ImGui::Checkbox("Enabled", &renderer.FluidSurfaceEnabled);
+                    ImGui::SliderFloat("Visual radius", &renderer.FluidParticleRadius, 0.02f, 0.4f);
+                    ImGui::ColorEdit3("Tint", &renderer.FluidTintColor.x);
+                }
+
                 if (ImGui::Button("Emit box"))
                 {
                     particleSystem.EmitBox(particleSpawnOrigin - glm::vec3(0.5f), particleSpawnOrigin + glm::vec3(0.5f));

@@ -85,6 +85,24 @@ namespace Eden
         // implicit std140 layouts to agree - if you ever reorder these
         // fields, reorder them identically on the GLSL side too.
         float particlePointSize = 6.0f;
+
+        // Camera basis vectors, added for the fluid-surface depth prepass
+        // (fluid_depth.frag) - lets it build a camera-facing sphere
+        // impostor per point sprite without inverting the view matrix
+        // per-fragment (or even per-vertex). Appended at the END of the
+        // struct, same "existing shaders don't need to change" reasoning
+        // as SimParamsGPU::cohesion's own comment: every OTHER shader
+        // that declares this uniform block (triangle.vert/.frag,
+        // particle_point.vert, raymarch.frag, etc.) only reads up through
+        // particlePointSize and is completely unaffected by fields added
+        // after it - only fluid_depth.vert/.frag and fluid_composite.frag
+        // declare the extended block. std140 pads each vec3 to 16 bytes
+        // regardless, so this grows the UBO by 48 bytes - negligible
+        // against any real uniform-buffer size budget, unlike a push
+        // constant.
+        alignas(16) glm::vec3 cameraRight;
+        alignas(16) glm::vec3 cameraUp;
+        alignas(16) glm::vec3 cameraForward;
     };
 
     // Opaque handle into Renderer's mesh resource registry (see

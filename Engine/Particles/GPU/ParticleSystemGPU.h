@@ -98,6 +98,19 @@ namespace Eden
 
         int maxSweepIterations = 8;
 
+        // Akinci cohesion coefficient - see particle_force.comp's
+        // CohesionKernel/main() for the force this drives, and
+        // SimParamsGPU::cohesion's comment (ParticleGPUTypes.h) for why
+        // it exists. 0 = off, identical to pre-cohesion behavior.
+        // Un-tuned starting point - dial this from the "Particles (GPU)"
+        // ImGui panel while a resting pool/splash is on screen; a few
+        // thousand is a reasonable starting order of magnitude given
+        // this project's mass/restDensity/h, same scale as `stiffness`.
+        // Too high pulls the whole body into a single shrinking clump
+        // instead of holding a free surface together - if that happens,
+        // come back down.
+        float cohesion = 0.0f;
+
         // A particle whose position.y drops below this is considered to
         // have left the simulated world - see SimParamsGPU::voidKillY's
         // own comment (ParticleGPUTypes.h) and particle_integrate.comp's

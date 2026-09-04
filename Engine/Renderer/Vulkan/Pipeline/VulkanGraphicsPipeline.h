@@ -40,12 +40,26 @@ namespace Eden
         // for the one call site that does this today. This is a stopgap:
         // it papers over rare topology gaps by making backfaces visible
         // through them, it doesn't fix the gaps themselves.
+        // depthTestEnable/depthWriteEnable default to true/true, matching
+        // every call site's behavior before these parameters existed
+        // (mesh, voxel, particle-point, raymarch pipelines all want depth
+        // test+write ON - see VulkanGraphicsPipeline.cpp's depthStencil
+        // block, previously hardcoded). Added for the fluid-surface blur
+        // passes (see Renderer::m_FluidBlurPipeline), which render into a
+        // render pass with NO depth attachment at all - passing false/false
+        // there rather than relying on "an unused pDepthStencilState is
+        // spec-ignored when the subpass has no depth attachment," which is
+        // technically true per the Vulkan spec but not worth trusting
+        // untested across MoltenVK/Windows drivers when an explicit,
+        // zero-risk flag does the same thing.
         void Init(VkDevice device, VkRenderPass renderPass, VkPipelineLayout layout,
                   const std::string& vertSpirvPath, const std::string& fragSpirvPath,
                   const std::vector<VkVertexInputBindingDescription>& bindingDescriptions,
                   const std::vector<VkVertexInputAttributeDescription>& attributeDescriptions,
                   VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
-                  VkCullModeFlags cullMode = VK_CULL_MODE_BACK_BIT);
+                  VkCullModeFlags cullMode = VK_CULL_MODE_BACK_BIT,
+                  bool depthTestEnable = true,
+                  bool depthWriteEnable = true);
         void Shutdown();
 
         VkPipeline Get() const { return m_Pipeline; }

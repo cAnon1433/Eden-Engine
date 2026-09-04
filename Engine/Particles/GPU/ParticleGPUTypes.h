@@ -262,6 +262,24 @@ namespace Eden
         // ParticleSystemGPU has no notion of "where the world's floor
         // is," only main.cpp (or whatever owns scene layout) does.
         float voidKillY = -1.0e9f;
+
+        // Akinci et al. 2013 cohesion coefficient - see particle_force.comp's
+        // CohesionKernel/main() for the actual force. 0 = off (identical to
+        // pre-cohesion behavior). This is the knob for "bouncy separate
+        // droplets" vs "one cohesive body" - pressure+viscosity alone (the
+        // only forces that existed before this field) have nothing pulling
+        // free-surface particles toward each other, which is exactly what
+        // reads as "bouncy balls" instead of liquid.
+        //
+        // Appended last, same "don't disturb existing offsets" convention
+        // as heatDecayRate/boundaryFriction above. Struct size stays 112
+        // bytes, unchanged - voidKillY (a lone float right after gravity's
+        // vec4) already left 12 bytes of alignas(16) trailing padding that
+        // the compiler was silently reserving; this field just claims 4 of
+        // those already-spare bytes instead of growing the struct. Still
+        // 8 bytes of padding left after this for one more float/similar
+        // before the next one would actually push past 112.
+        float cohesion = 0.0f;
     };
     static_assert(sizeof(SimParamsGPU) == 112, "SimParamsGPU must match the GLSL push_constant block byte-for-byte");
 }

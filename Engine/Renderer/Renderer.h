@@ -12,6 +12,7 @@
 #include "Vulkan/Resources/VulkanMemoryAllocator.h"
 #include "Vulkan/Resources/VulkanImage.h"
 #include "Vulkan/Resources/VulkanTexture.h"
+#include "Vulkan/Resources/VulkanSampler.h"
 #include "Vulkan/Resources/Mesh.h"
 #include "Camera.h"
 #include "Frustum.h"
@@ -224,6 +225,32 @@ namespace Eden
         // the same live-tweak-from-UI reasoning as ParticlePointSize.
         glm::vec4 ParticleGPUColor{ 0.2f, 0.5f, 1.0f, 1.0f };
 
+        // --- Fluid surface rendering (see InitFluidSurfacePass) --------
+        // When true, DrawFrame replaces the raw round-point particle draw
+        // above (particleGPUCount/m_ParticlePointsGPUPipeline) with a
+        // 3-pass screen-space reconstruction that reads from the exact
+        // same GPU-resident position buffer: particles are splatted as
+        // sphere impostors into an offscreen depth texture
+        // (fluid_depth.vert/.frag), bilaterally blurred twice
+        // (fluid_blur.frag - see that shader for why this fuses separate
+        // particles into one surface instead of just softening the raw
+        // dots), then composited into the main render pass with a normal
+        // reconstructed from the blurred depth (fluid_composite.frag).
+        // Purely a rendering technique - doesn't touch ParticleSystemGPU
+        // or particle physics at all. Same live-tweak-from-UI reasoning
+        // as ParticlePointSize for why these are public fields.
+        bool FluidSurfaceEnabled = true;
+        // World-space visual sphere radius per particle - independent of
+        // ParticleSystemGPU::boundaryRadius (the hard collision radius)
+        // and smoothingRadius (the SPH kernel radius); this only controls
+        // how big particles are drawn, same relationship ParticlePointSize
+        // already has to the raw-point path. Larger values overlap more
+        // (reads as more cohesive/continuous) at the cost of the fluid
+        // visually sitting a bit "puffier" than its actual simulated
+        // volume - a rendering compromise, not a physics one.
+        float FluidParticleRadius = 0.12f;
+        glm::vec3 FluidTintColor{ 0.06f, 0.28f, 0.5f };
+
         // CPU software occlusion buffer, cleared and repopulated fresh
         // every frame by RenderSystem::BuildDrawList - see
         // SoftwareOcclusionBuffer.h for the technique. Owned by Renderer
@@ -415,6 +442,116 @@ namespace Eden
         // defensively regardless).
         void UpdateRaymarchDescriptors(const std::vector<RaymarchObjectGPU>& objects,
                                         VkBuffer densityBuffer);
+
+        // --- Fluid surface rendering (see FluidSurfaceEnabled above and
+        // fluid_depth.vert/fluid_blur.frag/fluid_composite.frag) --------
+        // Three offscreen-ish stages, all hand-managed raw VkRenderPass/
+        // VkFramebuffer objects rather than going through VulkanRenderPass
+        // (that class is hardcoded to "swapchain color + depth, one
+        // subpass" - see its own class comment - which doesn't fit any of
+        // these three: the depth prepass needs a COLOR attachment that's
+        // R32_SFLOAT and gets SAMPLED afterward, not presented, and the
+        // blur passes need no depth attachment at all).
+        void InitFluidSurfacePass();
+        // Split from InitFluidSurfacePass (which only runs once, in
+        // Init()) because the image/framebuffer half - unlike the
+        // pipelines/descriptor-set-layouts/sampler half - is sized to the
+        // swapchain extent and has to be torn down and rebuilt on every
+        // resize, same as m_DepthImage/CreateDepthResources. Order
+        // matters: CreateFluidSurfaceResources allocates the descriptor
+        // sets that read these images, so DestroyFluidSurfaceResources
+        // must run before a resize recreates them, and
+        // CreateFluidSurfaceResources must run again after.
+        void CreateFluidSurfaceResources();
+        void DestroyFluidSurfaceResources();
+
+        VkRenderPass m_FluidDepthPrepassRenderPass = VK_NULL_HANDLE;
+        VkRenderPass m_FluidBlurRenderPass = VK_NULL_HANDLE;
+        VkFramebuffer m_FluidDepthFramebuffer = VK_NULL_HANDLE;
+        VkFramebuffer m_FluidBlurFramebufferA = VK_NULL_HANDLE;
+        VkFramebuffer m_FluidBlurFramebufferB = VK_NULL_HANDLE;
+
+        // R32_SFLOAT, world-space distance from the camera to the
+        // reconstructed sphere surface at each pixel - see
+        // fluid_depth.frag's comment for why world-distance (not raw
+        // view-space Z) is what gets stored, matching raymarch.frag's
+        // existing ray-reconstruction technique that fluid_composite.frag
+        // reuses. "No particle here" pixels hold whatever
+        // CreateFluidSurfaceResources clears this to (see that function) -
+        // every downstream shader treats anything past
+        // SENTINEL_THRESHOLD as empty, never as a real depth.
+        VulkanImage m_FluidDepthImage;
+        // LOCAL depth-test-only buffer for the depth prepass - resolves
+        // which of several overlapping sphere impostors is actually
+        // nearest at a given pixel (ordinary hardware depth test). Never
+        // sampled by anything afterward, unlike m_FluidDepthImage above -
+        // exists purely so vkCmdDraw'ing particles as unsorted point
+        // sprites still occludes correctly, the same reason ANY depth
+        // buffer exists.
+        VulkanImage m_FluidDepthPassDS;
+        // Ping-pong targets for the separable bilateral blur (see
+        // fluid_blur.frag) - A holds the horizontal pass's output/the
+        // vertical pass's input, B holds the vertical pass's (i.e. the
+        // whole blur's) final output, which is what
+        // m_FluidCompositeSet actually reads.
+        VulkanImage m_FluidBlurImageA;
+        VulkanImage m_FluidBlurImageB;
+
+        // NEAREST, not LINEAR - see fluid_blur.frag's comment: this
+        // texture holds either a real depth value or a huge sentinel with
+        // nothing in between, and hardware bilinear filtering would blend
+        // the two right at every silhouette edge before the shader's own
+        // sentinel check ever sees the sample, corrupting exactly the
+        // boundary the whole bilateral-weight scheme exists to preserve.
+        VulkanSampler m_FluidSampler;
+
+        // Set 1 = m_ParticleGPUSetLayout (the same one-storage-buffer
+        // layout RegisterParticleGPUSource already created) - this
+        // pipeline reads the identical position buffer that pipeline
+        // does, just through a different pipeline/vertex shader, so it
+        // reuses that layout AND that already-allocated m_ParticleGPUStorageSet
+        // directly rather than standing up a second copy of the same
+        // binding.
+        VulkanPipelineLayout m_FluidDepthPipelineLayout;
+        VulkanGraphicsPipeline m_FluidDepthPipeline;
+
+        // Set 0 = m_TextureSetLayout (one combined image sampler) - no
+        // camera UBO needed for a pure image-space blur. Same pipeline
+        // object is bound for BOTH the horizontal and vertical pass
+        // (see DrawFrame) - only the bound descriptor set and the
+        // direction push constant differ between the two draw calls.
+        VulkanPipelineLayout m_FluidBlurPipelineLayout;
+        VulkanGraphicsPipeline m_FluidBlurPipeline;
+
+        // Set 0 = m_DescriptorSetLayout (camera UBO, reused exactly like
+        // m_RaymarchPipelineLayout does), set 1 = m_TextureSetLayout
+        // (the final blurred depth texture).
+        VulkanPipelineLayout m_FluidCompositePipelineLayout;
+        VulkanGraphicsPipeline m_FluidCompositePipeline;
+
+        // Dedicated tiny pool, same "own pool, sized for exactly what
+        // this feature needs" reasoning as m_ParticleGPUDescriptorPool/
+        // m_RaymarchDescriptorPool - 3 sets, one combined-image-sampler
+        // descriptor each. Reallocated in CreateFluidSurfaceResources
+        // every time the underlying images are recreated (resize), since
+        // a VkDescriptorSet reads a specific VkImageView, not an image
+        // "slot" that keeps working after the view it points to is
+        // destroyed and recreated.
+        VkDescriptorPool m_FluidDescriptorPool = VK_NULL_HANDLE;
+        VkDescriptorSet m_FluidBlurXSet = VK_NULL_HANDLE;       // reads m_FluidDepthImage
+        VkDescriptorSet m_FluidBlurYSet = VK_NULL_HANDLE;       // reads m_FluidBlurImageA
+        VkDescriptorSet m_FluidCompositeSet = VK_NULL_HANDLE;   // reads m_FluidBlurImageB
+
+        // Guards RecreateSwapchainResources/DrawFrame's fluid-surface
+        // branches - InitFluidSurfacePass/CreateFluidSurfaceResources run
+        // lazily from RegisterParticleGPUSource (see that function's
+        // comment for why: the depth prepass pipeline's set 1 IS
+        // m_ParticleGPUSetLayout, which doesn't exist until that call
+        // happens), not from Init() like everything else in this file -
+        // so a resize or a frame that lands before RegisterParticleGPUSource
+        // has ever been called must skip fluid-surface work entirely
+        // rather than touching still-null render passes/pipelines.
+        bool m_FluidSurfaceInitialized = false;
 
         SoftwareOcclusionBuffer m_OcclusionBuffer;
         VulkanCommandPool m_CommandPool;

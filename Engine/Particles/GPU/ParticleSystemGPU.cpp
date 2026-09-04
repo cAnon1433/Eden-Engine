@@ -611,6 +611,7 @@ namespace Eden
         params.heatColdMultiplier = heatColdMultiplier;
         params.gravity = glm::vec4(gravity, 0.0f);
         params.voidKillY = voidKillY;
+        params.cohesion = cohesion;
         return params;
     }
 

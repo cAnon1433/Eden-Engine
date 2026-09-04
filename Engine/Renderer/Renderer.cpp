@@ -249,6 +249,22 @@ namespace Eden
             {},
             {},
             VK_PRIMITIVE_TOPOLOGY_POINT_LIST);
+
+        // Fluid-surface pass setup lives HERE, not in Init() alongside
+        // everything else in this file, because m_FluidDepthPipelineLayout's
+        // set 1 IS m_ParticleGPUSetLayout (just created a few lines up) -
+        // it reads the exact same position buffer this function just
+        // registered, through a different pipeline/vertex shader, rather
+        // than standing up a second copy of that binding (see
+        // m_FluidDepthPipelineLayout's own comment in Renderer.h). Every
+        // OTHER dependency (m_DescriptorSetLayout, m_TextureSetLayout,
+        // m_RenderPass, m_CommandPool) was already created earlier in
+        // Init(), before main.cpp ever calls RegisterParticleGPUSource -
+        // so this is the earliest point everything this pass needs
+        // actually exists together.
+        InitFluidSurfacePass();
+        CreateFluidSurfaceResources();
+        m_FluidSurfaceInitialized = true;
     }
 
 
@@ -443,6 +459,403 @@ namespace Eden
         }
 
         vkUpdateDescriptorSets(device, writeCount, writes.data(), 0, nullptr);
+    }
+
+    void Renderer::InitFluidSurfacePass()
+    {
+        VkDevice device = m_Context.Device().Get();
+
+        m_FluidSampler.Init(device, VK_FILTER_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+
+        // --- Depth prepass render pass: color(R32_SFLOAT) + depth ------
+        // Color attachment ends in SHADER_READ_ONLY_OPTIMAL (sampled by
+        // the blur pass right after), not PRESENT_SRC_KHR like the main
+        // render pass's swapchain attachment.
+        {
+            VkAttachmentDescription colorAttachment{};
+            colorAttachment.format = VK_FORMAT_R32_SFLOAT;
+            colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+            colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            colorAttachment.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+            VkAttachmentDescription depthAttachment{};
+            depthAttachment.format = FindDepthFormat();
+            depthAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+            depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE; // local to this pass only, see m_FluidDepthPassDS's comment
+            depthAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            depthAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            depthAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            depthAttachment.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+            VkAttachmentReference colorRef{ 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+            VkAttachmentReference depthRef{ 1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
+
+            VkSubpassDescription subpass{};
+            subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+            subpass.colorAttachmentCount = 1;
+            subpass.pColorAttachments = &colorRef;
+            subpass.pDepthStencilAttachment = &depthRef;
+
+            // Entry dependency - same shape as VulkanRenderPass.cpp's own
+            // (external write hazard into a fresh color+depth attachment).
+            VkSubpassDependency enterDependency{};
+            enterDependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+            enterDependency.dstSubpass = 0;
+            enterDependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                            VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+            enterDependency.srcAccessMask = 0;
+            enterDependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                            VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+            enterDependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                             VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+
+            // Exit dependency - this pass's color output is about to be
+            // SAMPLED by the blur pass right after, not presented, so
+            // (unlike the main render pass) this one also needs to
+            // publish a color-attachment-write -> fragment-shader-read
+            // barrier before that next pass's draw call is safe.
+            VkSubpassDependency exitDependency{};
+            exitDependency.srcSubpass = 0;
+            exitDependency.dstSubpass = VK_SUBPASS_EXTERNAL;
+            exitDependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+            exitDependency.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            exitDependency.dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+            exitDependency.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+            std::array<VkAttachmentDescription, 2> attachments = { colorAttachment, depthAttachment };
+            std::array<VkSubpassDependency, 2> dependencies = { enterDependency, exitDependency };
+
+            VkRenderPassCreateInfo renderPassInfo{};
+            renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+            renderPassInfo.attachmentCount = static_cast<uint32_t>(attachments.size());
+            renderPassInfo.pAttachments = attachments.data();
+            renderPassInfo.subpassCount = 1;
+            renderPassInfo.pSubpasses = &subpass;
+            renderPassInfo.dependencyCount = static_cast<uint32_t>(dependencies.size());
+            renderPassInfo.pDependencies = dependencies.data();
+
+            if (vkCreateRenderPass(device, &renderPassInfo, nullptr, &m_FluidDepthPrepassRenderPass) != VK_SUCCESS)
+            {
+                throw std::runtime_error("Eden: failed to create fluid depth prepass render pass");
+            }
+        }
+
+        // --- Blur render pass: single color attachment, no depth -------
+        // Reused for BOTH the horizontal and vertical blur draw (see
+        // DrawFrame) - same format/config either way, only which
+        // framebuffer/descriptor set gets bound differs.
+        {
+            VkAttachmentDescription colorAttachment{};
+            colorAttachment.format = VK_FORMAT_R32_SFLOAT;
+            colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+            colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; // fullscreen triangle overwrites every pixel, no need to clear first
+            colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            colorAttachment.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+            VkAttachmentReference colorRef{ 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+
+            VkSubpassDescription subpass{};
+            subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+            subpass.colorAttachmentCount = 1;
+            subpass.pColorAttachments = &colorRef;
+
+            // Enter dependency: this pass writing to its OWN fresh color
+            // attachment (same "undefined -> color attachment optimal"
+            // shape as the depth prepass's enter dependency above and
+            // VulkanRenderPass.cpp's existing one) - NOT the hazard of
+            // reading the OTHER pass's output texture as a sampler input.
+            // That second hazard (must-happen-before-this-pass-samples-it)
+            // is already covered by the SOURCE render pass's own EXIT
+            // dependency (see the depth prepass's exitDependency above,
+            // and this same pass's exitDependency below when it's the
+            // producer for the next blur direction) - a producer's exit
+            // dependency into VK_SUBPASS_EXTERNAL correctly orders
+            // against a later, separate render pass's matching access,
+            // it doesn't need to be repeated as this pass's entry
+            // dependency too.
+            VkSubpassDependency enterDependency{};
+            enterDependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+            enterDependency.dstSubpass = 0;
+            enterDependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+            enterDependency.srcAccessMask = 0;
+            enterDependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+            enterDependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
+            VkSubpassDependency exitDependency{};
+            exitDependency.srcSubpass = 0;
+            exitDependency.dstSubpass = VK_SUBPASS_EXTERNAL;
+            exitDependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+            exitDependency.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            exitDependency.dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+            exitDependency.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+            std::array<VkSubpassDependency, 2> dependencies = { enterDependency, exitDependency };
+
+            VkRenderPassCreateInfo renderPassInfo{};
+            renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+            renderPassInfo.attachmentCount = 1;
+            renderPassInfo.pAttachments = &colorAttachment;
+            renderPassInfo.subpassCount = 1;
+            renderPassInfo.pSubpasses = &subpass;
+            renderPassInfo.dependencyCount = static_cast<uint32_t>(dependencies.size());
+            renderPassInfo.pDependencies = dependencies.data();
+
+            if (vkCreateRenderPass(device, &renderPassInfo, nullptr, &m_FluidBlurRenderPass) != VK_SUCCESS)
+            {
+                throw std::runtime_error("Eden: failed to create fluid blur render pass");
+            }
+        }
+
+        // --- Depth prepass pipeline -------------------------------------
+        // Set 0 = camera UBO (m_DescriptorSetLayout, reused exactly like
+        // every other pipeline layout in this file). Set 1 =
+        // m_ParticleGPUSetLayout - the SAME layout (and, at draw time,
+        // the same already-allocated m_ParticleGPUStorageSet)
+        // RegisterParticleGPUSource created for the raw-point path; this
+        // pipeline reads the identical position buffer through a
+        // different vertex shader, not a second copy of the binding.
+        VkPushConstantRange fluidDepthPushConstant{};
+        fluidDepthPushConstant.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+        fluidDepthPushConstant.offset = 0;
+        fluidDepthPushConstant.size = sizeof(float) * 1; // radius - see fluid_depth.vert
+
+        m_FluidDepthPipelineLayout.Init(device, { m_DescriptorSetLayout.Get(), m_ParticleGPUSetLayout },
+                                         { fluidDepthPushConstant });
+
+        m_FluidDepthPipeline.Init(
+            device,
+            m_FluidDepthPrepassRenderPass,
+            m_FluidDepthPipelineLayout.Get(),
+            "Shaders/Compiled/fluid_depth.vert.spv",
+            "Shaders/Compiled/fluid_depth.frag.spv",
+            {}, {},
+            // TRIANGLE_LIST billboard quads, not POINT_LIST - see
+            // fluid_depth.vert's file comment for why the point-sprite
+            // version got replaced (gl_PointSize hardware clamp bug).
+            // cullMode explicitly NONE: a billboard's winding relative to
+            // the view direction isn't guaranteed by construction the
+            // way ordinary front-facing mesh geometry's is, and the
+            // default VK_CULL_MODE_BACK_BIT would silently discard every
+            // quad if it came out backwards - points were never subject
+            // to face culling at all, so this risk didn't exist before
+            // this pass switched to real triangles.
+            VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+            VK_CULL_MODE_NONE);
+            // depthTestEnable/depthWriteEnable left at their true/true
+            // defaults - overlapping sphere impostors need real depth
+            // resolution within this pass, see m_FluidDepthPassDS.
+
+        // --- Blur pipeline -----------------------------------------------
+        // Set 0 = m_TextureSetLayout (one combined image sampler) - no
+        // camera UBO, pure image-space work. depthTestEnable/
+        // depthWriteEnable explicitly FALSE - this render pass has no
+        // depth attachment at all (see m_FluidBlurRenderPass above).
+        VkPushConstantRange blurPushConstant{};
+        blurPushConstant.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        blurPushConstant.offset = 0;
+        blurPushConstant.size = sizeof(float) * 4; // texelSize.xy, direction.xy - see fluid_blur.frag
+
+        m_FluidBlurPipelineLayout.Init(device, { m_TextureSetLayout.Get() }, { blurPushConstant });
+
+        m_FluidBlurPipeline.Init(
+            device,
+            m_FluidBlurRenderPass,
+            m_FluidBlurPipelineLayout.Get(),
+            "Shaders/Compiled/raymarch.vert.spv", // generic fullscreen triangle - see fluid_blur.frag's file comment
+            "Shaders/Compiled/fluid_blur.frag.spv",
+            {}, {},
+            VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+            VK_CULL_MODE_NONE,
+            /*depthTestEnable=*/false,
+            /*depthWriteEnable=*/false);
+
+        // --- Composite pipeline -------------------------------------------
+        // Renders INTO THE MAIN render pass (m_RenderPass), not one of
+        // the offscreen ones above - see fluid_composite.frag's file
+        // comment for why (needs to depth-test against, and be occluded
+        // by, whatever opaque/raymarched geometry the main pass already
+        // drew this frame). Set 0 = camera UBO, set 1 = the final
+        // blurred depth texture.
+        VkPushConstantRange compositePushConstant{};
+        compositePushConstant.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        compositePushConstant.offset = 0;
+        compositePushConstant.size = sizeof(float) * 4; // tintColor.xyz + pad - see fluid_composite.frag
+
+        m_FluidCompositePipelineLayout.Init(device, { m_DescriptorSetLayout.Get(), m_TextureSetLayout.Get() },
+                                             { compositePushConstant });
+
+        m_FluidCompositePipeline.Init(
+            device,
+            m_RenderPass.Get(),
+            m_FluidCompositePipelineLayout.Get(),
+            "Shaders/Compiled/raymarch.vert.spv",
+            "Shaders/Compiled/fluid_composite.frag.spv",
+            {}, {},
+            VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+            VK_CULL_MODE_NONE);
+            // depthTestEnable/depthWriteEnable left at true/true - same
+            // "write real depth, let the fixed-function test handle
+            // occlusion" approach m_RaymarchPipeline already uses.
+    }
+
+    void Renderer::CreateFluidSurfaceResources()
+    {
+        VkDevice device = m_Context.Device().Get();
+        VmaAllocator allocator = m_Allocator.Get();
+        VkExtent2D extent = m_Context.Swapchain().GetExtent();
+
+        m_FluidDepthImage.Init(allocator, device, extent, VK_FORMAT_R32_SFLOAT,
+                                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                                VK_IMAGE_ASPECT_COLOR_BIT);
+        m_FluidDepthPassDS.Init(allocator, device, extent, FindDepthFormat(),
+                                 VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT);
+        m_FluidBlurImageA.Init(allocator, device, extent, VK_FORMAT_R32_SFLOAT,
+                                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                                VK_IMAGE_ASPECT_COLOR_BIT);
+        m_FluidBlurImageB.Init(allocator, device, extent, VK_FORMAT_R32_SFLOAT,
+                                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                                VK_IMAGE_ASPECT_COLOR_BIT);
+
+        {
+            std::array<VkImageView, 2> attachments = { m_FluidDepthImage.GetView(), m_FluidDepthPassDS.GetView() };
+            VkFramebufferCreateInfo framebufferInfo{};
+            framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+            framebufferInfo.renderPass = m_FluidDepthPrepassRenderPass;
+            framebufferInfo.attachmentCount = static_cast<uint32_t>(attachments.size());
+            framebufferInfo.pAttachments = attachments.data();
+            framebufferInfo.width = extent.width;
+            framebufferInfo.height = extent.height;
+            framebufferInfo.layers = 1;
+            if (vkCreateFramebuffer(device, &framebufferInfo, nullptr, &m_FluidDepthFramebuffer) != VK_SUCCESS)
+            {
+                throw std::runtime_error("Eden: failed to create fluid depth framebuffer");
+            }
+        }
+        {
+            VkImageView attachment = m_FluidBlurImageA.GetView();
+            VkFramebufferCreateInfo framebufferInfo{};
+            framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+            framebufferInfo.renderPass = m_FluidBlurRenderPass;
+            framebufferInfo.attachmentCount = 1;
+            framebufferInfo.pAttachments = &attachment;
+            framebufferInfo.width = extent.width;
+            framebufferInfo.height = extent.height;
+            framebufferInfo.layers = 1;
+            if (vkCreateFramebuffer(device, &framebufferInfo, nullptr, &m_FluidBlurFramebufferA) != VK_SUCCESS)
+            {
+                throw std::runtime_error("Eden: failed to create fluid blur framebuffer A");
+            }
+        }
+        {
+            VkImageView attachment = m_FluidBlurImageB.GetView();
+            VkFramebufferCreateInfo framebufferInfo{};
+            framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+            framebufferInfo.renderPass = m_FluidBlurRenderPass;
+            framebufferInfo.attachmentCount = 1;
+            framebufferInfo.pAttachments = &attachment;
+            framebufferInfo.width = extent.width;
+            framebufferInfo.height = extent.height;
+            framebufferInfo.layers = 1;
+            if (vkCreateFramebuffer(device, &framebufferInfo, nullptr, &m_FluidBlurFramebufferB) != VK_SUCCESS)
+            {
+                throw std::runtime_error("Eden: failed to create fluid blur framebuffer B");
+            }
+        }
+
+        // Dedicated tiny pool - 3 sets, one combined-image-sampler each -
+        // same "own pool" reasoning as m_ParticleGPUDescriptorPool/
+        // m_RaymarchDescriptorPool.
+        std::vector<VkDescriptorPoolSize> poolSizes = { { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 } };
+        VkDescriptorPoolCreateInfo poolInfo{};
+        poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        poolInfo.maxSets = 3;
+        poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+        poolInfo.pPoolSizes = poolSizes.data();
+        if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &m_FluidDescriptorPool) != VK_SUCCESS)
+        {
+            throw std::runtime_error("Eden: failed to create fluid descriptor pool");
+        }
+
+        auto allocateAndWrite = [&](VkImageView view) -> VkDescriptorSet
+        {
+            VkDescriptorSetLayout layout = m_TextureSetLayout.Get();
+            VkDescriptorSetAllocateInfo allocInfo{};
+            allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+            allocInfo.descriptorPool = m_FluidDescriptorPool;
+            allocInfo.descriptorSetCount = 1;
+            allocInfo.pSetLayouts = &layout;
+
+            VkDescriptorSet set = VK_NULL_HANDLE;
+            if (vkAllocateDescriptorSets(device, &allocInfo, &set) != VK_SUCCESS)
+            {
+                throw std::runtime_error("Eden: failed to allocate fluid descriptor set");
+            }
+
+            VkDescriptorImageInfo imageInfo{};
+            imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            imageInfo.imageView = view;
+            imageInfo.sampler = m_FluidSampler.Get();
+
+            VkWriteDescriptorSet write{};
+            write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            write.dstSet = set;
+            write.dstBinding = 0;
+            write.descriptorCount = 1;
+            write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            write.pImageInfo = &imageInfo;
+            vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+
+            return set;
+        };
+
+        m_FluidBlurXSet = allocateAndWrite(m_FluidDepthImage.GetView());
+        m_FluidBlurYSet = allocateAndWrite(m_FluidBlurImageA.GetView());
+        m_FluidCompositeSet = allocateAndWrite(m_FluidBlurImageB.GetView());
+    }
+
+    void Renderer::DestroyFluidSurfaceResources()
+    {
+        VkDevice device = m_Context.Device().Get();
+
+        // Destroying the pool implicitly frees the sets allocated from it
+        // - same reasoning as m_RaymarchDescriptorPool's teardown.
+        if (m_FluidDescriptorPool != VK_NULL_HANDLE)
+        {
+            vkDestroyDescriptorPool(device, m_FluidDescriptorPool, nullptr);
+            m_FluidDescriptorPool = VK_NULL_HANDLE;
+        }
+        m_FluidBlurXSet = VK_NULL_HANDLE;
+        m_FluidBlurYSet = VK_NULL_HANDLE;
+        m_FluidCompositeSet = VK_NULL_HANDLE;
+
+        if (m_FluidDepthFramebuffer != VK_NULL_HANDLE)
+        {
+            vkDestroyFramebuffer(device, m_FluidDepthFramebuffer, nullptr);
+            m_FluidDepthFramebuffer = VK_NULL_HANDLE;
+        }
+        if (m_FluidBlurFramebufferA != VK_NULL_HANDLE)
+        {
+            vkDestroyFramebuffer(device, m_FluidBlurFramebufferA, nullptr);
+            m_FluidBlurFramebufferA = VK_NULL_HANDLE;
+        }
+        if (m_FluidBlurFramebufferB != VK_NULL_HANDLE)
+        {
+            vkDestroyFramebuffer(device, m_FluidBlurFramebufferB, nullptr);
+            m_FluidBlurFramebufferB = VK_NULL_HANDLE;
+        }
+
+        m_FluidDepthImage.Shutdown();
+        m_FluidDepthPassDS.Shutdown();
+        m_FluidBlurImageA.Shutdown();
+        m_FluidBlurImageB.Shutdown();
     }
 
     void Renderer::InitImGui()
@@ -654,6 +1067,17 @@ namespace Eden
 
         m_Context.Swapchain().CreateFramebuffers(m_RenderPass.Get(), m_DepthImage.GetView());
 
+        // Fluid-surface offscreen targets are sized to the swapchain
+        // extent too - tear down and rebuild alongside the depth image
+        // above. Guarded on m_FluidSurfaceInitialized (see that field's
+        // comment) since a resize landing before RegisterParticleGPUSource
+        // has ever run would otherwise touch still-null render passes.
+        if (m_FluidSurfaceInitialized)
+        {
+            DestroyFluidSurfaceResources();
+            CreateFluidSurfaceResources();
+        }
+
         // Image count CAN change on recreate (rare, but the spec doesn't
         // guarantee it stays the same) - rebuild to match rather than
         // assume the old count still applies.
@@ -744,6 +1168,11 @@ namespace Eden
             sunAzimuthDir.y * glm::sin(sunZenithRad)));
         ubo.lightColor = glm::vec3(1.0f, 1.0f, 0.95f);
         ubo.ambientColor = glm::vec3(0.15f, 0.15f, 0.18f);
+        // See UniformBufferObject::cameraRight's comment - only consumed
+        // by the fluid-surface pass's shaders.
+        ubo.cameraRight = m_Camera.Right;
+        ubo.cameraUp = m_Camera.Up;
+        ubo.cameraForward = m_Camera.Front;
         frame.UpdateUniformBuffer(ubo);
 
         frame.commandBuffer.Reset();
@@ -769,6 +1198,106 @@ namespace Eden
             computeToVertexBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
             vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
                                   0, 1, &computeToVertexBarrier, 0, nullptr, 0, nullptr);
+        }
+
+        // --- Fluid surface offscreen passes (see FluidSurfaceEnabled's
+        // comment in Renderer.h) - three separate, serial render pass
+        // instances, all recorded BEFORE the main render pass begins,
+        // same "can't nest render passes" constraint recordComputeWork's
+        // comment above already flags for compute work. fluidSurfaceThisFrame
+        // also gates the composite draw further down (inside the main
+        // render pass) and the raw-point fallback draw right after this
+        // block - the three are mutually exclusive per frame, not
+        // independent toggles.
+        bool fluidSurfaceThisFrame = FluidSurfaceEnabled && m_FluidSurfaceInitialized &&
+                                      particleGPUCount > 0 && m_ParticleGPUStorageSet != VK_NULL_HANDLE;
+        if (fluidSurfaceThisFrame)
+        {
+            VkViewport fluidViewport{};
+            fluidViewport.x = 0.0f;
+            fluidViewport.y = 0.0f;
+            fluidViewport.width = static_cast<float>(extent.width);
+            fluidViewport.height = static_cast<float>(extent.height);
+            fluidViewport.minDepth = 0.0f;
+            fluidViewport.maxDepth = 1.0f;
+
+            VkRect2D fluidScissor{};
+            fluidScissor.offset = { 0, 0 };
+            fluidScissor.extent = extent;
+
+            // Pass 1: sphere-impostor depth splat - see fluid_depth.vert/.frag.
+            std::array<VkClearValue, 2> depthPassClears{};
+            // Sentinel "no fluid here" value - see fluid_blur.frag/
+            // fluid_composite.frag's SENTINEL_THRESHOLD, which both treat
+            // anything above 1e6 as empty.
+            depthPassClears[0].color = { { 1.0e9f, 0.0f, 0.0f, 0.0f } };
+            depthPassClears[1].depthStencil = { 1.0f, 0 };
+
+            VkRenderPassBeginInfo depthPassInfo{};
+            depthPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+            depthPassInfo.renderPass = m_FluidDepthPrepassRenderPass;
+            depthPassInfo.framebuffer = m_FluidDepthFramebuffer;
+            depthPassInfo.renderArea.offset = { 0, 0 };
+            depthPassInfo.renderArea.extent = extent;
+            depthPassInfo.clearValueCount = static_cast<uint32_t>(depthPassClears.size());
+            depthPassInfo.pClearValues = depthPassClears.data();
+
+            vkCmdBeginRenderPass(cmd, &depthPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_FluidDepthPipeline.Get());
+            vkCmdSetViewport(cmd, 0, 1, &fluidViewport);
+            vkCmdSetScissor(cmd, 0, 1, &fluidScissor);
+
+            std::array<VkDescriptorSet, 2> depthSets = { frame.descriptorSet, m_ParticleGPUStorageSet };
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_FluidDepthPipelineLayout.Get(),
+                                     0, static_cast<uint32_t>(depthSets.size()), depthSets.data(), 0, nullptr);
+
+            struct { float radius; } depthPush{ FluidParticleRadius };
+            vkCmdPushConstants(cmd, m_FluidDepthPipelineLayout.Get(), VK_SHADER_STAGE_VERTEX_BIT,
+                                0, sizeof(depthPush), &depthPush);
+
+            // 6 vertices/instance - a billboard quad (see
+            // fluid_depth.vert), not 1 point/instance.
+            vkCmdDraw(cmd, 6, particleGPUCount, 0, 0);
+            vkCmdEndRenderPass(cmd);
+
+            // Pass 2/3: separable bilateral blur, horizontal then
+            // vertical (see fluid_blur.frag) - X reads m_FluidDepthImage
+            // and writes m_FluidBlurImageA; Y reads m_FluidBlurImageA and
+            // writes m_FluidBlurImageB, the final texture
+            // m_FluidCompositeSet (and so fluid_composite.frag) samples.
+            auto recordBlurPass = [&](VkFramebuffer targetFramebuffer, VkDescriptorSet sourceSet, float dirX, float dirY)
+            {
+                VkClearValue blurClear{};
+                blurClear.color = { { 0.0f, 0.0f, 0.0f, 0.0f } }; // LOAD_OP_DONT_CARE for this attachment - never actually read, see m_FluidBlurRenderPass's comment
+
+                VkRenderPassBeginInfo blurPassInfo{};
+                blurPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+                blurPassInfo.renderPass = m_FluidBlurRenderPass;
+                blurPassInfo.framebuffer = targetFramebuffer;
+                blurPassInfo.renderArea.offset = { 0, 0 };
+                blurPassInfo.renderArea.extent = extent;
+                blurPassInfo.clearValueCount = 1;
+                blurPassInfo.pClearValues = &blurClear;
+
+                vkCmdBeginRenderPass(cmd, &blurPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_FluidBlurPipeline.Get());
+                vkCmdSetViewport(cmd, 0, 1, &fluidViewport);
+                vkCmdSetScissor(cmd, 0, 1, &fluidScissor);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_FluidBlurPipelineLayout.Get(),
+                                         0, 1, &sourceSet, 0, nullptr);
+
+                struct { float texelSizeX, texelSizeY, dirX, dirY; } blurPush{
+                    1.0f / static_cast<float>(extent.width), 1.0f / static_cast<float>(extent.height), dirX, dirY
+                };
+                vkCmdPushConstants(cmd, m_FluidBlurPipelineLayout.Get(), VK_SHADER_STAGE_FRAGMENT_BIT,
+                                    0, sizeof(blurPush), &blurPush);
+
+                vkCmdDraw(cmd, 3, 1, 0, 0);
+                vkCmdEndRenderPass(cmd);
+            };
+
+            recordBlurPass(m_FluidBlurFramebufferA, m_FluidBlurXSet, 1.0f, 0.0f);
+            recordBlurPass(m_FluidBlurFramebufferB, m_FluidBlurYSet, 0.0f, 1.0f);
         }
 
         std::array<VkClearValue, 2> clearValues{};
@@ -924,7 +1453,7 @@ namespace Eden
         // straight from the storage buffer via gl_InstanceIndex. Only
         // fires once RegisterParticleGPUSource has actually been called
         // (m_ParticleGPUStorageSet stays VK_NULL_HANDLE until then).
-        if (particleGPUCount > 0 && m_ParticleGPUStorageSet != VK_NULL_HANDLE)
+        if (particleGPUCount > 0 && m_ParticleGPUStorageSet != VK_NULL_HANDLE && !fluidSurfaceThisFrame)
         {
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_ParticlePointsGPUPipeline.Get());
 
@@ -1061,6 +1590,27 @@ namespace Eden
 
             // No vertex/instance buffers bound - see raymarch.vert,
             // vertices are generated from gl_VertexIndex.
+            vkCmdDraw(cmd, 3, 1, 0, 0);
+        }
+
+        // Fluid surface composite - drawn after raymarch, same render
+        // pass/depth buffer, so it depth-tests against (and can be
+        // occluded by) both rasterized geometry and raymarched objects.
+        // See fluid_composite.frag's file comment.
+        if (fluidSurfaceThisFrame)
+        {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_FluidCompositePipeline.Get());
+
+            std::array<VkDescriptorSet, 2> compositeSets = { frame.descriptorSet, m_FluidCompositeSet };
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_FluidCompositePipelineLayout.Get(),
+                                     0, static_cast<uint32_t>(compositeSets.size()), compositeSets.data(), 0, nullptr);
+
+            struct { float r, g, b, pad; } compositePush{ FluidTintColor.r, FluidTintColor.g, FluidTintColor.b, 0.0f };
+            vkCmdPushConstants(cmd, m_FluidCompositePipelineLayout.Get(), VK_SHADER_STAGE_FRAGMENT_BIT,
+                                0, sizeof(compositePush), &compositePush);
+
+            // No vertex/instance buffers - fullscreen triangle, same as
+            // the raymarch draw just above.
             vkCmdDraw(cmd, 3, 1, 0, 0);
         }
 
@@ -1203,6 +1753,32 @@ namespace Eden
         }
 
         m_DepthImage.Shutdown();
+
+        // Fluid-surface pass (see InitFluidSurfacePass/RegisterParticleGPUSource) -
+        // safe to call unconditionally even if RegisterParticleGPUSource
+        // was never invoked: DestroyFluidSurfaceResources/VulkanImage::
+        // Shutdown/VulkanGraphicsPipeline::Shutdown/VulkanPipelineLayout::
+        // Shutdown all already guard on their handles being non-null
+        // before destroying anything, same as every other Shutdown() in
+        // this file.
+        DestroyFluidSurfaceResources();
+        m_FluidDepthPipeline.Shutdown();
+        m_FluidDepthPipelineLayout.Shutdown();
+        m_FluidBlurPipeline.Shutdown();
+        m_FluidBlurPipelineLayout.Shutdown();
+        m_FluidCompositePipeline.Shutdown();
+        m_FluidCompositePipelineLayout.Shutdown();
+        m_FluidSampler.Shutdown();
+        if (m_FluidDepthPrepassRenderPass != VK_NULL_HANDLE)
+        {
+            vkDestroyRenderPass(m_Context.Device().Get(), m_FluidDepthPrepassRenderPass, nullptr);
+            m_FluidDepthPrepassRenderPass = VK_NULL_HANDLE;
+        }
+        if (m_FluidBlurRenderPass != VK_NULL_HANDLE)
+        {
+            vkDestroyRenderPass(m_Context.Device().Get(), m_FluidBlurRenderPass, nullptr);
+            m_FluidBlurRenderPass = VK_NULL_HANDLE;
+        }
 
         m_MeshRegistry.clear(); // each Mesh's destructor frees its VulkanBuffer
         m_TextureRegistry.clear(); // each VulkanTexture's destructor frees its VulkanImage/VulkanSampler

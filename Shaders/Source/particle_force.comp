@@ -52,9 +52,39 @@ layout(push_constant) uniform SimParams
     // particle_integrate.comp and particle_build_grid.comp - not just
     // present for layout matching anymore.
     float voidKillY;
+
+    // Cohesion coefficient - see CohesionKernel/main() below for the
+    // force this actually drives, and ParticleGPUTypes.h's
+    // SimParamsGPU::cohesion comment for why it exists. 0 = off.
+    float cohesion;
 } sim;
 
 const float PI = 3.14159265358979323846;
+
+// Akinci et al. 2013 ("Versatile Surface Tension and Adhesion for SPH
+// Fluids") cohesion spline. Unlike Poly6/Spiky above, this is
+// deliberately NOT a density-estimation kernel - it's shaped to give a
+// short-range REPULSIVE lobe near r=0 (preventing particle interpenetration
+// from the attraction below) and an ATTRACTIVE lobe out toward r=h (pulling
+// free-surface particles back toward the body instead of letting them fly
+// off as separate droplets - see main()'s use of this for what "attractive"
+// means in an all-positive kernel: the minus sign lives in the force
+// direction, not here).
+float CohesionKernel(float r, float h)
+{
+    if (r <= 0.0 || r > h)
+    {
+        return 0.0;
+    }
+    float coefficient = 32.0 / (PI * pow(h, 9.0));
+    float term = (h - r) * (h - r) * (h - r) * r * r * r;
+    if (2.0 * r > h)
+    {
+        return coefficient * term;
+    }
+    float h6 = pow(h, 6.0);
+    return coefficient * (2.0 * term - h6 / 64.0);
+}
 
 // grad W(r,h) = -45 / (pi * h^6) * (h - r)^2 * (rVec / r), for 0 < r <= h
 vec3 SpikyGradient(vec3 rVec, float r, float h)
@@ -113,6 +143,8 @@ void main()
 
     vec3 pressureForce = vec3(0.0);
     vec3 viscosityForce = vec3(0.0);
+    vec3 cohesionForce = vec3(0.0);
+    float densityI = densities[i];
 
     // Heat-conduction accumulators - see forces[i].w's comment below.
     // Only touched when heatI >= 0.0 (this particle is actually part of
@@ -187,6 +219,24 @@ void main()
             float lapW = ViscosityLaplacian(effectiveR, sim.h);
             viscosityForce += sim.mass * (vj - vi) / rhoJ * lapW;
 
+            // Cohesion (surface tension) - see CohesionKernel's comment
+            // above. kij is Akinci's density-correction factor: without
+            // it, particles in a denser-than-rest region (e.g. the
+            // bottom of a resting pool) would cohere MORE strongly than
+            // particles at rest density, which is backwards - cohesion
+            // should hold a free surface together, not add extra
+            // clumping force where the fluid is already well-packed.
+            // Direction is -effectiveRVec/effectiveR (points from i
+            // toward j, i.e. attractive) - opposite sign from
+            // pressureForce's repulsive gradient above.
+            if (sim.cohesion > 0.0)
+            {
+                float kij = 2.0 * sim.restDensity / (densityI + rhoJ);
+                float cKernel = CohesionKernel(effectiveR, sim.h);
+                cohesionForce -= sim.cohesion * sim.mass * sim.mass * kij * cKernel
+                                * (effectiveRVec / effectiveR);
+            }
+
             // Heat conduction toward SPH neighbors (same radius h
             // pressure/viscosity already use - "close enough to
             // interact" is a reasonable, already-computed proxy for
@@ -224,5 +274,5 @@ void main()
     // in range, e.g. an isolated melted particle with nothing nearby to
     // conduct with.
     float neighborAvgHeat = heatWeightTotal > 0.0 ? (heatWeightedSum / heatWeightTotal) : heatI;
-    forces[i] = vec4(pressureForce + viscosityForce, neighborAvgHeat);
+    forces[i] = vec4(pressureForce + viscosityForce + cohesionForce, neighborAvgHeat);
 }
