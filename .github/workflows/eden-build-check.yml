@@ -16,6 +16,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Remove any stale build folder from the checkout
+        # build/ must never come from git (a CMakeCache.txt from another machine
+        # makes CMake refuse to configure). Always start clean.
+        run: rm -rf build
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -34,6 +38,11 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
+      - name: Remove any stale build folder from the checkout
+        # build/ must never come from git (a CMakeCache.txt from another machine
+        # makes CMake refuse to configure). Always start clean.
+        shell: pwsh
+        run: Remove-Item -Recurse -Force build -ErrorAction SilentlyContinue; exit 0
       - name: Install Vulkan SDK
         uses: jakoch/install-vulkan-sdk-action@v1
         with:
@@ -78,6 +87,10 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
+      - name: Remove any stale build folder from the checkout
+        # build/ must never come from git (a CMakeCache.txt from another machine
+        # makes CMake refuse to configure). Always start clean.
+        run: rm -rf build
       - name: Install dependencies
         run: brew install cmake vulkan-headers vulkan-loader molten-vk glslang
       - name: Configure

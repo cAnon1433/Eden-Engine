@@ -10,6 +10,26 @@
 # publish action - and (b) has no .gitignore to keep build output and
 # generated files out of the commit.
 
+# Remove BUILD OUTPUT that is already tracked by the repo. .gitignore only
+# stops NEW files being added; a file committed once (e.g. by an older version
+# of these scripts, before a .gitignore existed) stays tracked and keeps being
+# re-committed on every push. Tracked build folders are actively harmful: a
+# CMakeCache.txt from one machine breaks every other checkout ("current
+# CMakeCache.txt directory is different than ..."), including GitHub Actions.
+# Only well-known build-output folders are touched, and only in the repo
+# (git rm --cached) - nothing on disk is deleted.
+eden_untrack_build_output() {
+    local tracked count
+    tracked=$(git ls-files -ci --exclude-standard | grep -E '^(build|build-[^/]*|dist|out|cmake-build-[^/]*)/' || true)
+    [ -z "$tracked" ] && return 0
+    count=$(printf '%s\n' "$tracked" | wc -l | tr -d ' ')
+    echo ""
+    echo "Removing $count build-output file(s) from the repository (they should never have been committed; .gitignore now covers them)."
+    printf '%s\n' "$tracked" | while IFS= read -r f; do
+        git rm --cached -q --ignore-unmatch -- "$f" 2>/dev/null || true
+    done
+}
+
 # Restore (instead of deleting on GitHub) files GitHub has but this folder
 # doesn't. Dot-files/dot-folders (.github, .gitignore, ...) are ALWAYS kept -
 # a fresh unzip never contains them, so "missing" never means "deleted on

@@ -41,6 +41,17 @@ echo Eden - build ^& run
 echo ==================
 echo.
 
+REM Self-heal a stale build folder (see the Mac script for the full story):
+REM CMake refuses a build\ whose CMakeCache.txt was created in another location.
+REM build\ is pure output, so if it doesn't mention THIS folder, start it over.
+if exist build\CMakeCache.txt (
+    set "CUR_DIR=%CD:\=/%"
+    findstr /i /c:"!CUR_DIR!/build" build\CMakeCache.txt >nul 2>&1
+    if errorlevel 1 (
+        echo The build folder was created for a different location. Rebuilding it from scratch...
+        rmdir /s /q build
+    )
+)
 if not exist build mkdir build
 cd build
 

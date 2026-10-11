@@ -18,6 +18,22 @@ echo "Eden - build & run"
 echo "=================="
 echo ""
 
+# Self-heal a stale build folder. CMake refuses to reuse a build/ whose
+# CMakeCache.txt was created in a different location ("current CMakeCache.txt
+# directory is different than ..."): that happens when build/ is copied from
+# another folder, the project folder is moved/renamed, or build output was
+# ever committed to git and came back with a checkout. build/ is pure output,
+# so just start it over.
+if [ -f build/CMakeCache.txt ]; then
+    CACHED_DIR=$(grep -m1 '^CMAKE_CACHEFILE_DIR:INTERNAL=' build/CMakeCache.txt | cut -d= -f2-)
+    if [ "$CACHED_DIR" != "$(pwd -P)/build" ]; then
+        echo "The build folder was created for a different location:"
+        echo "  $CACHED_DIR"
+        echo "Rebuilding it from scratch (one-time, a few minutes)..."
+        rm -rf build
+    fi
+fi
+
 mkdir -p build
 cd build
 

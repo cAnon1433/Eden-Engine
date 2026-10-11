@@ -145,6 +145,7 @@ fi
 
 # A fresh unzip has no .git/.gitignore/.github: keep files that exist on GitHub
 # but not here (esp. .github/workflows) instead of staging their deletion.
+eden_untrack_build_output   # first: build/ etc. must leave the repo, not be 'kept'
 eden_protect_remote_only_files
 
 git add -A
