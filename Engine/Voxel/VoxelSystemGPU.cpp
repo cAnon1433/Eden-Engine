@@ -1,4 +1,7 @@
 #include "VoxelSystemGPU.h"
+#include "../Core/Profiler.h"
+#include <cstdlib>
+#include <cmath>
 #include "MarchingCubesTables33.h"
 #include "../Renderer/Vulkan/RendererTypes.h"
 #include "../Physics/SDF.h"
@@ -83,6 +86,23 @@ namespace Eden
         m_CommandPool = commandPool;
         m_GraphicsQueue = graphicsQueue;
 
+        // Created UNSIGNALED - SubmitAndWaitForCommandBuffer's first use
+        // submits into it directly; vkResetFences before every
+        // subsequent submission is what makes reuse safe (a fence must
+        // be reset between the previous wait and the next submit, or the
+        // next vkWaitForFences would just immediately return on the
+        // OLD signal).
+        VkFenceCreateInfo submitFenceInfo{};
+        submitFenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        if (vkCreateFence(m_Device, &submitFenceInfo, nullptr, &m_SubmitFence) != VK_SUCCESS)
+        {
+            // Non-fatal - SubmitAndWaitForCommandBuffer falls back to the
+            // old vkQueueWaitIdle path whenever m_SubmitFence is
+            // VK_NULL_HANDLE, same as its per-call fence-creation failure
+            // path already did before this became a persistent fence.
+            m_SubmitFence = VK_NULL_HANDLE;
+        }
+
         // Queried here (previously the physicalDevice parameter was
         // unused) - minStorageBufferOffsetAlignment is what every
         // volume's densityOffsetElements (see RegisterVolume) must
@@ -131,7 +151,7 @@ namespace Eden
 
     void VoxelSystemGPU::CreateComputeLayout()
     {
-        std::array<VkDescriptorSetLayoutBinding, 5> bindings{};
+        std::array<VkDescriptorSetLayoutBinding, 6> bindings{};
         for (uint32_t i = 0; i < bindings.size(); ++i)
         {
             bindings[i].binding = i;
@@ -140,12 +160,16 @@ namespace Eden
             bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         }
         // 0 = density, 1 = vertices (out), 2 = indirect commands (atomic
-        // vertexCount), 3 = MC33 table blob, 4 = dirty flags - all read
-        // by voxel_march.comp; density is written from the CPU side only
-        // now (UploadDensity), never by a compute shader - see the class
-        // comment in VoxelSystemGPU.h. (Was 6 bindings, edge table + tri
-        // table separately, before the MC33 rewrite packed every table
-        // into one buffer - see MarchingCubesTables33.h.)
+        // vertexCount), 3 = MC33 table blob, 4 = dirty flags, 5 = chunk
+        // remap (raw chunk index -> compact vertex/indirect slot, or
+        // kVoxelChunkRemapUnused - see ChunkRemapBuffer's own comment in
+        // voxel_march.comp) - all read by voxel_march.comp; density is
+        // written from the CPU side only now (UploadDensity), never by a
+        // compute shader - see the class comment in VoxelSystemGPU.h.
+        // (Was 6 bindings, edge table + tri table separately, before the
+        // MC33 rewrite packed every table into one buffer - see
+        // MarchingCubesTables33.h. Back to 6 again now, for an unrelated
+        // reason - chunk compaction, not the old tri-table split.)
 
         VkDescriptorSetLayoutCreateInfo layoutInfo{};
         layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
@@ -180,10 +204,32 @@ namespace Eden
 
     void VoxelSystemGPU::Shutdown()
     {
+        if (m_SubmitFence != VK_NULL_HANDLE)
+        {
+            vkDestroyFence(m_Device, m_SubmitFence, nullptr);
+            m_SubmitFence = VK_NULL_HANDLE;
+        }
+
+        if (m_DensityStagingBuffer != VK_NULL_HANDLE)
+        {
+            vmaDestroyBuffer(m_Allocator, m_DensityStagingBuffer, m_DensityStagingAllocation);
+            m_DensityStagingBuffer = VK_NULL_HANDLE;
+            m_DensityStagingAllocation = VK_NULL_HANDLE;
+            m_DensityStagingMappedPtr = nullptr;
+            m_DensityStagingCapacityBytes = 0;
+        }
+
+        if (m_ReusableCommandBuffer != VK_NULL_HANDLE)
+        {
+            vkFreeCommandBuffers(m_Device, m_CommandPool, 1, &m_ReusableCommandBuffer);
+            m_ReusableCommandBuffer = VK_NULL_HANDLE;
+        }
+
         for (auto& volume : m_Volumes)
         {
             volume.instance.Shutdown();
             volume.dirtyFlags.Shutdown();
+            volume.chunkRemap.Shutdown();
             volume.indirect.Shutdown();
             volume.vertices.Shutdown();
             // No per-volume volume.density.Shutdown() here anymore -
@@ -333,8 +379,76 @@ namespace Eden
                     volume.densityCPU.data(), volume.densityCPU.size() * sizeof(float));
     }
 
+    void VoxelSystemGPU::EnsureDensityStagingCapacity(VkDeviceSize requiredBytes)
+    {
+        if (requiredBytes <= m_DensityStagingCapacityBytes)
+        {
+            return; // common case - existing buffer already has enough room, zero allocation this call
+        }
+
+        if (m_DensityStagingBuffer != VK_NULL_HANDLE)
+        {
+            vmaDestroyBuffer(m_Allocator, m_DensityStagingBuffer, m_DensityStagingAllocation);
+            m_DensityStagingBuffer = VK_NULL_HANDLE;
+            m_DensityStagingAllocation = VK_NULL_HANDLE;
+            m_DensityStagingMappedPtr = nullptr;
+            m_DensityStagingCapacityBytes = 0;
+        }
+
+        // Grow with headroom (doubling), not exactly-to-fit - a slightly
+        // bigger next carve (e.g. a wider drill-through stroke) shouldn't
+        // immediately trigger ANOTHER reallocation right after this one.
+        VkDeviceSize newCapacity = std::max<VkDeviceSize>(requiredBytes, m_DensityStagingCapacityBytes * 2);
+
+        VkBufferCreateInfo stagingInfo{};
+        stagingInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        stagingInfo.size = newCapacity;
+        stagingInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        stagingInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        VmaAllocationCreateInfo stagingAllocInfo{};
+        stagingAllocInfo.usage = VMA_MEMORY_USAGE_AUTO;
+        stagingAllocInfo.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+
+        VmaAllocationInfo stagingInfoOut{};
+        if (vmaCreateBuffer(m_Allocator, &stagingInfo, &stagingAllocInfo, &m_DensityStagingBuffer,
+                             &m_DensityStagingAllocation, &stagingInfoOut) != VK_SUCCESS)
+        {
+            throw std::runtime_error("Eden: VoxelSystemGPU failed to (re)create the persistent density staging buffer");
+        }
+
+        m_DensityStagingMappedPtr = stagingInfoOut.pMappedData;
+        m_DensityStagingCapacityBytes = newCapacity;
+    }
+
+    VkCommandBuffer VoxelSystemGPU::GetReusableCommandBuffer()
+    {
+        if (m_ReusableCommandBuffer == VK_NULL_HANDLE)
+        {
+            VkCommandBufferAllocateInfo cmdAllocInfo{};
+            cmdAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+            cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            cmdAllocInfo.commandPool = m_CommandPool;
+            cmdAllocInfo.commandBufferCount = 1;
+            vkAllocateCommandBuffers(m_Device, &cmdAllocInfo, &m_ReusableCommandBuffer);
+        }
+        else
+        {
+            // Explicit reset rather than relying on vkBeginCommandBuffer's
+            // implicit reset - both are valid given
+            // VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT (see
+            // m_ReusableCommandBuffer's own comment), but being explicit
+            // here doesn't depend on that implicit-reset behavior staying
+            // true if this pool's creation flags ever change for some
+            // unrelated reason.
+            vkResetCommandBuffer(m_ReusableCommandBuffer, 0);
+        }
+        return m_ReusableCommandBuffer;
+    }
+
     void VoxelSystemGPU::UploadDensityRegion(Volume& volume, glm::ivec3 sampleMin, glm::ivec3 sampleMax)
     {
+        EDEN_PROFILE_SCOPE("Voxel: density upload (submit + GPU wait)");
         // Row-by-row (fixed y,z, contiguous run of x) is the natural
         // packing given SampleIndex's x-fastest layout - each row is
         // already contiguous in densityCPU, so it can go straight into
@@ -349,16 +463,26 @@ namespace Eden
         // UploadDensity's comment/m_SharedDensityBuffer's own comment.
         VkDeviceSize volumeBaseBytes = volume.densityOffsetElements * sizeof(float);
 
-        std::vector<float> packed(static_cast<size_t>(rowLen) * rowCount);
+        // Grows the persistent buffer only if this carve's region is
+        // bigger than anything seen so far this session - see
+        // EnsureDensityStagingCapacity's own comment. No per-call
+        // vmaCreateBuffer/vmaDestroyBuffer anymore, and no per-call
+        // `packed` heap vector either - both replaced by writing
+        // straight into the persistent buffer's own (already mapped,
+        // never re-mapped) memory below.
+        EnsureDensityStagingCapacity(totalBytes);
+
         std::vector<VkBufferCopy> regions;
         regions.reserve(rowCount);
 
         size_t packedOffsetElems = 0;
+        char* stagingWritePtr = static_cast<char*>(m_DensityStagingMappedPtr);
         for (int32_t z = sampleMin.z; z <= sampleMax.z; ++z)
         for (int32_t y = sampleMin.y; y <= sampleMax.y; ++y)
         {
             uint32_t rowStartIdx = SampleIndex(volume.desc, glm::ivec3(sampleMin.x, y, z));
-            std::memcpy(&packed[packedOffsetElems], &volume.densityCPU[rowStartIdx], static_cast<size_t>(rowBytes));
+            std::memcpy(stagingWritePtr + packedOffsetElems * sizeof(float), &volume.densityCPU[rowStartIdx],
+                        static_cast<size_t>(rowBytes));
 
             VkBufferCopy region{};
             region.srcOffset = packedOffsetElems * sizeof(float);
@@ -369,64 +493,31 @@ namespace Eden
             packedOffsetElems += rowLen;
         }
 
-        // Same staging-buffer shape as UploadRange, but with MULTIPLE
-        // copy regions in one vkCmdCopyBuffer call instead of one region
-        // per call - the whole point of batching this: one blocking
-        // submit for the entire touched region, not one per row (which,
-        // for a several-dozen-row carve region, would cost more in
-        // submit/wait overhead than the whole-buffer upload this
-        // replaces).
-        VkBuffer stagingBuffer;
-        VmaAllocation stagingAllocation;
-
-        VkBufferCreateInfo stagingInfo{};
-        stagingInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-        stagingInfo.size = totalBytes;
-        stagingInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-        stagingInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-
-        VmaAllocationCreateInfo stagingAllocInfo{};
-        stagingAllocInfo.usage = VMA_MEMORY_USAGE_AUTO;
-        stagingAllocInfo.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
-
-        VmaAllocationInfo stagingInfoOut{};
-        if (vmaCreateBuffer(m_Allocator, &stagingInfo, &stagingAllocInfo, &stagingBuffer, &stagingAllocation, &stagingInfoOut) != VK_SUCCESS)
-        {
-            throw std::runtime_error("Eden: VoxelSystemGPU failed to create staging buffer for a density region upload");
-        }
-        std::memcpy(stagingInfoOut.pMappedData, packed.data(), static_cast<size_t>(totalBytes));
-
-        VkCommandBufferAllocateInfo cmdAllocInfo{};
-        cmdAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cmdAllocInfo.commandPool = m_CommandPool;
-        cmdAllocInfo.commandBufferCount = 1;
-
-        VkCommandBuffer cmd;
-        vkAllocateCommandBuffers(m_Device, &cmdAllocInfo, &cmd);
+        // Same shape as UploadRange, but with MULTIPLE copy regions in
+        // one vkCmdCopyBuffer call instead of one region per call - the
+        // whole point of batching this: one blocking submit for the
+        // entire touched region, not one per row (which, for a several-
+        // dozen-row carve region, would cost more in submit/wait
+        // overhead than the whole-buffer upload this replaces).
+        VkCommandBuffer cmd = GetReusableCommandBuffer();
 
         VkCommandBufferBeginInfo beginInfo{};
         beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkBeginCommandBuffer(cmd, &beginInfo);
 
-        vkCmdCopyBuffer(cmd, stagingBuffer, m_SharedDensityBuffer.Get(), static_cast<uint32_t>(regions.size()), regions.data());
+        vkCmdCopyBuffer(cmd, m_DensityStagingBuffer, m_SharedDensityBuffer.Get(), static_cast<uint32_t>(regions.size()), regions.data());
 
         vkEndCommandBuffer(cmd);
+        SubmitAndWaitForCommandBuffer(cmd);
 
-        VkSubmitInfo submitInfo{};
-        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &cmd;
-
-        vkQueueSubmit(m_GraphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
-        vkQueueWaitIdle(m_GraphicsQueue);
-
-        vkFreeCommandBuffers(m_Device, m_CommandPool, 1, &cmd);
-        vmaDestroyBuffer(m_Allocator, stagingBuffer, stagingAllocation);
+        // m_DensityStagingBuffer is NOT destroyed here anymore - it's
+        // persistent, reused by the next call. See
+        // EnsureDensityStagingCapacity's own comment.
     }
 
-    VoxelVolumeHandle VoxelSystemGPU::RegisterVolume(const VoxelVolumeDesc& desc)
+    VoxelVolumeHandle VoxelSystemGPU::RegisterVolume(const VoxelVolumeDesc& desc, const std::vector<uint32_t>& chunkRemapOverride,
+                                                      uint32_t compactChunkCountOverride)
     {
         // Reuse a freed slot before growing m_Volumes - see
         // VoxelVolumeHandle's comment and m_FreeSlotIndices' own
@@ -475,15 +566,63 @@ namespace Eden
         // VkDescriptorBufferInfo::offset bound below.
         volume.densityOffsetElements = AllocateDensityRegion(numSamples);
 
-        volume.vertices.Init(m_Allocator, static_cast<VkDeviceSize>(numChunks) * kVoxelMaxVerticesPerChunk * sizeof(Vertex),
+        // See RegisterVolume's own header comment for chunkRemapOverride/
+        // compactChunkCountOverride - empty override means identity (every
+        // existing caller before chunk compaction existed, and every
+        // volume still subject to later Carve() edits, which a one-time
+        // static classification can't safely handle).
+        bool usingCompaction = !chunkRemapOverride.empty();
+        if (usingCompaction && chunkRemapOverride.size() != numChunks)
+        {
+            throw std::runtime_error(
+                "Eden: RegisterVolume's chunkRemapOverride has " + std::to_string(chunkRemapOverride.size())
+                + " entries but desc describes " + std::to_string(numChunks)
+                + " chunks - a mismatched remap table is a caller bug (see BuildChunkRemapTable, which "
+                  "always sizes its output to match the SAME desc passed to it).");
+        }
+        volume.compactChunkCount = usingCompaction ? compactChunkCountOverride : numChunks;
+
+        volume.vertices.Init(m_Allocator, static_cast<VkDeviceSize>(volume.compactChunkCount) * kVoxelMaxVerticesPerChunk * sizeof(Vertex),
                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
 
-        volume.indirect.Init(m_Allocator, static_cast<VkDeviceSize>(numChunks) * sizeof(IndirectCommand),
+        volume.indirect.Init(m_Allocator, static_cast<VkDeviceSize>(volume.compactChunkCount) * sizeof(IndirectCommand),
                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                               VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
 
         volume.dirtyFlags.Init(m_Allocator, static_cast<VkDeviceSize>(numChunks) * sizeof(uint32_t),
                                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+
+        // See ChunkRemapBuffer's comment in voxel_march.comp. Always
+        // allocated (even for the identity/non-compacted case) so the
+        // shader's addressing logic never needs to branch on whether a
+        // given volume happens to be compacted - it always looks up
+        // chunkRemap[chunkIndex], the identity case just makes that a
+        // no-op indirection.
+        volume.chunkRemap.Init(m_Allocator, static_cast<VkDeviceSize>(numChunks) * sizeof(uint32_t),
+                                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+        if (usingCompaction)
+        {
+            UploadRange(volume.chunkRemap.Get(), 0, chunkRemapOverride.data(), chunkRemapOverride.size() * sizeof(uint32_t));
+            // Mirror on the CPU - see Volume::chunkRemapCPU's comment for
+            // why MarchDirtyChunks needs this rather than just re-deriving
+            // it or reading the GPU buffer back.
+            volume.chunkRemapCPU = chunkRemapOverride;
+        }
+        else
+        {
+            std::vector<uint32_t> identityRemap(numChunks);
+            for (uint32_t i = 0; i < numChunks; ++i)
+            {
+                identityRemap[i] = i;
+            }
+            UploadRange(volume.chunkRemap.Get(), 0, identityRemap.data(), identityRemap.size() * sizeof(uint32_t));
+            // Left empty (not identityRemap) for the non-compacted case -
+            // Volume::chunkRemapCPU's comment documents empty as shorthand
+            // for "chunkIndex is already the compact index", so every
+            // MarchDirtyChunks call for the (much more common) non-compacted
+            // case skips the lookup entirely instead of indexing into an
+            // identity table that would just hand back the same value.
+        }
 
         // Host-visible + persistently mapped: SetTransform is a plain
         // CPU memcpy, no staging round trip - identical reasoning to
@@ -497,11 +636,16 @@ namespace Eden
         std::memcpy(volume.instanceMapped, &defaultInstance, sizeof(InstanceData));
 
         // Every chunk's slot in the shared vertex buffer is a fixed,
-        // never-changing offset (chunkIndex * kVoxelMaxVerticesPerChunk)
-        // - vertexCount starts at 0 until the first MarchDirtyChunks call
-        // fills it in via atomic writes.
-        std::vector<IndirectCommand> initialCommands(numChunks);
-        for (uint32_t i = 0; i < numChunks; ++i)
+        // never-changing offset (compactIndex * kVoxelMaxVerticesPerChunk,
+        // where compactIndex == the chunk's own raw index for the
+        // identity/non-compacted case) - vertexCount starts at 0 until
+        // the first MarchDirtyChunks call fills it in via atomic writes.
+        // Only compactChunkCount entries now, not always numChunks - a
+        // compacted volume's indirect buffer has no slot at all for a
+        // chunk that was pre-classified as having no geometry, which is
+        // exactly the point (see RegisterVolume's own header comment).
+        std::vector<IndirectCommand> initialCommands(volume.compactChunkCount);
+        for (uint32_t i = 0; i < volume.compactChunkCount; ++i)
         {
             initialCommands[i] = { 0, 1, i * kVoxelMaxVerticesPerChunk, 0 };
         }
@@ -524,7 +668,7 @@ namespace Eden
         volume.chunkSolid.assign(numChunks, true);
         volume.dirtyChunkIndices.clear();
 
-        std::array<VkDescriptorBufferInfo, 5> bufferInfos{};
+        std::array<VkDescriptorBufferInfo, 6> bufferInfos{};
         // Binding 0 is now the FULL shared density buffer (offset 0,
         // VK_WHOLE_SIZE), not a per-volume sub-range like it used to be.
         // Ghost-sample neighbor reads (voxel_march.comp's DensityAt)
@@ -544,8 +688,9 @@ namespace Eden
         bufferInfos[2] = { volume.indirect.Get(), 0, VK_WHOLE_SIZE };
         bufferInfos[3] = { m_MC33Table.Get(), 0, VK_WHOLE_SIZE };
         bufferInfos[4] = { volume.dirtyFlags.Get(), 0, VK_WHOLE_SIZE };
+        bufferInfos[5] = { volume.chunkRemap.Get(), 0, VK_WHOLE_SIZE };
 
-        std::array<VkWriteDescriptorSet, 5> writes{};
+        std::array<VkWriteDescriptorSet, 6> writes{};
         for (uint32_t b = 0; b < writes.size(); ++b)
         {
             writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -751,6 +896,7 @@ namespace Eden
         volume.vertices.Shutdown();
         volume.indirect.Shutdown();
         volume.dirtyFlags.Shutdown();
+        volume.chunkRemap.Shutdown();
         volume.instance.Shutdown();
         volume.instanceMapped = nullptr; // the memory it pointed into was just freed above
 
@@ -758,6 +904,7 @@ namespace Eden
         // empty rather than .clear() so capacity is actually released
         // (matches how large densityCPU can get at higher resolutions;
         // .clear() alone would keep the allocation reserved).
+        volume.hasPendingUpload = false;
         std::vector<float>().swap(volume.densityCPU);
         std::vector<uint32_t>().swap(volume.dirtyChunkIndices);
         std::vector<bool>().swap(volume.chunkSolid);
@@ -778,7 +925,7 @@ namespace Eden
     VkBuffer VoxelSystemGPU::GetVertexBuffer(VoxelVolumeHandle handle) const { return GetVolume(handle).vertices.Get(); }
     VkBuffer VoxelSystemGPU::GetIndirectBuffer(VoxelVolumeHandle handle) const { return GetVolume(handle).indirect.Get(); }
     VkBuffer VoxelSystemGPU::GetInstanceBuffer(VoxelVolumeHandle handle) const { return GetVolume(handle).instance.Get(); }
-    uint32_t VoxelSystemGPU::GetChunkCount(VoxelVolumeHandle handle) const { return GetVolume(handle).desc.NumChunks(); }
+    uint32_t VoxelSystemGPU::GetChunkCount(VoxelVolumeHandle handle) const { return GetVolume(handle).compactChunkCount; }
     VkBuffer VoxelSystemGPU::GetDensityBuffer(VoxelVolumeHandle /*handle*/) const { return m_SharedDensityBuffer.Get(); }
     VkDeviceSize VoxelSystemGPU::GetDensityBufferOffset(VoxelVolumeHandle handle) const { return GetVolume(handle).densityOffsetElements; }
     glm::ivec3 VoxelSystemGPU::GetSampleDims(VoxelVolumeHandle handle) const { return GetVolume(handle).desc.SampleDims(); }
@@ -787,6 +934,7 @@ namespace Eden
     void VoxelSystemGPU::SetTransform(VoxelVolumeHandle handle, const glm::mat4& model, const glm::vec4& colorOverride)
     {
         Volume& volume = GetVolume(handle);
+        volume.lastColor = colorOverride; // see GetVolumeColor's comment - mirrored for later readback, doesn't change this function's own behavior
         InstanceData instance{};
         instance.model = model;
         instance.colorOverride = colorOverride;
@@ -805,6 +953,31 @@ namespace Eden
         // something introduced by volume register/unregister reuse, and
         // not fixed by anything in UnregisterVolume's synchronization.
         std::memcpy(volume.instanceMapped, &instance, sizeof(InstanceData));
+    }
+
+    VkDeviceSize VoxelSystemGPU::EstimateVertexBufferBytes(const VoxelVolumeDesc& desc, uint32_t compactChunkCountOverride)
+    {
+        // Byte-for-byte the same formula RegisterVolume's real
+        // vertices.Init call uses just above - see that line and
+        // EstimateVertexBufferBytes' own header comment. 0 (default)
+        // matches RegisterVolume's own "0 means identity/full" convention.
+        uint32_t chunkCount = compactChunkCountOverride == 0 ? desc.NumChunks() : compactChunkCountOverride;
+        return static_cast<VkDeviceSize>(chunkCount) * kVoxelMaxVerticesPerChunk * sizeof(Vertex);
+    }
+
+    void VoxelSystemGPU::SetChemicalId(VoxelVolumeHandle handle, uint32_t chemicalId)
+    {
+        GetVolume(handle).chemicalId = chemicalId;
+    }
+
+    uint32_t VoxelSystemGPU::GetChemicalId(VoxelVolumeHandle handle) const
+    {
+        return GetVolume(handle).chemicalId;
+    }
+
+    glm::vec4 VoxelSystemGPU::GetVolumeColor(VoxelVolumeHandle handle) const
+    {
+        return GetVolume(handle).lastColor;
     }
 
     void VoxelSystemGPU::SeedSphere(VoxelVolumeHandle handle, const glm::vec3& localCenter, float radius)
@@ -865,118 +1038,218 @@ namespace Eden
         }
     }
 
+    void VoxelSystemGPU::SplatParticlesIntoDensityField(std::vector<float>& densityCPU, const VoxelVolumeDesc& desc,
+                                                         const std::vector<glm::vec3>& localPositions, float particleRadius,
+                                                         float smoothRadius)
+    {
+        glm::ivec3 sampleDims = desc.SampleDims();
+        float voxelSize = desc.voxelSize;
+
+        // "Splat" approach (every PARTICLE only touches the small
+        // neighborhood of samples it can actually influence, rather than
+        // every SAMPLE searching outward for nearby particles) - see
+        // SeedFromParticles' own comment (this function used to BE its
+        // body directly) for the full performance story behind this
+        // choice. Extracted into a standalone, Volume-free function so
+        // ReformSystem can compute a cluster's real density field BEFORE
+        // ever registering a volume for it - see CountSurfaceCrossingChunks
+        // for what that classification is actually used for.
+        std::fill(densityCPU.begin(), densityCPU.end(), kVoxelIsoLevel + 1.0f);
+
+        float influenceRadius = particleRadius + smoothRadius;
+
+        for (const glm::vec3& particlePos : localPositions)
+        {
+            glm::ivec3 sampleMin = glm::ivec3(glm::floor((particlePos - glm::vec3(influenceRadius)) / voxelSize));
+            glm::ivec3 sampleMax = glm::ivec3(glm::ceil((particlePos + glm::vec3(influenceRadius)) / voxelSize));
+            sampleMin = glm::max(sampleMin, glm::ivec3(0));
+            sampleMax = glm::min(sampleMax, sampleDims - glm::ivec3(1));
+
+            for (int32_t z = sampleMin.z; z <= sampleMax.z; ++z)
+            for (int32_t y = sampleMin.y; y <= sampleMax.y; ++y)
+            for (int32_t x = sampleMin.x; x <= sampleMax.x; ++x)
+            {
+                glm::vec3 localPos = glm::vec3(x, y, z) * voxelSize;
+
+                // Same smooth union of per-particle spheres via SmoothMin
+                // as before - still an order-dependent approximation of a
+                // true N-way blend (particles are folded in whatever
+                // order localPositions happens to list them, not
+                // distance-sorted), same as this algorithm has always
+                // been - no visual quality change from this extraction,
+                // only WHERE the code lives changed.
+                float d = glm::length(localPos - particlePos) - particleRadius;
+                size_t sampleIndex = SampleIndex(desc, glm::ivec3(x, y, z));
+                densityCPU[sampleIndex] = SmoothMin(densityCPU[sampleIndex], d, smoothRadius);
+            }
+        }
+    }
+
+    uint32_t VoxelSystemGPU::CountSurfaceCrossingChunks(const std::vector<float>& densityCPU, const VoxelVolumeDesc& desc)
+    {
+        // A chunk contributes triangles if and only if the marching-cubes
+        // algorithm finds at least one solid sample and at least one
+        // empty sample among the samples it owns - see voxel_march.comp's
+        // own per-cell logic for the (equivalent, finer-grained) real
+        // test this approximates at chunk granularity. A chunk entirely
+        // solid or entirely empty never emits a single triangle,
+        // regardless of resolution - this is what a uniform "reserve
+        // worst-case space for every chunk" vertex buffer sizing wastes
+        // space on. See BuildChunkRemapTable, which does this SAME
+        // classification but also builds the actual GPU-side remap table
+        // that makes shrinking the buffer to fit ONLY these chunks safe -
+        // this function alone was the first, non-load-bearing half of
+        // that (a count, not something the shader can act on by itself).
+        glm::ivec3 sampleDims = desc.SampleDims();
+        glm::ivec3 chunkDims = desc.chunkDims;
+        int32_t chunkSize = static_cast<int32_t>(kVoxelChunkSize);
+
+        uint32_t crossingChunks = 0;
+
+        for (int32_t cz = 0; cz < chunkDims.z; ++cz)
+        for (int32_t cy = 0; cy < chunkDims.y; ++cy)
+        for (int32_t cx = 0; cx < chunkDims.x; ++cx)
+        {
+            glm::ivec3 sampleMin = glm::ivec3(cx, cy, cz) * chunkSize;
+            glm::ivec3 sampleMax = glm::min(sampleMin + glm::ivec3(chunkSize), sampleDims - glm::ivec3(1));
+
+            bool hasSolid = false;
+            bool hasEmpty = false;
+
+            for (int32_t z = sampleMin.z; z <= sampleMax.z && !(hasSolid && hasEmpty); ++z)
+            for (int32_t y = sampleMin.y; y <= sampleMax.y && !(hasSolid && hasEmpty); ++y)
+            for (int32_t x = sampleMin.x; x <= sampleMax.x && !(hasSolid && hasEmpty); ++x)
+            {
+                float d = densityCPU[SampleIndex(desc, glm::ivec3(x, y, z))];
+                if (d < kVoxelIsoLevel)
+                {
+                    hasSolid = true;
+                }
+                else
+                {
+                    hasEmpty = true;
+                }
+            }
+
+            if (hasSolid && hasEmpty)
+            {
+                ++crossingChunks;
+            }
+        }
+
+        return crossingChunks;
+    }
+
+    uint32_t VoxelSystemGPU::BuildChunkRemapTable(const std::vector<float>& densityCPU, const VoxelVolumeDesc& desc,
+                                                   std::vector<uint32_t>& outRemap)
+    {
+        // Same classification as CountSurfaceCrossingChunks (see that
+        // function's comment for what "crosses the isosurface" means and
+        // why it's the right test) - this version additionally assigns
+        // each crossing chunk a compact index as it goes (0, 1, 2... in
+        // raw-chunk-index order) and records kVoxelChunkRemapUnused for
+        // every other chunk, instead of just counting. See
+        // voxel_march.comp's ChunkRemapBuffer for how the shader consumes
+        // this, and RegisterVolume's chunkRemapOverride for how a caller
+        // installs it.
+        glm::ivec3 sampleDims = desc.SampleDims();
+        glm::ivec3 chunkDims = desc.chunkDims;
+        int32_t chunkSize = static_cast<int32_t>(kVoxelChunkSize);
+        uint32_t numChunks = desc.NumChunks();
+
+        outRemap.assign(numChunks, kVoxelChunkRemapUnused);
+        uint32_t compactCount = 0;
+
+        for (int32_t cz = 0; cz < chunkDims.z; ++cz)
+        for (int32_t cy = 0; cy < chunkDims.y; ++cy)
+        for (int32_t cx = 0; cx < chunkDims.x; ++cx)
+        {
+            glm::ivec3 sampleMin = glm::ivec3(cx, cy, cz) * chunkSize;
+            glm::ivec3 sampleMax = glm::min(sampleMin + glm::ivec3(chunkSize), sampleDims - glm::ivec3(1));
+
+            bool hasSolid = false;
+            bool hasEmpty = false;
+
+            for (int32_t z = sampleMin.z; z <= sampleMax.z && !(hasSolid && hasEmpty); ++z)
+            for (int32_t y = sampleMin.y; y <= sampleMax.y && !(hasSolid && hasEmpty); ++y)
+            for (int32_t x = sampleMin.x; x <= sampleMax.x && !(hasSolid && hasEmpty); ++x)
+            {
+                float d = densityCPU[SampleIndex(desc, glm::ivec3(x, y, z))];
+                if (d < kVoxelIsoLevel)
+                {
+                    hasSolid = true;
+                }
+                else
+                {
+                    hasEmpty = true;
+                }
+            }
+
+            if (hasSolid && hasEmpty)
+            {
+                // Raw index formula must match voxel_march.comp's own
+                // chunkIndex computation exactly (chunkCoord.x +
+                // chunkCoord.y*chunkDims.x + chunkCoord.z*chunkDims.x*chunkDims.y)
+                // - this is the SAME flat-index convention SampleIndex
+                // and every other chunk-indexed buffer in this class
+                // already use, not a new one invented here.
+                int32_t rawChunkIndex = cx + cy * chunkDims.x + cz * chunkDims.x * chunkDims.y;
+                outRemap[rawChunkIndex] = compactCount;
+                ++compactCount;
+            }
+        }
+
+        return compactCount;
+    }
+
+    void VoxelSystemGPU::MarkAllChunksDirty(Volume& volume)
+    {
+        uint32_t numChunks = volume.desc.NumChunks();
+        volume.dirtyChunkIndices.resize(numChunks);
+        for (uint32_t i = 0; i < numChunks; ++i)
+        {
+            volume.dirtyChunkIndices[i] = i;
+        }
+    }
+
+    void VoxelSystemGPU::SetDensityFieldDirect(VoxelVolumeHandle handle, std::vector<float> densityCPU)
+    {
+        Volume& volume = GetVolume(handle);
+        volume.densityCPU = std::move(densityCPU);
+        UploadDensity(volume);
+        MarkAllChunksDirty(volume);
+    }
+
     void VoxelSystemGPU::SeedFromParticles(VoxelVolumeHandle handle, const std::vector<glm::vec3>& localPositions, float particleRadius,
                                             float smoothRadius)
     {
         Volume& volume = GetVolume(handle);
-        glm::ivec3 sampleDims = volume.desc.SampleDims();
 
-        // Spatial hash over localPositions, cell size = particleRadius*2.
-        // The 3x3x3 neighborhood below (radius=1) is correct ONLY if no
-        // sample's true nearest particle is ever more than one cell away
-        // - which assumed particles are always packed at least this
-        // densely. That assumption is false in general: MeltSystem seeds
-        // particles at tight SPH rest spacing, but by the time Reform
-        // actually runs, the fluid has been through however much
-        // splashing/settling/spreading the GPU SPH sim did in between -
-        // a puddle that spread out wide before H was pressed can have
-        // genuinely sparse regions (particularly thin edges) where
-        // nothing falls inside a sample's 3x3x3 neighborhood at all.
-        // Verified directly: a uniform lattice spaced ~3.5x this
-        // cellSize apart produced samples with ZERO particles found in
-        // the fixed 3x3x3 search, falling back to the raw sentinel value
-        // with a hard, un-interpolated jump - exactly the kind of
-        // reading that made a resting sphere's distance swing from
-        // ~0.13 to ~0.47 for a sub-voxel position change (a genuinely
-        // smooth trilinear field cannot do that; a hole in the
-        // underlying corner values can). Fixed below by widening the
-        // search radius when the initial pass finds nothing, instead of
-        // assuming the initial radius was always going to be wide
-        // enough.
-        float cellSize = std::max(particleRadius * 2.0f, 0.001f);
-        auto cellKey = [](const glm::ivec3& cell) -> int64_t
-        {
-            // Same packing scheme as ClusterSystem's CellKey - see that
-            // function's comment for why the offset/shift amounts are
-            // safe for the coordinate ranges this engine actually sees.
-            constexpr int64_t kOffset = 1 << 20;
-            int64_t x = static_cast<int64_t>(cell.x) + kOffset;
-            int64_t y = static_cast<int64_t>(cell.y) + kOffset;
-            int64_t z = static_cast<int64_t>(cell.z) + kOffset;
-            return (x << 42) | (y << 21) | z;
-        };
-
-        std::unordered_map<int64_t, std::vector<uint32_t>> grid;
-        grid.reserve(localPositions.size());
-        for (uint32_t i = 0; i < localPositions.size(); ++i)
-        {
-            glm::ivec3 cell = glm::ivec3(glm::floor(localPositions[i] / cellSize));
-            grid[cellKey(cell)].push_back(i);
-        }
-
-        // Caps the worst case at a 9x9x9 cell search (radius 4) - only
-        // ever reached for a sample whose nearest particle is genuinely
-        // far away in a sparse region; the common dense case still exits
-        // after the first (3x3x3) pass, same cost as before.
-        constexpr int kMaxNeighborSearchRadius = 4;
-
-        for (int32_t z = 0; z < sampleDims.z; ++z)
-        for (int32_t y = 0; y < sampleDims.y; ++y)
-        for (int32_t x = 0; x < sampleDims.x; ++x)
-        {
-            glm::vec3 localPos = glm::vec3(x, y, z) * volume.desc.voxelSize;
-            glm::ivec3 sampleCell = glm::ivec3(glm::floor(localPos / cellSize));
-
-            // Smooth union of per-particle spheres via SmoothMin (see
-            // that function's comment) instead of a hard min - folded
-            // pairwise across every nearby particle, which is only an
-            // approximation of a true N-way smooth union (order-
-            // dependent), but visually indistinguishable from the exact
-            // version at the particle counts/spacing this runs at, and
-            // far simpler than an exact simultaneous N-way blend.
-            float minDist = kVoxelIsoLevel + 1.0f; // no particles nearby -> empty, matches ClearVolume's convention
-            bool foundAnyParticle = false;
-
-            for (int radius = 1; radius <= kMaxNeighborSearchRadius && !foundAnyParticle; ++radius)
-            {
-                // Only visit the newly-added outer shell each pass, not
-                // cells a smaller radius already folded into minDist -
-                // radius=1 still checks the full 3x3x3 (nothing smaller
-                // came before it).
-                for (int32_t dz = -radius; dz <= radius; ++dz)
-                for (int32_t dy = -radius; dy <= radius; ++dy)
-                for (int32_t dx = -radius; dx <= radius; ++dx)
-                {
-                    if (radius > 1 && std::abs(dx) < radius && std::abs(dy) < radius && std::abs(dz) < radius)
-                    {
-                        continue;
-                    }
-
-                    auto it = grid.find(cellKey(sampleCell + glm::ivec3(dx, dy, dz)));
-                    if (it == grid.end())
-                    {
-                        continue;
-                    }
-
-                    for (uint32_t particleIndex : it->second)
-                    {
-                        float d = glm::length(localPos - localPositions[particleIndex]) - particleRadius;
-                        minDist = SmoothMin(minDist, d, smoothRadius);
-                        foundAnyParticle = true;
-                    }
-                }
-            }
-
-            volume.densityCPU[SampleIndex(volume.desc, glm::ivec3(x, y, z))] = minDist;
-        }
-
+        // Rewritten from a "gather" approach (every SAMPLE searches
+        // outward through a spatial hash for nearby particles) to a
+        // "splat" approach (every PARTICLE only touches the small
+        // neighborhood of samples it can actually influence). The old
+        // version's cost scaled with total sample count regardless of
+        // how many particles actually existed - for a real measured
+        // case (724 particles, a wide/thin puddle needing a
+        // 20x3x16-chunk volume), that meant iterating ~500K+ samples,
+        // most sitting in genuinely empty space, each paying for an
+        // escalating grid search (up to 729 hash lookups across 4
+        // radii) before concluding "nothing here" - 13.6+ SECONDS,
+        // confirmed via direct timing, and a coarse AABB-reject attempt
+        // at trimming that search didn't meaningfully help (the reject
+        // margin needed to stay correct ended up nearly as wide as the
+        // volume itself in the puddle's thin axis, canceling out most of
+        // the intended savings).
+        //
+        // This version's cost scales with PARTICLE count instead, and is
+        // now implemented in SplatParticlesIntoDensityField (see that
+        // function) so ReformSystem can also call it standalone, before a
+        // volume even exists, purely to classify which chunks will
+        // actually need geometry - see CountSurfaceCrossingChunks.
+        SplatParticlesIntoDensityField(volume.densityCPU, volume.desc, localPositions, particleRadius, smoothRadius);
         UploadDensity(volume);
-
-        volume.dirtyChunkIndices.resize(volume.desc.NumChunks());
-        for (uint32_t i = 0; i < volume.desc.NumChunks(); ++i)
-        {
-            volume.dirtyChunkIndices[i] = i;
-        }
+        MarkAllChunksDirty(volume);
     }
 
     void VoxelSystemGPU::SeedHeightfieldNoise(VoxelVolumeHandle handle, float baseHeight, float amplitude,
@@ -1053,8 +1326,77 @@ namespace Eden
         }
     }
 
+    void VoxelSystemGPU::SubmitAndWaitForCommandBuffer(VkCommandBuffer cmd)
+    {
+        // A fence signals when THIS submission's work completes, unlike
+        // vkQueueWaitIdle which blocks until the ENTIRE queue drains -
+        // see this function's own header comment (VoxelSystemGPU.h) for
+        // why that difference is the actual point here, not just a style
+        // preference: MarchDirtyChunks and UploadDensityRegion both run
+        // on every single Carve(), and with carving now holdable,
+        // vkQueueWaitIdle there meant every carve tick could stall behind
+        // an unrelated in-flight frame already queued on this same
+        // queue - a real, measured cause of stutter while holding the
+        // carve button, not a theoretical one.
+        //
+        // Reuses m_SubmitFence (created once in Init, reset here every
+        // call) rather than creating and destroying a fresh VkFence per
+        // call, which is what this function did at first. That turned
+        // out to be a real regression, not a free win: VkFence
+        // create/destroy is real driver work, not just a CPU-side struct,
+        // and doing it twice per carve tick (once here, once from
+        // UploadDensityRegion's own call) on MoltenVK specifically - this
+        // project's primary target, and already flagged in prior
+        // learnings as having its own sync/descriptor quirks separate
+        // from desktop Vulkan - plausibly cost more than the
+        // vkQueueWaitIdle stall it was replacing. Resetting and reusing
+        // one persistent fence keeps the actual fix (don't wait for
+        // unrelated in-flight work) without paying object-churn cost on
+        // every single carve tick.
+        //
+        // cmd itself is never freed here anymore either - it's always
+        // m_ReusableCommandBuffer (see GetReusableCommandBuffer), the
+        // SAME class of per-call-churn mistake as the fence, on the
+        // command buffer this time - missed in the two previous passes
+        // that fixed the fence and the staging buffer in these exact
+        // same functions.
+        if (m_SubmitFence == VK_NULL_HANDLE)
+        {
+            // Fallback matches Init's own comment: no working fence
+            // available, so fall back to the always-correct-if-slower
+            // vkQueueWaitIdle path rather than proceeding with no wait
+            // at all - a caller reading GPU results right after this
+            // call still needs a real guarantee the write landed.
+            VkSubmitInfo submitInfo{};
+            submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            submitInfo.commandBufferCount = 1;
+            submitInfo.pCommandBuffers = &cmd;
+            vkQueueSubmit(m_GraphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
+            vkQueueWaitIdle(m_GraphicsQueue);
+            return;
+        }
+
+        // Must reset before reuse - a signaled fence's next
+        // vkWaitForFences call would return immediately on the OLD
+        // signal rather than waiting for THIS submission.
+        vkResetFences(m_Device, 1, &m_SubmitFence);
+
+        VkSubmitInfo submitInfo{};
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &cmd;
+        vkQueueSubmit(m_GraphicsQueue, 1, &submitInfo, m_SubmitFence);
+
+        // No timeout - matches vkQueueWaitIdle's own "wait as long as it
+        // takes" contract exactly; this is a correctness wait, not a
+        // polling one.
+        vkWaitForFences(m_Device, 1, &m_SubmitFence, VK_TRUE, UINT64_MAX);
+    }
+
     void VoxelSystemGPU::MarchDirtyChunks(VoxelVolumeHandle handle)
     {
+        EDEN_PROFILE_SCOPE("Voxel: march dirty chunks (total, incl. upload)");
+        FlushPendingUpload(handle); // the march reads the GPU density buffer
         Volume& volume = GetVolume(handle);
 
         if (volume.dirtyChunkIndices.empty())
@@ -1085,14 +1427,7 @@ namespace Eden
         if (IsValid(volume.neighborNegZ)) params.neighborDensityOffsetNegZ = static_cast<int32_t>(GetVolume(volume.neighborNegZ).densityOffsetElements);
         if (IsValid(volume.neighborPosZ)) params.neighborDensityOffsetPosZ = static_cast<int32_t>(GetVolume(volume.neighborPosZ).densityOffsetElements);
 
-        VkCommandBufferAllocateInfo cmdAllocInfo{};
-        cmdAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cmdAllocInfo.commandPool = m_CommandPool;
-        cmdAllocInfo.commandBufferCount = 1;
-
-        VkCommandBuffer cmd;
-        vkAllocateCommandBuffers(m_Device, &cmdAllocInfo, &cmd);
+        VkCommandBuffer cmd = GetReusableCommandBuffer();
 
         VkCommandBufferBeginInfo beginInfo{};
         beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -1112,8 +1447,25 @@ namespace Eden
         // re-marched this call).
         for (uint32_t chunkIndex : volume.dirtyChunkIndices)
         {
+            // dirtyFlags is always sized to the RAW chunk count (see its
+            // own comment on Volume), so this one is never compacted -
+            // raw chunkIndex is always the right address here.
             vkCmdFillBuffer(cmd, volume.dirtyFlags.Get(), static_cast<VkDeviceSize>(chunkIndex) * sizeof(uint32_t), sizeof(uint32_t), 1);
-            VkDeviceSize vertexCountOffset = static_cast<VkDeviceSize>(chunkIndex) * sizeof(IndirectCommand);
+
+            // `indirect` IS compacted (compactChunkCount entries, not
+            // numChunks) - see Volume::chunkRemapCPU's comment. Translate
+            // through the same remap the GPU shader uses, and skip chunks
+            // with no compact slot at all (kVoxelChunkRemapUnused) instead
+            // of resetting a slot that doesn't exist - this is what a
+            // caller marking every raw chunk dirty on a compacted volume
+            // (ClearVolume, SetDensityFieldDirect, a Seed*) needs to stay
+            // in-bounds.
+            uint32_t compactIndex = volume.chunkRemapCPU.empty() ? chunkIndex : volume.chunkRemapCPU[chunkIndex];
+            if (compactIndex == kVoxelChunkRemapUnused)
+            {
+                continue;
+            }
+            VkDeviceSize vertexCountOffset = static_cast<VkDeviceSize>(compactIndex) * sizeof(IndirectCommand);
             vkCmdFillBuffer(cmd, volume.indirect.Get(), vertexCountOffset, sizeof(uint32_t), 0);
         }
 
@@ -1159,10 +1511,10 @@ namespace Eden
         // Compute-write (vertices/indirect) -> indirect-draw-read and
         // vertex-shader-read, both of which happen in Renderer::
         // DrawFrame well after this call returns (this function blocks
-        // on vkQueueWaitIdle below before returning, on the SAME queue
-        // that later does the graphics submission, so this barrier is
-        // strictly about intra-command-buffer ordering here, not
-        // cross-queue sync - matches ParticleSystemGPU's pattern of
+        // on a fence tied to this command buffer below before returning -
+        // see SubmitAndWaitForCommandBuffer's own comment - so this
+        // barrier is strictly about intra-command-buffer ordering here,
+        // not cross-queue sync - matches ParticleSystemGPU's pattern of
         // barriers-within-the-recorded-work).
         VkMemoryBarrier toIndirectAndVertex{};
         toIndirectAndVertex.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -1173,28 +1525,42 @@ namespace Eden
                               0, 1, &toIndirectAndVertex, 0, nullptr, 0, nullptr);
 
         vkEndCommandBuffer(cmd);
+        SubmitAndWaitForCommandBuffer(cmd);
 
-        VkSubmitInfo submitInfo{};
-        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &cmd;
-        vkQueueSubmit(m_GraphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
-        vkQueueWaitIdle(m_GraphicsQueue);
+        // Summary count only - this used to also print every individual
+        // chunk index in the batch, which was harmless for a handful of
+        // chunks but became real, unnecessary overhead once a single
+        // march started covering thousands of chunks (large reform/melt
+        // volumes near kMaxSamplesPerAxis - see ReformSystem.cpp's own
+        // comment on that cap): thousands of individual std::printf
+        // calls per march, purely diagnostic, with no value at that
+        // volume - nobody reads 2500 individual chunk numbers. Removed
+        // rather than gated behind a verbose flag since the per-chunk
+        // list was never actually useful even at small counts, just
+        // harmless there.
+        std::printf("[March]  re-marched %zu chunk(s)\n", volume.dirtyChunkIndices.size());
 
-        vkFreeCommandBuffers(m_Device, m_CommandPool, 1, &cmd);
+        volume.dirtyChunkIndices.clear();
+    }
 
-        std::printf("[March]  re-marched %zu chunk(s): ", volume.dirtyChunkIndices.size());
-        for (uint32_t chunkIndex : volume.dirtyChunkIndices)
-        {
-            std::printf("%u ", chunkIndex);
-        }
-        std::printf("\n");
-
+    void VoxelSystemGPU::DiscardPendingMarch(VoxelVolumeHandle handle)
+    {
+        // No GPU work at all - see this function's own header comment
+        // (VoxelSystemGPU.h) for why that's correct, not just fast, for
+        // a raymarch-only volume. The density buffer is already correct
+        // on the GPU (Carve()'s UploadDensityRegion uploaded it directly,
+        // same as SeedBox's UploadDensity does at registration) -
+        // dirtyChunkIndices exists purely to tell MarchDirtyChunks which
+        // chunks' MESH needs regenerating, and nothing here has a mesh
+        // consumer to regenerate it for.
+        FlushPendingUpload(handle); // raymarch-only volumes render straight from the GPU density buffer - it must be current
+        Volume& volume = GetVolume(handle);
         volume.dirtyChunkIndices.clear();
     }
 
     void VoxelSystemGPU::Carve(VoxelVolumeHandle handle, const glm::vec3& worldPos, float radius)
     {
+        EDEN_PROFILE_SCOPE("Voxel: Carve() CPU density edit");
         Volume& volume = GetVolume(handle);
         glm::vec3 localCenter = worldPos - volume.desc.origin;
 
@@ -1293,14 +1659,30 @@ namespace Eden
             else if (wasSolid && isSolidNow) stillSolid++;
         }
 
-        std::printf("[Carve] world=(%.3f,%.3f,%.3f) local=(%.3f,%.3f,%.3f) radius=%.3f\n",
-                    worldPos.x, worldPos.y, worldPos.z, localCenter.x, localCenter.y, localCenter.z, radius);
-        std::printf("[Carve]   cellMin=(%d,%d,%d) cellMax=(%d,%d,%d) sampleMin=(%d,%d,%d) sampleMax=(%d,%d,%d)\n",
-                    cellMin.x, cellMin.y, cellMin.z, cellMax.x, cellMax.y, cellMax.z,
-                    sampleMin.x, sampleMin.y, sampleMin.z, sampleMax.x, sampleMax.y, sampleMax.z);
-        std::printf("[Carve]   chunkMin=(%d,%d,%d) chunkMax=(%d,%d,%d) dirtyChunkCount=%zu flippedSolidToEmpty=%d stillSolid=%d\n",
-                    chunkMin.x, chunkMin.y, chunkMin.z, chunkMax.x, chunkMax.y, chunkMax.z,
-                    volume.dirtyChunkIndices.size(), flippedSolidToEmpty, stillSolid);
+        // Verbose per-carve diagnostics - OFF by default. This used to
+        // run unconditionally, 3-4 std::printf calls on EVERY Carve()
+        // invocation. That was tolerable back when carving was one click
+        // = one carve; it stopped being tolerable once carving could be
+        // held (10 ticks/sec) and a single tick can mean multiple Carve()
+        // calls (terrain-tile-boundary wraparound alone doubles it - see
+        // the paired entries in a carve log near a tile seam). Synchronous
+        // console writes are genuinely slow on plenty of terminals/IDE
+        // consoles - 80+ of them a second while holding the carve button
+        // down is real, measurable stutter, not free logging. Flip this
+        // to true for one session if this needs re-diagnosing; nothing
+        // else needs to change to get the diagnostics back.
+        constexpr bool kCarveDebugLogging = false;
+        if constexpr (kCarveDebugLogging)
+        {
+            std::printf("[Carve] world=(%.3f,%.3f,%.3f) local=(%.3f,%.3f,%.3f) radius=%.3f\n",
+                        worldPos.x, worldPos.y, worldPos.z, localCenter.x, localCenter.y, localCenter.z, radius);
+            std::printf("[Carve]   cellMin=(%d,%d,%d) cellMax=(%d,%d,%d) sampleMin=(%d,%d,%d) sampleMax=(%d,%d,%d)\n",
+                        cellMin.x, cellMin.y, cellMin.z, cellMax.x, cellMax.y, cellMax.z,
+                        sampleMin.x, sampleMin.y, sampleMin.z, sampleMax.x, sampleMax.y, sampleMax.z);
+            std::printf("[Carve]   chunkMin=(%d,%d,%d) chunkMax=(%d,%d,%d) dirtyChunkCount=%zu flippedSolidToEmpty=%d stillSolid=%d\n",
+                        chunkMin.x, chunkMin.y, chunkMin.z, chunkMax.x, chunkMax.y, chunkMax.z,
+                        volume.dirtyChunkIndices.size(), flippedSolidToEmpty, stillSolid);
+        }
 
         // Extra diagnostic: was this carve's own sample range clamped
         // against the volume boundary at all (i.e. did the request reach
@@ -1310,39 +1692,97 @@ namespace Eden
         // from cellMax looking suspiciously close to voxelDims-1.
         glm::ivec3 requestedMin = glm::ivec3(glm::floor(localMin));
         glm::ivec3 requestedMax = glm::ivec3(glm::ceil(localMax)) + glm::ivec3(1);
-        bool clampedLow = glm::any(glm::lessThan(requestedMin, glm::ivec3(0)));
-        bool clampedHigh = glm::any(glm::greaterThanEqual(requestedMax, sampleDims));
-        if (clampedLow || clampedHigh)
+        if constexpr (kCarveDebugLogging)
         {
-            std::printf("[Carve]   ** BOUNDARY CLAMPED ** requestedMin=(%d,%d,%d) requestedMax=(%d,%d,%d) sampleDims=(%d,%d,%d)\n",
-                        requestedMin.x, requestedMin.y, requestedMin.z,
-                        requestedMax.x, requestedMax.y, requestedMax.z,
-                        sampleDims.x, sampleDims.y, sampleDims.z);
+            bool clampedLow = glm::any(glm::lessThan(requestedMin, glm::ivec3(0)));
+            bool clampedHigh = glm::any(glm::greaterThanEqual(requestedMax, sampleDims));
+            if (clampedLow || clampedHigh)
+            {
+                std::printf("[Carve]   ** BOUNDARY CLAMPED ** requestedMin=(%d,%d,%d) requestedMax=(%d,%d,%d) sampleDims=(%d,%d,%d)\n",
+                            requestedMin.x, requestedMin.y, requestedMin.z,
+                            requestedMax.x, requestedMax.y, requestedMax.z,
+                            sampleDims.x, sampleDims.y, sampleDims.z);
+            }
         }
 
-        UploadDensityRegion(volume, sampleMin, sampleMax);
+        // Union into the pending region RecomputeExactDistances will
+        // consume - see Volume::hasPendingExactDistanceRegion's own
+        // comment. Unioning (not overwriting) is what makes this correct
+        // across a drill-through stroke's multiple Carve() calls on the
+        // same volume before RecomputeExactDistances runs once at the end.
+        if (volume.hasPendingExactDistanceRegion)
+        {
+            volume.pendingExactDistanceMin = glm::min(volume.pendingExactDistanceMin, sampleMin);
+            volume.pendingExactDistanceMax = glm::max(volume.pendingExactDistanceMax, sampleMax);
+        }
+        else
+        {
+            volume.pendingExactDistanceMin = sampleMin;
+            volume.pendingExactDistanceMax = sampleMax;
+            volume.hasPendingExactDistanceRegion = true;
+        }
+
+        // Deferred - see Volume::hasPendingUpload. Union with anything
+        // already pending (several Carve() calls per gesture).
+        if (volume.hasPendingUpload)
+        {
+            volume.pendingUploadMin = glm::min(volume.pendingUploadMin, sampleMin);
+            volume.pendingUploadMax = glm::max(volume.pendingUploadMax, sampleMax);
+        }
+        else
+        {
+            volume.pendingUploadMin = sampleMin;
+            volume.pendingUploadMax = sampleMax;
+            volume.hasPendingUpload = true;
+        }
     }
 
-    void VoxelSystemGPU::RecomputeExactDistances(VoxelVolumeHandle handle)
+    void VoxelSystemGPU::FlushPendingUpload(VoxelVolumeHandle handle)
     {
-        // Multi-source Dijkstra distance transform, seeded from every
-        // currently-solid sample - see this function's header comment
-        // for WHY this exists (Carve() alone leaves every untouched
-        // sample holding a stale, systematically-too-small distance).
-        // This computes the TRUE distance from every non-solid sample to
-        // the nearest CURRENTLY-solid sample, with no dependency on
-        // carve radius or coverage - correctness here comes from
-        // actually searching the field, not from hoping every carve
-        // stroke overlapped enough.
+        if (!IsValid(handle))
+        {
+            return;
+        }
         Volume& volume = GetVolume(handle);
-        glm::ivec3 sampleDims = volume.desc.SampleDims();
-        size_t sampleCount = static_cast<size_t>(sampleDims.x) * sampleDims.y * sampleDims.z;
+        if (!volume.hasPendingUpload || volume.densityCPU.empty())
+        {
+            return;
+        }
+        volume.hasPendingUpload = false; // cleared first: UploadDensityRegion can throw, and a retry loop on a bad region helps nobody
+        UploadDensityRegion(volume, volume.pendingUploadMin, volume.pendingUploadMax);
+    }
 
-        // 26-connected neighbor offsets (face/edge/corner), each with
-        // its true Euclidean length so the propagated distance is a real
-        // (grid-quantized, but not axis-biased) distance, not a cheaper
-        // Manhattan/Chebyshev approximation that would visibly distort
-        // near diagonals.
+    void VoxelSystemGPU::FlushAllPendingUploads()
+    {
+        for (Volume& volume : m_Volumes)
+        {
+            // Freed slots have densityCPU swapped empty (see UnregisterVolume)
+            // and hasPendingUpload reset; the checks are belt and braces.
+            if (volume.hasPendingUpload && !volume.densityCPU.empty())
+            {
+                volume.hasPendingUpload = false;
+                UploadDensityRegion(volume, volume.pendingUploadMin, volume.pendingUploadMax);
+            }
+        }
+    }
+
+    // REFERENCE implementation of RecomputeExactDistances - the original
+    // whole-volume algorithm, kept ONLY so the optimized version can be
+    // checked against it (set EDEN_VERIFY_DISTANCE=1; see
+    // RecomputeExactDistances). Not used in normal runs.
+    static void ReferenceExactDistances(const VoxelVolumeDesc& desc, std::vector<float>& density, glm::ivec3 boxMin, glm::ivec3 boxMax)
+    {
+        glm::ivec3 sampleDims = desc.SampleDims();
+        // Same math as the private VoxelSystemGPU::SampleIndex (this helper is a
+        // free function so it can't call it).
+        auto SampleIndexRef = [&desc](const VoxelVolumeDesc&, glm::ivec3 sample) -> uint32_t
+        {
+            glm::ivec3 dims = desc.SampleDims();
+            glm::ivec3 clamped = glm::clamp(sample, glm::ivec3(0), dims - glm::ivec3(1));
+            return static_cast<uint32_t>(clamped.x) + static_cast<uint32_t>(clamped.y) * static_cast<uint32_t>(dims.x)
+                 + static_cast<uint32_t>(clamped.z) * static_cast<uint32_t>(dims.x) * static_cast<uint32_t>(dims.y);
+        };
+        size_t sampleCount = static_cast<size_t>(sampleDims.x) * sampleDims.y * sampleDims.z;
         struct Neighbor { glm::ivec3 offset; float length; };
         static const std::vector<Neighbor> kNeighbors = []
         {
@@ -1357,16 +1797,21 @@ namespace Eden
             }
             return result;
         }();
-
         std::vector<float> trueDistance(sampleCount, std::numeric_limits<float>::infinity());
         std::vector<bool> finalized(sampleCount, false);
 
         using QueueEntry = std::pair<float, uint32_t>; // (distance, sample index)
         std::priority_queue<QueueEntry, std::vector<QueueEntry>, std::greater<QueueEntry>> queue;
 
+        // Seeds from EVERY solid sample in the WHOLE field, not just the
+        // padded box - a solid sample just outside the box can still be
+        // the nearest neighbor for a non-solid sample right at the box's
+        // edge, and this scan is cheap (a single bandwidth-bound pass,
+        // not the priority-queue traversal that was the actual cost -
+        // see this function's header comment).
         for (size_t i = 0; i < sampleCount; ++i)
         {
-            if (volume.densityCPU[i] < kVoxelIsoLevel)
+            if (density[i] < kVoxelIsoLevel)
             {
                 trueDistance[i] = 0.0f;
                 queue.push({ 0.0f, static_cast<uint32_t>(i) });
@@ -1404,13 +1849,29 @@ namespace Eden
                     continue;
                 }
 
-                uint32_t neighborIndex = SampleIndex(volume.desc, neighborCoord);
+                // The actual bound: never propagate INTO a cell outside
+                // the padded box. A solid seed sitting outside the box
+                // still gets popped and still checks its neighbors (that's
+                // how it correctly seeds a box-edge cell one hop inside),
+                // but nothing outside the box ever gets pushed onward from
+                // there - so the traversal explores at most (every solid
+                // sample's one-hop neighborhood) + (the padded box itself),
+                // never the whole non-solid field. That first term is why
+                // the seed scan above still has to be global rather than
+                // box-limited too.
+                if (glm::any(glm::lessThan(neighborCoord, boxMin)) ||
+                    glm::any(glm::greaterThan(neighborCoord, boxMax)))
+                {
+                    continue;
+                }
+
+                uint32_t neighborIndex = SampleIndexRef(desc, neighborCoord);
                 if (finalized[neighborIndex])
                 {
                     continue;
                 }
 
-                float candidateDist = dist + neighbor.length * volume.desc.voxelSize;
+                float candidateDist = dist + neighbor.length * desc.voxelSize;
                 if (candidateDist < trueDistance[neighborIndex])
                 {
                     trueDistance[neighborIndex] = candidateDist;
@@ -1419,20 +1880,244 @@ namespace Eden
             }
         }
 
-        // Only overwrite non-solid samples - solid samples already hold
-        // exact, locally-correct CSG values from SeedSphere/Carve and
-        // were never the source of this bug. A non-solid sample with no
-        // solid anywhere in the volume ends up with trueDistance ==
-        // infinity, which is exactly the right answer ("nothing solid
-        // exists in this volume") and behaves correctly downstream -
-        // SampleSignedDistance/SampleGradient never see it as anything
-        // but overwhelmingly far away.
-        for (size_t i = 0; i < sampleCount; ++i)
+        // Only overwrite non-solid samples INSIDE the padded box - solid
+        // samples already hold exact, locally-correct CSG values from
+        // SeedSphere/Carve and were never the source of this bug (same as
+        // before). Samples outside the box were never relaxed this call
+        // (trueDistance[i] is still its infinity initial value for most
+        // of them), so writing them back would OVERWRITE an already-
+        // correct value from a previous call with garbage - skipping them
+        // entirely is what makes bounding this to a region safe, not just
+        // fast.
+        for (int32_t z = boxMin.z; z <= boxMax.z; ++z)
+        for (int32_t y = boxMin.y; y <= boxMax.y; ++y)
+        for (int32_t x = boxMin.x; x <= boxMax.x; ++x)
         {
+            uint32_t i = SampleIndexRef(desc, glm::ivec3(x, y, z));
+            if (density[i] >= kVoxelIsoLevel)
+            {
+                density[i] = trueDistance[i];
+            }
+        }
+    }
+
+    void VoxelSystemGPU::RecomputeExactDistances(VoxelVolumeHandle handle)
+    {
+        EDEN_PROFILE_SCOPE("Voxel: exact distance transform (CPU)");
+        // Multi-source Dijkstra distance transform, seeded from every
+        // currently-solid sample - see this function's header comment
+        // for WHY this exists (Carve() alone leaves every untouched
+        // sample holding a stale, systematically-too-small distance).
+        // This computes the TRUE distance from every non-solid sample to
+        // the nearest CURRENTLY-solid sample, with no dependency on
+        // carve radius or coverage - correctness here comes from
+        // actually searching the field, not from hoping every carve
+        // stroke overlapped enough.
+        //
+        // BOUNDED to a padded region around what Carve() actually
+        // touched (see Volume::hasPendingExactDistanceRegion's own
+        // comment) - this was briefly reverted to full-field on a theory
+        // that partial coverage caused a chunk-boundary mesh seam a user
+        // reported. That theory was WRONG (confirmed: this function only
+        // ever writes to densityCPU and never re-uploads to the GPU or
+        // triggers a re-march, so nothing it does can reach the rendered
+        // mesh at all - see the bottom of this function), and reverting
+        // it cost real, measured performance (lag roughly doubled) for
+        // zero correctness benefit, so it's back. The actual seam cause
+        // is still open and unrelated to this function.
+        //
+        // Bounding this at all exists because the un-bounded version was
+        // the actual cause of a real multi-second freeze carving anything
+        // fine-grained (a mold workpiece's much finer voxelSize means
+        // vastly more samples than a terrain tile - the exact same
+        // O(wholeField log wholeField) algorithm scales with sample
+        // count, not carve size). A local carve can only have changed
+        // which sample is nearest-solid for points near where it
+        // happened - kPaddingVoxels below is deliberately generous
+        // relative to typical carve radii so this stays correct in
+        // practice, not just fast; see its own comment for the actual
+        // trade-off being made.
+        static const bool verifyAgainstReference = (std::getenv("EDEN_VERIFY_DISTANCE") != nullptr);
+        Volume& volume = GetVolume(handle);
+        glm::ivec3 sampleDims = volume.desc.SampleDims();
+        size_t sampleCount = static_cast<size_t>(sampleDims.x) * sampleDims.y * sampleDims.z;
+
+        // Consumed here - the NEXT Carve() call starts a fresh pending
+        // region. Falls back to the whole field (this function's
+        // original, always-correct behavior) if nothing is pending, which
+        // only happens if something other than the carve-input path ever
+        // calls this directly - see this function's only current caller
+        // in ProcessVoxelCarveInput.
+        glm::ivec3 boxMin(0);
+        glm::ivec3 boxMax = sampleDims - glm::ivec3(1);
+        if (volume.hasPendingExactDistanceRegion)
+        {
+            constexpr int32_t kPaddingVoxels = 12; // see this function's header comment - comfortably larger than sampleMin/sampleMax's own already-tight carve-radius span, not a tuned-to-the-wire minimum
+            boxMin = glm::max(volume.pendingExactDistanceMin - glm::ivec3(kPaddingVoxels), glm::ivec3(0));
+            boxMax = glm::min(volume.pendingExactDistanceMax + glm::ivec3(kPaddingVoxels), sampleDims - glm::ivec3(1));
+        }
+        volume.hasPendingExactDistanceRegion = false;
+
+        std::vector<float> referenceDensity;
+        if (verifyAgainstReference)
+        {
+            referenceDensity = volume.densityCPU;
+        }
+
+        // 26-connected neighbor offsets (face/edge/corner), each with
+        // its true Euclidean length so the propagated distance is a real
+        // (grid-quantized, but not axis-biased) distance, not a cheaper
+        // Manhattan/Chebyshev approximation that would visibly distort
+        // near diagonals.
+        struct Neighbor { glm::ivec3 offset; float length; };
+        static const std::vector<Neighbor> kNeighbors = []
+        {
+            std::vector<Neighbor> result;
+            for (int32_t dz = -1; dz <= 1; ++dz)
+            for (int32_t dy = -1; dy <= 1; ++dy)
+            for (int32_t dx = -1; dx <= 1; ++dx)
+            {
+                if (dx == 0 && dy == 0 && dz == 0) continue;
+                glm::ivec3 offset(dx, dy, dz);
+                result.push_back({ offset, glm::length(glm::vec3(offset)) });
+            }
+            return result;
+        }();
+
+        // OPTIMIZED, result-identical to the original (ReferenceExactDistances):
+        //  * The original allocated and scanned arrays for the WHOLE volume and
+        //    pushed EVERY solid sample into the priority queue, then spent most
+        //    of its time popping seeds whose neighbors it immediately rejected
+        //    for being outside the box. Only the box matters: nothing outside
+        //    it is ever relaxed, so the only outside samples that can influence
+        //    the result are solid seeds directly adjacent to the box - hence
+        //    the one-sample border on `region`.
+        //  * A solid seed whose in-box neighbors are all solid can't improve
+        //    anything (every candidate would be > 0 against an existing 0), so
+        //    only seeds touching at least one non-solid in-box sample are queued.
+        const glm::ivec3 regionMin = glm::max(boxMin - glm::ivec3(1), glm::ivec3(0));
+        const glm::ivec3 regionMax = glm::min(boxMax + glm::ivec3(1), sampleDims - glm::ivec3(1));
+        const glm::ivec3 regionDims = regionMax - regionMin + glm::ivec3(1);
+        const size_t regionCount = static_cast<size_t>(regionDims.x) * regionDims.y * regionDims.z;
+
+        auto LocalIndex = [&](const glm::ivec3& c) -> uint32_t
+        {
+            glm::ivec3 l = c - regionMin;
+            return static_cast<uint32_t>(l.x + regionDims.x * (l.y + regionDims.y * l.z));
+        };
+        auto InBox = [&](const glm::ivec3& c)
+        {
+            return c.x >= boxMin.x && c.y >= boxMin.y && c.z >= boxMin.z &&
+                   c.x <= boxMax.x && c.y <= boxMax.y && c.z <= boxMax.z;
+        };
+
+        std::vector<float> trueDistance(regionCount, std::numeric_limits<float>::infinity());
+        std::vector<uint8_t> finalized(regionCount, 0);
+
+        using QueueEntry = std::pair<float, uint32_t>; // (distance, LOCAL region index)
+        std::priority_queue<QueueEntry, std::vector<QueueEntry>, std::greater<QueueEntry>> queue;
+
+        // Pass 1: mark solids (distance 0) and queue only the ones that touch a non-solid in-box sample.
+        for (int32_t z = regionMin.z; z <= regionMax.z; ++z)
+        for (int32_t y = regionMin.y; y <= regionMax.y; ++y)
+        for (int32_t x = regionMin.x; x <= regionMax.x; ++x)
+        {
+            const glm::ivec3 coord(x, y, z);
+            if (!(volume.densityCPU[SampleIndex(volume.desc, coord)] < kVoxelIsoLevel))
+            {
+                continue;
+            }
+            const uint32_t local = LocalIndex(coord);
+            trueDistance[local] = 0.0f;
+
+            bool touchesOpen = false;
+            for (const Neighbor& neighbor : kNeighbors)
+            {
+                const glm::ivec3 nc = coord + neighbor.offset;
+                if (!InBox(nc) || nc.x >= sampleDims.x || nc.y >= sampleDims.y || nc.z >= sampleDims.z)
+                {
+                    continue;
+                }
+                if (!(volume.densityCPU[SampleIndex(volume.desc, nc)] < kVoxelIsoLevel))
+                {
+                    touchesOpen = true;
+                    break;
+                }
+            }
+            if (touchesOpen)
+            {
+                queue.push({ 0.0f, local });
+            }
+        }
+
+        while (!queue.empty())
+        {
+            const auto [dist, local] = queue.top();
+            queue.pop();
+            if (finalized[local])
+            {
+                continue;
+            }
+            finalized[local] = 1;
+
+            const glm::ivec3 coord(regionMin.x + static_cast<int32_t>(local % regionDims.x),
+                                    regionMin.y + static_cast<int32_t>((local / regionDims.x) % regionDims.y),
+                                    regionMin.z + static_cast<int32_t>(local / (regionDims.x * regionDims.y)));
+            for (const Neighbor& neighbor : kNeighbors)
+            {
+                const glm::ivec3 neighborCoord = coord + neighbor.offset;
+                if (!InBox(neighborCoord) || glm::any(glm::greaterThanEqual(neighborCoord, sampleDims)))
+                {
+                    continue; // outside the padded box (InBox is already >= 0 clamped via boxMin)
+                }
+                const uint32_t neighborLocal = LocalIndex(neighborCoord);
+                if (finalized[neighborLocal])
+                {
+                    continue;
+                }
+                const float candidateDist = dist + neighbor.length * volume.desc.voxelSize;
+                if (candidateDist < trueDistance[neighborLocal])
+                {
+                    trueDistance[neighborLocal] = candidateDist;
+                    queue.push({ candidateDist, neighborLocal });
+                }
+            }
+        }
+
+        for (int32_t z = boxMin.z; z <= boxMax.z; ++z)
+        for (int32_t y = boxMin.y; y <= boxMax.y; ++y)
+        for (int32_t x = boxMin.x; x <= boxMax.x; ++x)
+        {
+            const uint32_t i = SampleIndex(volume.desc, glm::ivec3(x, y, z));
             if (volume.densityCPU[i] >= kVoxelIsoLevel)
             {
-                volume.densityCPU[i] = trueDistance[i];
+                volume.densityCPU[i] = trueDistance[LocalIndex(glm::ivec3(x, y, z))];
             }
+        }
+
+        // Optional self-check against the original algorithm. Run with
+        // EDEN_VERIFY_DISTANCE=1 and watch the console: it prints the largest
+        // difference over the box (0 expected - same graph, same weights).
+        // `referenceDensity` was copied BEFORE the optimized pass touched
+        // anything.
+        if (!referenceDensity.empty())
+        {
+            ReferenceExactDistances(volume.desc, referenceDensity, boxMin, boxMax);
+            float maxDiff = 0.0f;
+            size_t mismatches = 0;
+            for (int32_t z = boxMin.z; z <= boxMax.z; ++z)
+            for (int32_t y = boxMin.y; y <= boxMax.y; ++y)
+            for (int32_t x = boxMin.x; x <= boxMax.x; ++x)
+            {
+                const uint32_t i = SampleIndex(volume.desc, glm::ivec3(x, y, z));
+                const float a = volume.densityCPU[i];
+                const float b = referenceDensity[i];
+                const float diff = std::isinf(a) && std::isinf(b) ? 0.0f : std::fabs(a - b);
+                if (diff > 1e-4f) { ++mismatches; }
+                maxDiff = std::max(maxDiff, diff);
+            }
+            std::printf("[VerifyDistance] box=(%d,%d,%d)-(%d,%d,%d) maxDiff=%.6f mismatches=%zu\n",
+                        boxMin.x, boxMin.y, boxMin.z, boxMax.x, boxMax.y, boxMax.z, maxDiff, mismatches);
         }
 
         // Deliberately no GPU re-upload and no MarchDirtyChunks call

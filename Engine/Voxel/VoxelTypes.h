@@ -32,6 +32,15 @@ namespace Eden
     constexpr uint32_t kVoxelMaxTrianglesPerChunk = 12 * kVoxelCellsPerChunk;
     constexpr uint32_t kVoxelMaxVerticesPerChunk = kVoxelMaxTrianglesPerChunk * 3;
 
+    // Chunk compaction sentinel (see VoxelSystemGPU::BuildChunkRemapTable
+    // and voxel_march.comp's ChunkRemapBuffer/kChunkRemapUnused) - a
+    // chunk remap entry holding this value means "this chunk has no
+    // geometry at all, don't write anything for it." Defined ONCE here,
+    // shared by both the CPU code that BUILDS a remap table and the
+    // shader that CONSUMES one, rather than each independently hardcoding
+    // 0xFFFFFFFF and trusting they never drift apart.
+    constexpr uint32_t kVoxelChunkRemapUnused = 0xFFFFFFFFu;
+
     // Hard ceiling on how many volumes VoxelSystemGPU will register -
     // same "documented, raisable ceiling" pattern as GPU_MAX_PARTICLES.
     // Each volume owns its own density/vertex/indirect buffers, so this
@@ -79,8 +88,44 @@ namespace Eden
     // constant directly if a session needs more capacity than it
     // provides - RegisterVolume throws rather than silently corrupting
     // adjacent volumes' data if this is exceeded.
+    // Raised from the original 12 * 64^3 (~12.6MB) after a real session
+    // hit this ceiling: melt/reform cycles accumulate density-buffer
+    // usage that's never reclaimed (MeltSystem::Melt clears a volume's
+    // CONTENTS via ClearVolume but doesn't UnregisterVolume it - a gap
+    // this project's own to-do notes already flagged as "worth making
+    // an explicit decision about" - so every melt->reform round trip
+    // permanently consumes new space even though the melted volume is
+    // functionally dead afterward). A single session doing a handful of
+    // melt/reform cycles plus normal terrain carving hit this exact
+    // ceiling and crashed (RegisterVolume throws rather than silently
+    // corrupting adjacent volumes' data - see this constant's own
+    // comment below - which is why this was a clean fatal error and not
+    // memory corruption, but a crash either way).
+    //
+    // This is a real headroom increase, not a root-cause fix - the
+    // underlying leak-shaped gap (nothing ever frees a melted volume's
+    // slot) still exists and will eventually exhaust ANY fixed ceiling
+    // given enough melt/reform cycles in one sitting. Actually closing
+    // it means calling UnregisterVolume once a melted volume is no
+    // longer needed - deliberately NOT done in this pass: the volume
+    // handle is still read (GetVolumeBounds) by the caller immediately
+    // after MeltSystem::Melt returns (see ProcessMeltInput's
+    // WakeSleepingBodiesNearVolume call in main.cpp), and at least one
+    // meltable volume (the original test sphere, via
+    // RegisterVoxelPhysicsEntity) has a real ECS entity holding this
+    // same handle in its ColliderComponent/VoxelVolumeComponent -
+    // unregistering without also confirming every OTHER meltable
+    // volume's ECS/collision/render references are handled risks
+    // trading this crash for a dangling-handle one, which needs its own
+    // careful, scoped pass rather than a rushed addition here.
+    //
+    // 48 * 64^3 = 12,582,912 elements * 4 bytes/float = ~50.3MB (up from
+    // ~12.6MB) - real GPU memory, but comfortably affordable on any
+    // target hardware for this project, and roughly 2.5x the peak usage
+    // this exact session actually hit before crashing (it needed ~5.0M
+    // elements total when it failed).
     constexpr uint64_t kSharedDensityBufferCapacityElements =
-        12ull * 64ull * 64ull * 64ull;
+        48ull * 64ull * 64ull * 64ull;
 
     // Isosurface threshold - density values below this are "solid",
     // above are "empty". 0.0 with signed-distance seeding (negative =

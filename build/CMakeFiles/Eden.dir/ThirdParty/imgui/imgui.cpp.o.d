@@ -1,7 +1,7 @@
 CMakeFiles/Eden.dir/ThirdParty/imgui/imgui.cpp.o: \
-  /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/ThirdParty/imgui/imgui.cpp \
-  /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/ThirdParty/imgui/imgui.h \
-  /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/ThirdParty/imgui/imconfig.h \
+  /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/ThirdParty/imgui/imgui.cpp \
+  /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/ThirdParty/imgui/imgui.h \
+  /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/ThirdParty/imgui/imconfig.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1/float.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1/__config \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1/__config_site \
@@ -71,9 +71,8 @@ CMakeFiles/Eden.dir/ThirdParty/imgui/imgui.cpp.o: \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_ssize_t.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/_strings.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/assert.h \
-  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/_assert.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/_static_assert.h \
-  /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/ThirdParty/imgui/imgui_internal.h \
+  /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/ThirdParty/imgui/imgui_internal.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1/stdio.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/stdio.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/_stdio.h \

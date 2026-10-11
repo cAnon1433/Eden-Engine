@@ -22,12 +22,16 @@ mkdir -p build
 cd build
 
 echo "Configuring..."
-cmake .. -DCMAKE_BUILD_TYPE=Debug > /tmp/eden_cmake.log 2>&1 || {
+# Release by default (Debug is much slower and enables Vulkan validation
+# layers). Debug build: EDEN_BUILD_TYPE=Debug ./"Run Eden (Linux).sh"
+BUILD_TYPE="${EDEN_BUILD_TYPE:-Release}"
+echo "Build type: $BUILD_TYPE"
+cmake .. -DCMAKE_BUILD_TYPE="$BUILD_TYPE" > /tmp/eden_cmake.log 2>&1 || {
     echo ""
     echo "CMake configuration failed. Full log:"
     cat /tmp/eden_cmake.log
     echo ""
-    echo "Common cause on Linux: missing Vulkan SDK, or missing X11/Wayland"
+    echo "Common cause on Linux: missing Vulkan SDK, or missing X11"
     echo "development headers that GLFW's own source (vendored in"
     echo "ThirdParty/glfw/, built as part of this project - no separate"
     echo "GLFW/GLM install needed anymore) needs to compile its Linux"
@@ -35,8 +39,7 @@ cmake .. -DCMAKE_BUILD_TYPE=Debug > /tmp/eden_cmake.log 2>&1 || {
     echo "  sudo apt install cmake build-essential libvulkan-dev \\"
     echo "                   vulkan-tools glslang-tools \\"
     echo "                   libx11-dev libxrandr-dev libxinerama-dev \\"
-    echo "                   libxcursor-dev libxi-dev libwayland-dev \\"
-    echo "                   libxkbcommon-dev"
+    echo "                   libxcursor-dev libxi-dev"
     echo "and make sure VULKAN_SDK is set if you installed LunarG's SDK"
     echo "instead of the distro packages."
     echo ""

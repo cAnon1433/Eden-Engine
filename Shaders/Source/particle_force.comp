@@ -24,6 +24,35 @@ layout(std430, binding = 6) readonly buffer CellBucketsBuffer { uint cellBuckets
 // own buffer/binding.
 layout(std430, binding = 8) readonly buffer HeatBuffer { float heat[]; };
 
+// Chemical ID system (base build) - see ParticleGPUTypes.h's
+// ChemicalPropertiesGPU comment. Byte-identical to that C++ struct, same
+// as particle_density.comp's copy of this struct (hand-synced, same
+// convention SimParams already uses).
+struct ChemicalProperties
+{
+    float mass;
+    float restDensity;
+    float viscosity;
+    float stiffness;         // unused in this shader - already baked into pressures[] by particle_density.comp
+    float hardeningThreshold; // unused in this shader
+    float hardenedDensity;    // unused in this shader
+    float conductivity;       // inert
+    float cohesion;           // load-bearing here - see main()'s cohesionIJ
+    vec4 baseColor;           // unused in this shader
+};
+
+layout(std430, binding = 10) readonly buffer ChemicalIdBuffer { uint chemicalIds[]; };
+// Color diffusion (see main()'s "Color diffusion" block below) - Colors
+// is read-only here (integrate.comp owns writing it, same read/write
+// split heat already uses), ColorsAvg is this shader's OWN scratch
+// output, mirroring exactly how forces[i].w carries neighborAvgHeat to
+// integrate.comp - just with its own buffer instead of a spare
+// component, since a color needs three floats and ForcesBuffer has none
+// spare (xyz already force, w already heat).
+layout(std430, binding = 11) readonly buffer ColorsBuffer { vec4 colors[]; };
+layout(std430, binding = 12) buffer ColorsAvgBuffer { vec4 colorsAvg[]; };
+layout(std430, binding = 13) readonly buffer ChemicalPropertiesBuffer { ChemicalProperties chemicals[]; };
+
 layout(push_constant) uniform SimParams
 {
     uint particleCount;
@@ -140,6 +169,8 @@ void main()
     vec3 vi = velocities[i].xyz;
     float pressureI = pressures[i];
     float heatI = heat[i];
+    uint chemI = chemicalIds[i];
+    vec3 colorI = colors[i].rgb;
 
     vec3 pressureForce = vec3(0.0);
     vec3 viscosityForce = vec3(0.0);
@@ -147,13 +178,18 @@ void main()
     float densityI = densities[i];
 
     // Heat-conduction accumulators - see forces[i].w's comment below.
-    // Only touched when heatI >= 0.0 (this particle is actually part of
-    // the melt/reform system - see GPU_HEAT_NOT_MELTED in
-    // ParticleGPUTypes.h); ordinary liquid particles skip this
-    // entirely, same "not part of this system" boundary heat decay
-    // already respects in particle_integrate.comp.
+    // Unconditional now for every particle - see GPU_HEAT_NOT_MELTED's
+    // comment for what "only touched when part of the melt system" used
+    // to mean here and why that distinction no longer exists.
     float heatWeightedSum = 0.0;
     float heatWeightTotal = 0.0;
+
+    // Color-diffusion accumulators - see "Color diffusion" below. Same
+    // unconditional shape as heat above now - color mixing is a property
+    // of ALL matter, not just melted matter, and was never gated the way
+    // heat used to be.
+    vec3 colorWeightedSum = vec3(0.0);
+    float colorWeightTotal = 0.0;
 
     ivec3 cell = ivec3(floor(pi / sim.cellSize));
     const float kMinSeparation = 1e-4;
@@ -211,31 +247,78 @@ void main()
                 continue;
             }
 
+            uint chemJ = chemicalIds[j];
+            float massJ = chemicals[chemJ].mass;
+
+            // Symmetric pressure-force form (each particle's OWN
+            // pressure/density-squared term, not the previous single-
+            // global-mass approximation) - the standard, momentum-
+            // conserving multi-material SPH pressure gradient (Müller
+            // 2003's own citation for it). This matters now specifically
+            // BECAUSE mass/density can differ per chemical: the old
+            // "sim.mass * (pI+pJ)/(2*rhoJ)" form was only exactly correct
+            // when every particle shared one mass/density, which was
+            // true before this base build and is no longer guaranteed.
             float pressureJ = pressures[j];
             vec3 gradW = SpikyGradient(effectiveRVec, effectiveR, sim.h);
-            pressureForce -= sim.mass * (pressureI + pressureJ) / (2.0 * rhoJ) * gradW;
+            pressureForce -= massJ * (pressureI / (densityI * densityI) + pressureJ / (rhoJ * rhoJ)) * gradW;
 
+            // Per-pair viscosity - simple average of the two chemicals'
+            // own viscosity (viscosity is fundamentally a PAIRWISE
+            // property of an interaction, not something one particle
+            // "has" in isolation - there's no more principled single
+            // value to pick between two different chemicals meeting).
+            // Fully per-chemical now - no global multiplier on top
+            // anymore (there used to be one, sim.viscosity/the old
+            // "Viscosity" ImGui slider - removed once every chemical got
+            // its own editable viscosity, so there was no longer a
+            // meaningful DIFFERENCE between "the global knob" and "just
+            // edit the chemical", and keeping both was two controls
+            // doing overlapping jobs).
             vec3 vj = velocities[j].xyz;
             float lapW = ViscosityLaplacian(effectiveR, sim.h);
-            viscosityForce += sim.mass * (vj - vi) / rhoJ * lapW;
+            float viscosityIJ = 0.5 * (chemicals[chemI].viscosity + chemicals[chemJ].viscosity);
+            viscosityForce += massJ * viscosityIJ * (vj - vi) / rhoJ * lapW;
 
             // Cohesion (surface tension) - see CohesionKernel's comment
-            // above. kij is Akinci's density-correction factor: without
-            // it, particles in a denser-than-rest region (e.g. the
-            // bottom of a resting pool) would cohere MORE strongly than
-            // particles at rest density, which is backwards - cohesion
-            // should hold a free surface together, not add extra
-            // clumping force where the fluid is already well-packed.
-            // Direction is -effectiveRVec/effectiveR (points from i
-            // toward j, i.e. attractive) - opposite sign from
-            // pressureForce's repulsive gradient above.
-            if (sim.cohesion > 0.0)
+            // above. Per-chemical now (average of both particles' own
+            // cohesion, same pairwise-average pattern as viscosity just
+            // above) - moved off the old global sim.cohesion once
+            // "differing properties per chemical" became the explicit
+            // goal; see ChemicalPropertiesGPU::cohesion's own comment for
+            // why it was kept global originally and why that stopped
+            // making sense. massI*massJ replaces the old sim.mass*sim.mass -
+            // still correct now that mass genuinely varies per particle.
+            // kij is Akinci's density-correction factor: without it,
+            // particles in a denser-than-rest region (e.g. the bottom of
+            // a resting pool) would cohere MORE strongly than particles
+            // at rest density, which is backwards - cohesion should hold
+            // a free surface together, not add extra clumping force
+            // where the fluid is already well-packed.
+            float cohesionIJ = 0.5 * (chemicals[chemI].cohesion + chemicals[chemJ].cohesion);
+            if (cohesionIJ > 0.0)
             {
+                float massI = chemicals[chemI].mass;
                 float kij = 2.0 * sim.restDensity / (densityI + rhoJ);
                 float cKernel = CohesionKernel(effectiveR, sim.h);
-                cohesionForce -= sim.cohesion * sim.mass * sim.mass * kij * cKernel
+                cohesionForce -= cohesionIJ * massI * massJ * kij * cKernel
                                 * (effectiveRVec / effectiveR);
             }
+
+            // Color diffusion - reuses lapW exactly like heat conduction
+            // below does (same Laplacian-smoothing role, same neighbor
+            // set, applied to a different per-particle scalar/vector).
+            // Unconditional (no heatI>=0-style gate) - every particle's
+            // color mixes with its neighbors', not just melt-system
+            // particles. This is the mechanism behind "drop a dark
+            // liquid into a light one and watch it spread": each
+            // particle's displayed color is continuously pulled toward
+            // its SPH neighborhood's weighted-average color, exactly the
+            // same miscible-fluid technique heat diffusion already
+            // proved out for a scalar - just applied to vec3 here.
+            vec3 colorJ = colors[j].rgb;
+            colorWeightedSum += colorJ * lapW;
+            colorWeightTotal += lapW;
 
             // Heat conduction toward SPH neighbors (same radius h
             // pressure/viscosity already use - "close enough to
@@ -244,23 +327,22 @@ void main()
             // the falloff weight, same Laplacian-smoothing role it plays
             // for viscosity's velocity diffusion - heat diffusion is the
             // same kind of process on a scalar instead of a vector, not
-            // a different mechanism. Only accumulates over OTHER
-            // melt-system particles (heatJ >= 0.0) - an ordinary liquid
-            // neighbor shouldn't pull a melted particle's heat around,
-            // it isn't part of this system.
-            if (heatI >= 0.0)
-            {
-                float heatJ = heat[j];
-                if (heatJ >= 0.0)
-                {
-                    heatWeightedSum += heatJ * lapW;
-                    heatWeightTotal += lapW;
-                }
-            }
+            // a different mechanism. Unconditional now - every particle
+            // conducts heat with every neighbor regardless of chemical or
+            // origin (see GPU_HEAT_NOT_MELTED's comment for what this
+            // replaced: heat[j] used to be checked against a "part of the
+            // melt system" sentinel before contributing here, but there's
+            // no such distinction left to check).
+            float heatJ = heat[j];
+            heatWeightedSum += heatJ * lapW;
+            heatWeightTotal += lapW;
         }
     }
 
-    viscosityForce *= sim.viscosity;
+    // viscosityForce is NOT rescaled by sim.viscosity here anymore -
+    // that global multiplier is now applied per-pair, inside the loop
+    // above (see viscosityIJ), alongside each pair's own chemical
+    // viscosity average. Rescaling it again here would double-apply it.
 
     // Gravity NOT added here - applied as an acceleration in
     // particle_integrate.comp, same convention as the CPU version.
@@ -275,4 +357,13 @@ void main()
     // conduct with.
     float neighborAvgHeat = heatWeightTotal > 0.0 ? (heatWeightedSum / heatWeightTotal) : heatI;
     forces[i] = vec4(pressureForce + viscosityForce + cohesionForce, neighborAvgHeat);
+
+    // colorsAvg[i] carries this particle's SPH-neighborhood-weighted
+    // average color, exactly the same role forces[i].w plays for heat -
+    // particle_integrate.comp reads it back and pulls colors[i] toward
+    // it each step. Falls back to this particle's OWN current color (a
+    // no-op pull) when there are no neighbors in range at all - an
+    // isolated particle shouldn't drift toward black/zero just because
+    // colorWeightTotal is 0.
+    colorsAvg[i] = colorWeightTotal > 0.0 ? vec4(colorWeightedSum / colorWeightTotal, 1.0) : vec4(colorI, 1.0);
 }

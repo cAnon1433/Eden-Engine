@@ -1,0 +1,128 @@
+#version 450
+
+// Where on screen is the VISIBLE liquid? One thread per particle projects it,
+// throws it away if it is outside the view or hidden behind the opaque scene,
+// and folds its on-screen extent into a single screen-space bounding
+// rectangle (integer atomics). The CPU reads the 32-byte result back a couple
+// of frames later (no stall) and uses it to:
+//   * skip the whole fluid pass chain when nothing is visible, and
+//   * confine every fluid pass (and the composite) to that rectangle instead
+//     of touching every pixel of the screen.
+// Without this the chain cost the same ~16 bytes read + 16 written per pixel
+// per pass for a lone droplet as for a screen-filling pool.
+//
+// Runs between the opaque scene pass and the fluid passes, so the scene depth
+// buffer is available (see Renderer::DrawFrame).
+
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer PositionBuffer
+{
+    vec4 positions[]; // xyz = world position; y < -1e8 = void-killed (see every other particle shader)
+};
+
+layout(std430, set = 0, binding = 1) buffer BoundsBuffer
+{
+    int boundsMinX;
+    int boundsMinY;
+    int boundsMaxX;
+    int boundsMaxY;
+    uint visibleCount;
+    uint needsFullScreen; // 1 if any particle was too near/behind the camera for its projection to be trusted
+    uint pad0;
+    uint pad1;
+};
+
+layout(set = 0, binding = 2) uniform sampler2D sceneDepth;
+
+layout(push_constant) uniform PushConstants
+{
+    mat4 viewProj;
+    vec4 cameraPosAndRadius; // xyz = camera position, w = particle visual radius
+    vec4 screenAndScale;     // x,y = screen size in pixels; z = proj[0][0]*0.5*W; w = |proj[1][1]|*0.5*H  (pixels per world unit at w = 1)
+    uvec4 meta;              // x = particle count
+} pc;
+
+void main()
+{
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= pc.meta.x)
+    {
+        return;
+    }
+
+    vec3 position = positions[index].xyz;
+    if (position.y < -1.0e8)
+    {
+        return;
+    }
+
+    float radius = pc.cameraPosAndRadius.w;
+    vec2 screenSize = pc.screenAndScale.xy;
+
+    vec4 clip = pc.viewProj * vec4(position, 1.0);
+
+    // Too close to (or behind) the camera plane for the pinhole projection to
+    // mean anything: be conservative - count it as visible and tell the CPU
+    // to fall back to the whole screen.
+    if (clip.w < radius * 1.5)
+    {
+        // Behind the camera entirely (w <= 0) can't be seen at all.
+        if (clip.w > -radius)
+        {
+            atomicAdd(visibleCount, 1u);
+            atomicOr(needsFullScreen, 1u);
+        }
+        return;
+    }
+
+    vec2 ndc = clip.xy / clip.w;
+    float ndcZ = clip.z / clip.w;
+    vec2 pixelCenter = (ndc * 0.5 + 0.5) * screenSize;
+    vec2 pixelRadius = vec2(abs(pc.screenAndScale.z), abs(pc.screenAndScale.w)) * radius / clip.w;
+
+    // Frustum reject (sphere vs the screen rectangle, and beyond far plane).
+    if (pixelCenter.x + pixelRadius.x < 0.0 || pixelCenter.x - pixelRadius.x > screenSize.x ||
+        pixelCenter.y + pixelRadius.y < 0.0 || pixelCenter.y - pixelRadius.y > screenSize.y ||
+        ndcZ > 1.0)
+    {
+        return;
+    }
+
+    // Occlusion: the sphere's nearest possible point vs the opaque scene,
+    // tested at the centre and four points around it, so a particle that is
+    // only PARTLY hidden still counts as visible. Samples that fall off screen
+    // count as unoccluded.
+    vec3 toParticle = normalize(position - pc.cameraPosAndRadius.xyz);
+    vec4 nearestClip = pc.viewProj * vec4(position - toParticle * radius, 1.0);
+    float nearestNdcZ = nearestClip.w > 1.0e-4 ? nearestClip.z / nearestClip.w : -1.0;
+
+    bool visible = false;
+    const vec2 offsets[5] = vec2[5](vec2(0.0), vec2(0.7, 0.0), vec2(-0.7, 0.0), vec2(0.0, 0.7), vec2(0.0, -0.7));
+    for (int i = 0; i < 5 && !visible; ++i)
+    {
+        vec2 samplePixel = pixelCenter + offsets[i] * pixelRadius;
+        if (samplePixel.x < 0.0 || samplePixel.y < 0.0 || samplePixel.x >= screenSize.x || samplePixel.y >= screenSize.y)
+        {
+            visible = true;
+            continue;
+        }
+        float sceneZ = texture(sceneDepth, samplePixel / screenSize).r;
+        if (nearestNdcZ <= sceneZ)
+        {
+            visible = true;
+        }
+    }
+    if (!visible)
+    {
+        return;
+    }
+
+    ivec2 lo = ivec2(floor(pixelCenter - pixelRadius));
+    ivec2 hi = ivec2(ceil(pixelCenter + pixelRadius));
+    atomicMin(boundsMinX, lo.x);
+    atomicMin(boundsMinY, lo.y);
+    atomicMax(boundsMaxX, hi.x);
+    atomicMax(boundsMaxY, hi.y);
+    atomicAdd(visibleCount, 1u);
+}

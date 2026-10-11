@@ -1,0 +1,88 @@
+name: Eden release
+
+# Publishes tester builds. Run it by pushing a version tag:
+#     git tag v0.01 && git push origin v0.01
+# (or start it by hand from the Actions tab - then it builds and attaches the
+# zips to the run as downloadable artifacts only, without creating a Release).
+# Needs no secrets: it uses the built-in GITHUB_TOKEN.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # create the GitHub Release and attach files to it
+
+jobs:
+  windows:
+    name: Package Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Vulkan SDK
+        uses: jakoch/install-vulkan-sdk-action@v1
+        with:
+          vulkan_version: latest
+          install_runtime: false
+          cache: true
+          stripdown: true
+      - name: Build (Release)
+        run: |
+          cmake -S . -B build -A x64
+          cmake --build build --config Release --parallel
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/Eden-Windows | Out-Null
+          Copy-Item -Recurse -Force build/Release/* dist/Eden-Windows/
+          Get-ChildItem dist/Eden-Windows -Include *.pdb,*.ilk -Recurse | Remove-Item -Force
+          Compress-Archive -Path dist/Eden-Windows/* -DestinationPath dist/Eden-Windows.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Eden-Windows
+          path: dist/Eden-Windows.zip
+
+  linux:
+    name: Package Linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential libvulkan-dev glslang-tools zip \
+            libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev
+      - name: Build (Release)
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel
+      - name: Package
+        run: |
+          mkdir -p dist/Eden-Linux
+          cp build/Eden dist/Eden-Linux/
+          cp -r build/Assets build/Shaders dist/Eden-Linux/
+          (cd dist && zip -r Eden-Linux.zip Eden-Linux)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Eden-Linux
+          path: dist/Eden-Linux.zip
+
+  publish:
+    name: Create GitHub Release
+    # Only for tag pushes; manual runs stop after the artifacts above.
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/Eden-Windows.zip
+            dist/Eden-Linux.zip
+          generate_release_notes: true

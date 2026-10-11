@@ -131,25 +131,38 @@ namespace Eden
                 glm::mat4 model = transform.GetModelMatrix();
                 obj.invModel = glm::inverse(model);
 
-                // Object-local AABB centered on zero (-halfExtent to
-                // +halfExtent), NOT VoxelVolumeDesc's own (0,0,0)-origin
-                // convention - the density field's sample grid still
-                // starts at local (0,0,0) internally (see
-                // SampleSignedDistanceLocal in raymarch.frag, which
-                // takes a field-local position), but the OBJECT's AABB
-                // as seen from world space is shifted by -halfExtent so
-                // that TransformComponent::position (the object's
-                // center) lands in the middle of it. See localOffset
-                // below for the actual shift applied before sampling.
+                // Object-local AABB is NOT assumed symmetric around
+                // TransformComponent::position - it's whatever
+                // GetVolumeBounds actually reports, shifted into
+                // object-local space. This used to be computed as
+                // ±(fieldExtent*0.5), i.e. assuming the registered field
+                // is exactly centered on the object's TransformComponent
+                // position - which is only true when chunkDims/voxelSize
+                // happen to add up to exactly 2x the shape's own
+                // halfExtents+margin, with zero slack. They usually
+                // don't (see e.g. ProcessWorkpieceSpawnInput's own fit-
+                // check comment, which deliberately sizes the field with
+                // slack to avoid a DIFFERENT bug - clipping), so this was
+                // silently sampling the wrong region of the density field
+                // for any box whose registered field wasn't perfectly
+                // symmetric. This is the second half of the same bug
+                // SpawnRaymarchBox's box-seeding math had (see that
+                // function's own comment on the fix there) - fixing only
+                // the seeding side left carving and rendering
+                // disagreeing about where the box's center actually was,
+                // instead of both being wrong together. GetVolumeBounds
+                // (bounds.worldMin == VoxelVolumeDesc::origin exactly -
+                // see that function's own implementation) is the one
+                // already-correct source of truth every other consumer
+                // (Carve, RaycastSurfaceSegments, collision) uses; this
+                // now uses the same one instead of re-deriving its own,
+                // symmetry-assuming answer.
+                Eden::VoxelSystemGPU::VolumeBounds bounds = voxelSystem.GetVolumeBounds(handle);
+                obj.localMin = bounds.worldMin - transform.position;
+                obj.localMax = bounds.worldMax - transform.position;
+                obj.fieldOffset = transform.position - bounds.worldMin; // see raymarch.frag's SampleSignedDistanceLocal: fieldPos = localPos + fieldOffset must equal worldPos - desc.origin
                 glm::ivec3 sampleDims = voxelSystem.GetSampleDims(handle);
                 float voxelSize = voxelSystem.GetVoxelSize(handle);
-                glm::ivec3 voxelDims = sampleDims - glm::ivec3(1); // SampleDims() = VoxelDims() + 1, see VoxelVolumeDesc
-                glm::vec3 fieldExtent = glm::vec3(voxelDims) * voxelSize;
-                glm::vec3 halfExtent = fieldExtent * 0.5f;
-
-                obj.localMin = -halfExtent;
-                obj.localMax = halfExtent;
-                obj.fieldOffset = halfExtent; // added back before sampling the density field - see raymarch.frag's use of fieldOffset
                 obj.voxelSize = voxelSize;
                 obj.sampleDims = sampleDims;
                 obj.tintColor = tint.tintColor;

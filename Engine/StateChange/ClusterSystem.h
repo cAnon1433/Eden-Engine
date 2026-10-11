@@ -17,6 +17,22 @@ namespace Eden
     {
         std::vector<glm::vec3> positions;
         std::vector<uint32_t> particleIndices;
+
+        // Chemical ID round-trip (see VoxelSystemGPU::SetChemicalId's
+        // comment) - a cluster can genuinely mix chemicals (see
+        // FindReformClusters' own comment on why clustering doesn't
+        // check chemical match), so there's no single "correct" chemical
+        // to harden into. dominantChemicalId is simply whichever
+        // chemical has the most particles in this cluster - a
+        // deliberately simple majority vote, not a real alloy/mixture
+        // model (that's future work, same category as chemical
+        // reactions). averageColor is the mean of every particle's OWN
+        // current (diffused) color, which is usually more accurate than
+        // dominantChemicalId's base color for a cluster that's been
+        // sitting mixed for a while - see ReformSystem for how these two
+        // get used together.
+        uint32_t dominantChemicalId = 0;
+        glm::vec4 averageColor{ 1.0f, 1.0f, 1.0f, 1.0f };
     };
 
     // Reform-detection half of the melt/reform pipeline (see the
@@ -35,13 +51,20 @@ namespace Eden
     class ClusterSystem
     {
     public:
-        // Reads back every active particle's position + heat, keeps
-        // only particles with 0 <= heat <= GPU_HEAT_REFORM_THRESHOLD
-        // (see ParticleGPUTypes.h - excludes GPU_HEAT_NOT_MELTED
-        // particles automatically, they're never reform candidates),
-        // then flood-fills those into connected components using a
-        // uniform grid keyed at clusterRadius (two cooled particles
-        // within clusterRadius of each other join the same cluster).
+        // Reads back every active particle's position + heat + chemical
+        // ID, keeps only particles whose chemical actually hardens at
+        // all (hardeningThreshold >= 0 - see ChemicalPropertiesGPU's own
+        // comment; a negative threshold means "never hardens", e.g. an
+        // Aqua-like chemical) AND whose heat has cooled to/below that
+        // threshold - any particle can qualify now, regardless of how it
+        // was created (see GPU_HEAT_NOT_MELTED's comment in
+        // ParticleGPUTypes.h for what used to gate this per-particle
+        // instead of per-chemical). Then flood-fills those into connected
+        // components using a uniform grid keyed at clusterRadius (two
+        // cooled particles within clusterRadius of each other join the
+        // same cluster, REGARDLESS of whether they're the same chemical -
+        // see FindReformClusters' own comment on why that's an explicit,
+        // documented simplification, not an oversight).
         // Returns every component with at least minClusterSize
         // particles - deliberately no upper limit or "best cluster"
         // picking for this pass (see planning notes: single-material,

@@ -24,8 +24,10 @@ layout(std430, binding = 4) readonly buffer ForcesBuffer { vec4 forces[]; };
 // Heat/cooldown state (Eden Particle State Transitions). Written here
 // (the only compute pass that touches it, same "one writer" reasoning
 // as positions/velocities above) and read later by clustering/reform.
-// GPU_HEAT_NOT_MELTED (-1.0) means "not part of the melt system, skip
-// decay entirely" - see ParticleGPUTypes.h.
+// Every particle decays/conducts heat unconditionally now - hardening
+// eligibility is gated per-CHEMICAL (ChemicalPropertiesGPU::hardeningThreshold,
+// see ClusterSystem::FindReformClusters), not by a per-particle sentinel
+// anymore. See GPU_HEAT_NOT_MELTED's comment in ParticleGPUTypes.h.
 layout(std430, binding = 8) buffer HeatBuffer { float heat[]; };
 
 // VoxelSystemGPU's single shared density buffer (see that class's
@@ -37,6 +39,14 @@ layout(std430, binding = 8) buffer HeatBuffer { float heat[]; };
 // VkBuffer, bound once at ParticleSystemGPU::Init time (see
 // CreateComputeDescriptors), not per-frame.
 layout(std430, binding = 9) readonly buffer DensityBuffer { float voxelDensity[]; };
+
+// Color diffusion (Chemical ID base build) - Colors is read-write here
+// (the only pass that writes it, same "one writer" reasoning as
+// positions/velocities/heat above); ColorsAvg is particle_force.comp's
+// scratch output (see that shader's ColorsAvgBuffer comment), read-only
+// from this pass's point of view.
+layout(std430, binding = 11) buffer ColorsBuffer { vec4 colors[]; };
+layout(std430, binding = 12) readonly buffer ColorsAvgBuffer { vec4 colorsAvg[]; };
 
 struct ColliderGPU
 {
@@ -533,6 +543,18 @@ void main()
     const float kColdSurfaceBand = 0.15;
     float discreteRejectMargin = max(sim.particleRadius, kColdSurfaceBand);
 
+    // kConductionRate is a fraction-per-second pulled toward the
+    // neighbor average, not a physically-measured constant -
+    // deliberately fast relative to heatDecayRate (0.15/sec) so a
+    // resting pool homogenizes well before any of it finishes cooling.
+    // Clamped to 1.0 (at point of use) so a single substep can't
+    // overshoot past the neighbor average. Declared here (function
+    // scope, before first use) rather than down in Heat conduction
+    // because Color diffusion further below reuses the exact same
+    // constant - see that block's comment for why sharing one rate
+    // makes sense for a base build.
+    const float kConductionRate = 3.0;
+
     // Plain linear scan over every registered collider, with the same
     // cheap bounding-sphere reject the sweep loop above uses - NOT the
     // hash-indexed per-cell bitmask this briefly used. That approach is
@@ -597,45 +619,62 @@ void main()
     // planning notes: nothing elaborate yet) - passive decay everywhere,
     // extra decay within a fixed band of any collider surface, using the
     // nearest-surface distance the penetration loop above already
-    // computed for free.
+    // computed for free. Unconditional now for every particle - see
+    // GPU_HEAT_NOT_MELTED's comment for what the old "only if
+    // particleHeat >= 0.0" gate meant and why that per-particle
+    // exemption no longer exists (any particle can cool and become
+    // reform-eligible, gated only by its own chemical's
+    // hardeningThreshold - see ClusterSystem::FindReformClusters, not
+    // by anything checked here).
     float particleHeat = heat[i];
-    if (particleHeat >= 0.0)
-    {
-        // --- Heat conduction (toward SPH neighbors) ---
-        // Pull this particle's heat toward its neighborhood average
-        // (computed in particle_force.comp - see forces[i].w's comment
-        // there) BEFORE applying decay below. Without this, a resting
-        // pool cools patchily: only particles directly touching a
-        // collider get the cold-surface decay bonus, so a puddle
-        // crosses the reform threshold as a scattered set of isolated
-        // cold particles instead of together - see ReformSystem's
-        // comment on minClusterSize for the downstream symptom
-        // ("hardens into individual balls"). Conducting toward neighbors
-        // first means a cold patch pulls its warm neighbors down with
-        // it, so the WHOLE contiguous pool converges toward reform-
-        // eligibility together, not just whichever particles happen to
-        // be touching the floor.
-        //
-        // kConductionRate is a fraction-per-second pulled toward the
-        // neighbor average, not a physically-measured constant -
-        // deliberately fast relative to heatDecayRate (0.15/sec) so a
-        // resting pool homogenizes well before any of it finishes
-        // cooling. Clamped to 1.0 so a single substep can't overshoot
-        // past the neighbor average.
-        const float kConductionRate = 3.0;
-        float neighborAvgHeat = forces[i].w;
-        particleHeat += (neighborAvgHeat - particleHeat) * min(kConductionRate * sim.dt, 1.0);
 
-        // kColdSurfaceBand declared up near the discrete penetration
-        // loop above (the broad-phase reject there needs it too) - this
-        // block just reuses it, not a second declaration.
-        float decay = sim.heatDecayRate;
-        if (nearestSurfaceDistance < kColdSurfaceBand)
-        {
-            decay *= sim.heatColdMultiplier;
-        }
-        heat[i] = max(particleHeat - decay * sim.dt, 0.0);
+    // --- Heat conduction (toward SPH neighbors) ---
+    // Pull this particle's heat toward its neighborhood average
+    // (computed in particle_force.comp - see forces[i].w's comment
+    // there) BEFORE applying decay below. Without this, a resting
+    // pool cools patchily: only particles directly touching a
+    // collider get the cold-surface decay bonus, so a puddle
+    // crosses the reform threshold as a scattered set of isolated
+    // cold particles instead of together - see ReformSystem's
+    // comment on minClusterSize for the downstream symptom
+    // ("hardens into individual balls"). Conducting toward neighbors
+    // first means a cold patch pulls its warm neighbors down with
+    // it, so the WHOLE contiguous pool converges toward reform-
+    // eligibility together, not just whichever particles happen to
+    // be touching the floor.
+    //
+    // kConductionRate is declared at file scope (see top of file) -
+    // color diffusion below reuses the exact same constant.
+    float neighborAvgHeat = forces[i].w;
+    particleHeat += (neighborAvgHeat - particleHeat) * min(kConductionRate * sim.dt, 1.0);
+
+    // kColdSurfaceBand declared up near the discrete penetration
+    // loop above (the broad-phase reject there needs it too) - this
+    // block just reuses it, not a second declaration.
+    float decay = sim.heatDecayRate;
+    if (nearestSurfaceDistance < kColdSurfaceBand)
+    {
+        decay *= sim.heatColdMultiplier;
     }
+    heat[i] = max(particleHeat - decay * sim.dt, 0.0);
+
+    // --- Color diffusion (toward SPH neighbors) ---
+    // Same pull-toward-neighborhood-average shape as heat conduction
+    // above, applied to color instead of heat, and UNCONDITIONALLY (no
+    // "particleHeat >= 0.0" gate - every particle's color diffuses, not
+    // just melt-system particles). This is the actual mechanism behind
+    // "drop a dark liquid into a light one and watch it spread": each
+    // substep, every particle's displayed color moves a little further
+    // toward whatever its SPH neighborhood's average color already was
+    // (computed in particle_force.comp - see ColorsAvgBuffer's comment
+    // there). Same kConductionRate as heat - there's no principled reason
+    // color and heat should diffuse at different rates for a base build,
+    // and reusing the constant means one already-tuned "how fast does
+    // this system homogenize" knob instead of a second one to guess at.
+    vec3 currentColor = colors[i].rgb;
+    vec3 neighborAvgColor = colorsAvg[i].rgb;
+    vec3 mixedColor = currentColor + (neighborAvgColor - currentColor) * min(kConductionRate * sim.dt, 1.0);
+    colors[i] = vec4(mixedColor, 1.0);
 
     velocities[i] = vec4(velocity, 0.0);
     positions[i] = vec4(position, 0.0);

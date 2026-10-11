@@ -1,4 +1,5 @@
 #include "Engine/Renderer/Renderer.h"
+#include "Engine/Core/Profiler.h"
 #include "Engine/ECS/Registry.h"
 #include "Engine/ECS/Components/TransformComponent.h"
 #include "Engine/ECS/Components/MeshComponent.h"
@@ -20,17 +21,25 @@
 #include "Engine/StateChange/MeltSystem.h"
 #include "Engine/StateChange/ReformSystem.h"
 
+#ifndef GLFW_INCLUDE_NONE // GLFW_INCLUDE_NONE + _VULKAN are also set project-wide in CMakeLists.txt
+#define GLFW_INCLUDE_NONE // Eden never uses OpenGL - don't require its headers
+#endif
+#ifndef GLFW_INCLUDE_VULKAN
 #define GLFW_INCLUDE_VULKAN
+#endif
 #include <GLFW/glfw3.h>
 #include <imgui.h>
 
 #include <iostream>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
+#include <cstring>
 #include <cmath>
 #include <algorithm>
 #include <optional>
 #include <limits>
+#include <unordered_map>
 
 namespace
 {
@@ -46,7 +55,12 @@ namespace
     // frame. Capping it means physics visibly slows down/skips instead of
     // permanently falling further behind and locking up the app.
     constexpr float FIXED_TIMESTEP = 1.0f / 60.0f;
-    constexpr int MAX_PHYSICS_STEPS_PER_FRAME = 5;
+    // Runtime-adjustable (Performance panel). 3 instead of the old 5: each
+    // catch-up step also queues a full SPH substep batch on the GPU, so on a
+    // slow machine a high cap makes a slow frame even slower (the "spiral").
+    // 3 still keeps the sim real-time down to 20 fps; below that it
+    // deliberately runs slow-motion instead of dragging the frame time up.
+    int MAX_PHYSICS_STEPS_PER_FRAME = 3;
 
     bool g_FirstMouse = true;
     double g_LastMouseX = 0.0;
@@ -61,10 +75,11 @@ namespace
     // anything.
     bool g_CursorLocked = true;
 
-    // Edge-tracked (not held-state) so a carve fires once per click, not
-    // once per frame the button happens to be down - see
-    // ProcessVoxelCarveInput's own comment on why continuous "drill"
-    // carving isn't what this does yet.
+    // Tracks the edge (press vs. already-down) so the FIRST carve of a
+    // click still fires instantly - ProcessVoxelCarveInput now also
+    // supports holding the button down for continuous carving after that
+    // first hit, rate-limited by its own s_CarveHoldAccumulator rather
+    // than firing every frame - see that function's own comment.
     bool g_CarveMouseWasDown = false;
 
     // Edge-tracked the same way g_CarveMouseWasDown is - M triggers one
@@ -74,6 +89,10 @@ namespace
     // Edge-tracked the same way g_MeltKeyWasDown is - H triggers one
     // reform pass per press.
     bool g_ReformKeyWasDown = false;
+
+    // Edge-tracked the same way g_ReformKeyWasDown is - B spawns one
+    // workpiece block per press. See ProcessWorkpieceSpawnInput.
+    bool g_WorkpieceKeyWasDown = false;
 
     // TEMP DEBUG - remove after diagnosing. J dumps a vertical column of
     // live SampleSignedDistance readings through the original test
@@ -477,8 +496,21 @@ namespace
 
     void ProcessVoxelCarveInput(GLFWwindow* window, Eden::Renderer& renderer, Eden::Registry& registry,
                                  Eden::VoxelSystemGPU& voxelSystem, const std::vector<Eden::VoxelVolumeHandle>& candidates,
-                                 const std::vector<Eden::VoxelVolumeHandle>& terrainTileHandles)
+                                 const std::vector<Eden::VoxelVolumeHandle>& terrainTileHandles,
+                                 const std::vector<Eden::VoxelVolumeHandle>& workpieceVolumes, float deltaTime)
     {
+        // Rate-limits REPEAT carves while the button is held - the FIRST
+        // carve of a click still fires the instant the button goes down
+        // (see justPressed below), this only paces what happens if you
+        // keep holding past that. Same "accumulate real time, not frames"
+        // reasoning as ProcessPourInput's own accumulator - without it,
+        // holding the button at 144+ fps would re-carve (and re-march/
+        // re-RecomputeExactDistances/re-wake) every single frame, which
+        // is far more aggressive than a "hold to keep drilling" feel
+        // needs and costs real GPU time for no visible benefit between
+        // carves that close together.
+        static float s_CarveHoldAccumulator = 0.0f;
+
         if (!g_CursorLocked)
         {
             // A click made while the cursor is free (interacting with
@@ -486,11 +518,35 @@ namespace
             // the camera back - reset the edge-tracker so re-locking
             // doesn't fire a carve from a stale "was down" state.
             g_CarveMouseWasDown = false;
+            s_CarveHoldAccumulator = 0.0f;
             return;
         }
 
         bool mouseDown = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
-        if (mouseDown && !g_CarveMouseWasDown)
+        bool justPressed = mouseDown && !g_CarveMouseWasDown;
+
+        bool shouldCarve = false;
+        if (justPressed)
+        {
+            shouldCarve = true;
+            s_CarveHoldAccumulator = 0.0f;
+        }
+        else if (mouseDown)
+        {
+            constexpr float kCarveHoldIntervalSeconds = 0.1f; // 10/sec while held - see this function's own comment above
+            s_CarveHoldAccumulator += deltaTime;
+            if (s_CarveHoldAccumulator >= kCarveHoldIntervalSeconds)
+            {
+                shouldCarve = true;
+                s_CarveHoldAccumulator = 0.0f;
+            }
+        }
+        else
+        {
+            s_CarveHoldAccumulator = 0.0f;
+        }
+
+        if (shouldCarve)
         {
             Eden::Camera& camera = renderer.GetCamera();
 
@@ -508,8 +564,29 @@ namespace
             {
                 Eden::VoxelVolumeHandle voxelVolume = *target;
 
+                // Mold workpieces (B key) get a genuinely smaller brush -
+                // kCarveRadius=0.3 was tuned against terrain/the test
+                // sphere, both far coarser objects than a workpiece's
+                // fine 0.03 voxelSize grid (see ProcessWorkpieceSpawnInput's
+                // own comment). At that resolution 0.3 is still a very
+                // blunt tool - kWorkpieceCarveRadius is about a third of
+                // it, small enough to carve real mold detail while
+                // staying several voxels across (0.1 / 0.03 voxelSize =
+                // ~3.3 voxels diameter-equivalent - not so small it goes
+                // ragged, not so big it's just the general brush again).
+                bool isWorkpieceTarget = false;
+                for (Eden::VoxelVolumeHandle workpiece : workpieceVolumes)
+                {
+                    if (workpiece == voxelVolume)
+                    {
+                        isWorkpieceTarget = true;
+                        break;
+                    }
+                }
                 constexpr float kCarveRadius = 0.3f; // world units - back down from 1.5. That bump was never a real fix, just a workaround that traded away precision - RecomputeExactDistances (called below) is what actually fixes stale-margin false collisions now, so radius can go back to a size that's actually useful for detail carving (a bite-sized chunk, not the whole sphere).
-                float carveStep = kCarveRadius * 1.2f; // slight overlap so a tunnel has no gaps
+                constexpr float kWorkpieceCarveRadius = 0.1f;
+                float effectiveCarveRadius = isWorkpieceTarget ? kWorkpieceCarveRadius : kCarveRadius;
+                float carveStep = effectiveCarveRadius * 1.2f; // slight overlap so a tunnel has no gaps
 
                 // Every volume actually touched this gesture (primary
                 // target plus any terrain-tile neighbor CarveAcrossTerrainTiles
@@ -552,7 +629,7 @@ namespace
                         for (float d = 0.0f; d <= segmentLength; d += carveStep)
                         {
                             recordTouched(CarveAcrossTerrainTiles(voxelSystem, terrainTileHandles, voxelVolume,
-                                                                   entry + segmentDir * d, kCarveRadius));
+                                                                   entry + segmentDir * d, effectiveCarveRadius));
                         }
                     }
                 }
@@ -561,7 +638,7 @@ namespace
                     // Single bite at the FIRST (nearest) segment's entry
                     // point only - the easy-to-test default.
                     recordTouched(CarveAcrossTerrainTiles(voxelSystem, terrainTileHandles, voxelVolume,
-                                                           segments.front().first, kCarveRadius));
+                                                           segments.front().first, effectiveCarveRadius));
                 }
 
                 // One march per touched volume for the whole click's
@@ -570,21 +647,63 @@ namespace
                 // from MarchDirtyChunks.
                 for (Eden::VoxelVolumeHandle touched : touchedVolumes)
                 {
-                    voxelSystem.MarchDirtyChunks(touched);
+                    // Workpieces are raymarch-only (SpawnRaymarchBox adds
+                    // RaymarchVolumeComponent, not a mesh-source-list
+                    // entry - see the render source-list construction
+                    // elsewhere in this file) - their marched mesh has NO
+                    // consumer, ever. Worse than just wasted per-carve
+                    // work: SeedBox marks a freshly-spawned volume's
+                    // ENTIRE chunk set dirty with no march to consume it
+                    // (see SeedBox's own comment), so the first real
+                    // MarchDirtyChunks call on a workpiece - which used to
+                    // be whichever carve happened to touch it first -
+                    // inherited that whole backlog as one expensive,
+                    // mostly-non-early-exiting march. That backlog, not
+                    // carve size, was the actual ~1 second freeze on a
+                    // single workpiece carve. DiscardPendingMarch clears
+                    // the same bookkeeping with zero GPU work instead.
+                    bool isWorkpieceTarget = false;
+                    for (Eden::VoxelVolumeHandle workpiece : workpieceVolumes)
+                    {
+                        if (workpiece == touched)
+                        {
+                            isWorkpieceTarget = true;
+                            break;
+                        }
+                    }
+                    if (isWorkpieceTarget)
+                    {
+                        voxelSystem.DiscardPendingMarch(touched);
+                    }
+                    else
+                    {
+                        voxelSystem.MarchDirtyChunks(touched);
+                    }
 
                     // The actual fix for stale-margin false collisions (see
                     // RecomputeExactDistances' own comment for the full
                     // mechanism) - run once per completed carve gesture,
                     // same batching reasoning as MarchDirtyChunks above, not
                     // once per carve ball. Correctness no longer depends on
-                    // carve radius or coverage after this runs.
+                    // carve radius or coverage after this runs. Still needed
+                    // for workpieces too - collision reads the density field
+                    // directly regardless of whether a mesh was ever built.
                     voxelSystem.RecomputeExactDistances(touched);
 
-                    // TEMP DEBUG - testing whether marching cubes' classic
-                    // face-ambiguity case is actually present at carve
-                    // sites before committing to a table rewrite over it.
-                    // Remove once the crack bug is understood.
-                    voxelSystem.DebugScanAmbiguousCells(touched);
+                    // DebugScanAmbiguousCells is deliberately NOT called
+                    // here anymore. It was a full O(voxelDims.x*y*z) scan
+                    // over the WHOLE volume, run unconditionally on every
+                    // single carve - cheap on terrain's small tiles, but a
+                    // second (separate from RecomputeExactDistances)
+                    // O(whole field) cost on anything fine-grained, like a
+                    // mold workpiece's ~786k cells. It was already labeled
+                    // "TEMP DEBUG... remove once the crack bug is
+                    // understood" - it is: the crack bug it was
+                    // investigating is the marching-cubes face-ambiguity
+                    // case, and the confirmed fix (Lewiner MC33
+                    // disambiguated tables) is already in place. The
+                    // function itself is untouched below, still callable
+                    // by hand if this ever needs re-diagnosing.
 
                     // See WakeSleepingBodiesNearVolume's comment - a body
                     // asleep on this volume needs to be told its shape just
@@ -607,15 +726,30 @@ namespace
     // Melt() entry point) - there's nothing "final" about having gone
     // through reform once. One-shot per press, same edge-tracking shape
     // as the carve mouse button above.
-    void ProcessMeltInput(GLFWwindow* window, Eden::Renderer& renderer, Eden::Registry& registry,
+    // Returns the handle that got unregistered this call, if any - the
+    // caller (main loop) needs to immediately drop it from
+    // reformedVolumes too, not wait for that vector's own once-per-frame
+    // pruning: that pruning runs at the START of a frame, but the
+    // render-list-building code further down THIS SAME frame also
+    // iterates reformedVolumes (see the raymarch object-list build near
+    // the bottom of the main loop) - a volume unregistered here and left
+    // in that vector until next frame's prune would get used again by
+    // that code before ever being caught, which is exactly how the first
+    // version of this fix still crashed (a stale-handle abort, correctly
+    // caught by UnregisterVolume's own generational safety check, but
+    // several hundred lines further into the very frame that freed it).
+    std::optional<Eden::VoxelVolumeHandle> ProcessMeltInput(GLFWwindow* window, Eden::Renderer& renderer, Eden::Registry& registry,
                            Eden::VoxelSystemGPU& voxelSystem, const std::vector<Eden::VoxelVolumeHandle>& candidates,
-                           Eden::ParticleSystemGPU& particleSystem)
+                           Eden::ParticleSystemGPU& particleSystem, Eden::VoxelVolumeHandle ecsRegisteredVolume,
+                           std::unordered_map<Eden::VoxelVolumeHandle, Eden::Entity>& reformedVolumeEntities)
     {
         if (!g_CursorLocked)
         {
             g_MeltKeyWasDown = false;
-            return;
+            return std::nullopt;
         }
+
+        std::optional<Eden::VoxelVolumeHandle> unregistered;
 
         bool keyDown = glfwGetKey(window, GLFW_KEY_M) == GLFW_PRESS;
         if (keyDown && !g_MeltKeyWasDown)
@@ -646,10 +780,47 @@ namespace
                 // Melt() clears the ENTIRE volume (ClearVolume) - an even
                 // bigger shape change than a single carve bite, same
                 // reasoning as WakeSleepingBodiesNearVolume's comment.
+                // Handle is still valid here - only unregistered below,
+                // AFTER this call finishes reading it.
                 WakeSleepingBodiesNearVolume(registry, voxelSystem, *target);
+
+                // Closes the long-flagged "melt never frees the volume it
+                // emptied" gap. Only done for volumes OTHER than
+                // ecsRegisteredVolume (the original test sphere, which
+                // has a real ECS entity holding this same handle - see
+                // this function's own header comment for the
+                // RaymarchSystem hazard that keeps that specific case
+                // deferred).
+                //
+                // Every OTHER meltable volume (everything in
+                // reformedVolumes) DOES have a real ECS entity too -
+                // RegisterVoxelPhysicsEntity makes one for every volume
+                // ReformSystem::Reform produces, specifically so it has
+                // collision (see that function's own comment). A previous
+                // version of this comment claimed otherwise and only freed
+                // the GPU volume here, leaving that entity's
+                // ColliderComponent/VoxelVolumeComponent pointing at a
+                // freed (and later reused) handle - CollisionSystem::Step
+                // would reach it on the very next physics step and hit the
+                // stale-handle fatal error. reformedVolumeEntities (built
+                // in ProcessReformInput) is what lets this function find
+                // that same entity and destroy it here too.
+                if (*target != ecsRegisteredVolume)
+                {
+                    voxelSystem.UnregisterVolume(*target);
+                    unregistered = *target;
+
+                    auto it = reformedVolumeEntities.find(*target);
+                    if (it != reformedVolumeEntities.end())
+                    {
+                        registry.DestroyEntity(it->second);
+                        reformedVolumeEntities.erase(it);
+                    }
+                }
             }
         }
         g_MeltKeyWasDown = keyDown;
+        return unregistered;
     }
 
     // H key: harden/reform smoke test - runs ReformSystem::Reform over
@@ -870,9 +1041,16 @@ namespace
         AnalyticBox
     };
 
+    // voxelSize/chunkDims default to this function's original hardcoded
+    // values (0.08, (2,2,2)) - every existing call site above passes
+    // neither and gets IDENTICAL behavior to before. Parameterized so
+    // ProcessWorkpieceSpawnInput's mold workpiece (see that function's
+    // comment) can ask for a much finer grid on a much smaller box,
+    // rather than needing a near-duplicate of this whole function.
     Eden::Entity SpawnRaymarchBox(Eden::Registry& registry, Eden::VoxelSystemGPU& voxelSystem,
                                    const glm::vec3& worldCenter, const glm::vec3& halfExtents,
-                                   const glm::vec3& tintColor, RaymarchBoxCollision collision)
+                                   const glm::vec3& tintColor, RaymarchBoxCollision collision,
+                                   float voxelSize = 0.08f, glm::ivec3 chunkDims = glm::ivec3(2, 2, 2))
     {
         // Volume sized with a small margin beyond halfExtents so
         // SeedBox's box surface sits comfortably inside the field
@@ -885,13 +1063,33 @@ namespace
 
         Eden::VoxelVolumeDesc desc;
         desc.origin = worldCenter - fieldHalfExtents; // VoxelVolumeDesc::origin is a min corner, unrelated to this entity's own TransformComponent convention
-        desc.voxelSize = 0.08f; // finer than the test sphere's 0.15 - boxes read as boxes (not visibly faceted) at a coarser voxel size, but this stays consistent with SDF's exact-surface intent
-        desc.chunkDims = glm::ivec3(2, 2, 2);
+        desc.voxelSize = voxelSize;
+        desc.chunkDims = chunkDims;
         Eden::VoxelVolumeHandle handle = voxelSystem.RegisterVolume(desc);
 
-        glm::vec3 fieldExtent = glm::vec3(desc.VoxelDims()) * desc.voxelSize;
-        glm::vec3 fieldLocalCenter = fieldExtent * 0.5f;
-        voxelSystem.SeedBox(handle, fieldLocalCenter, halfExtents);
+        // worldCenter's position in the field's own local coordinate
+        // system is fieldHalfExtents, by definition of desc.origin two
+        // lines up (localPos = worldPos - desc.origin, so worldCenter -
+        // desc.origin = worldCenter - (worldCenter - fieldHalfExtents) =
+        // fieldHalfExtents). This used to be computed instead as HALF THE
+        // REGISTERED FIELD'S OWN SIZE (VoxelDims() * voxelSize * 0.5) -
+        // which only equals fieldHalfExtents when the registered field
+        // happens to be exactly 2*fieldHalfExtents with zero slack. It
+        // usually isn't: chunkDims/voxelSize are chosen to comfortably
+        // CLEAR the minimum required span (see the fit-check comments at
+        // every SpawnRaymarchBox call site that sizes its own chunkDims,
+        // e.g. ProcessWorkpieceSpawnInput's), so the registered field is
+        // routinely larger than the tight minimum - which silently seeded
+        // the box's shape off-center from worldCenter by however much
+        // slack that call's field had. Harmless (a few cm, unnoticed) for
+        // the small decorative/wall boxes that never get carved - a real,
+        // consciously-felt offset for the workpiece specifically, both
+        // because its own fit margin is larger in absolute terms and
+        // because it's the one thing here players actually aim a carve
+        // raycast at (which reads the density field directly, so it was
+        // faithfully reporting where the WRONGLY-seeded surface actually
+        // was - the raycast itself was never the bug).
+        voxelSystem.SeedBox(handle, fieldHalfExtents, halfExtents);
         // No MarchDirtyChunks - see the raymarch smoke-test sphere's
         // identical comment above for why a raymarch-only volume never
         // needs marching-cubes geometry generated.
@@ -991,8 +1189,211 @@ namespace
         }
     }
 
+    // P key (held, not edge-triggered like carve/melt/harden - a pour is
+    // meant to be a continuous stream for as long as you hold it down):
+    // spawns a small, steady trickle of the currently-selected chemical
+    // (see spawnChemicalId in main()'s ImGui panel - same variable, now
+    // hoisted above the loop so both this function and that panel can
+    // read/write it) at a point out in front of the camera, rather than
+    // EmitBox's old fixed-in-world-space particleSpawnOrigin. This is
+    // what actually makes molds workable - see the planning discussion
+    // this came out of: a full 1x1x1 block dropped from a fixed height
+    // (the old EmitBox call still exists below, untouched, for the
+    // "dump a big pool" case) splashes most of itself out of anything
+    // mold-sized. A small, slow, aimed stream can actually be walked
+    // into a carved cavity instead of dropped on top of it.
+    //
+    // Rate-limited by a per-call time accumulator (kPourIntervalSeconds),
+    // NOT by "one EmitBox per frame" - at 144+ fps that would mean a
+    // fresh box of particles every ~7ms, far more per second than a
+    // trickle should be, and frame-rate-dependent besides. Accumulating
+    // real elapsed time and only emitting once enough has built up keeps
+    // the pour rate constant regardless of framerate, same reasoning
+    // PhysicsSystem's fixed-timestep accumulator already applies to
+    // physics steps (see main()'s physicsAccumulator).
+    void ProcessPourInput(GLFWwindow* window, Eden::Renderer& renderer, Eden::ParticleSystemGPU& particleSystem,
+                           int chemicalId, float deltaTime)
+    {
+        static float s_PourAccumulator = 0.0f;
+
+        if (!g_CursorLocked)
+        {
+            // Same reasoning as ProcessVoxelCarveInput's g_CursorLocked
+            // gate - don't let a pour fire from residual key state the
+            // instant TAB re-locks the camera, and don't let the
+            // accumulator build up while the UI has focus (that would
+            // dump a burst of particles the moment the key check resumes).
+            s_PourAccumulator = 0.0f;
+            return;
+        }
+
+        bool pourKeyDown = glfwGetKey(window, GLFW_KEY_P) == GLFW_PRESS;
+        if (!pourKeyDown)
+        {
+            // Deliberately NOT resetting the accumulator to 0 here (only
+            // the cursor-unlock case above does that) - releasing and
+            // re-pressing P within less than one interval shouldn't get
+            // a free head start, but it also doesn't need punishing;
+            // simplest correct behavior is just "don't accumulate time
+            // you're not holding the key," which leaving it untouched
+            // already gives.
+            return;
+        }
+
+        s_PourAccumulator += deltaTime;
+
+        // Small enough that even a full-speed trickle reads as a stream
+        // of drops, not a hose - tuned against smoothingRadius's 0.6x
+        // equilibrium spacing (see EmitBox's own comment), not a round
+        // number: kPourBoxHalfExtent's box is about 1-2 particles wide
+        // per axis at that spacing, so each emit is a handful of
+        // particles, not a slug.
+        constexpr float kPourIntervalSeconds = 0.08f;
+        if (s_PourAccumulator < kPourIntervalSeconds)
+        {
+            return;
+        }
+        s_PourAccumulator = 0.0f;
+
+        Eden::Camera& camera = renderer.GetCamera();
+        glm::vec3 rayDir = glm::normalize(camera.Front);
+
+        // Same distance-in-front-of-camera idea as a carve/melt raycast,
+        // but a FIXED distance rather than FindTargetedVolume's actual
+        // surface hit - a pour point doesn't need to land exactly ON a
+        // surface (particles fall under gravity same as any other emit),
+        // it needs to be reachable INTO a cavity from outside it. Chosen
+        // to comfortably clear the carve brush's own reach
+        // (kCarveRadius=0.3, so a mold cavity carved at typical carve
+        // distances is well within this) without being so far the stream
+        // is already falling wildly by the time it's visible.
+        constexpr float kPourDistance = 1.5f;
+        glm::vec3 pourPoint = camera.Position + rayDir * kPourDistance;
+
+        // Small box, not a point - EmitBox needs a non-degenerate min/max
+        // to do its spacing-fill loop at all (min==max would only ever
+        // place exactly one particle regardless of spacing).
+        constexpr float kPourBoxHalfExtent = 0.08f;
+
+        // Gentle push in the aim direction, not zero velocity - reads as
+        // "coming out of a nozzle" rather than particles just appearing
+        // in midair. Small on purpose: this is a trickle, not a hose -
+        // gravity should dominate almost immediately after each drop
+        // spawns, which is exactly what lets it settle into a mold
+        // instead of splashing back out the way a fast/heavy stream would.
+        constexpr float kPourSpeed = 0.75f;
+        glm::vec3 pourVelocity = rayDir * kPourSpeed;
+
+        particleSystem.EmitBox(pourPoint - glm::vec3(kPourBoxHalfExtent), pourPoint + glm::vec3(kPourBoxHalfExtent),
+                                0.0f, pourVelocity, static_cast<uint32_t>(chemicalId));
+    }
+
+    // B key (edge-triggered, one block per press - same shape as M/H, not
+    // held like the pour trickle): spawns a small, carvable slab a short
+    // distance in front of the camera, meant as an actual mold workpiece
+    // rather than digging into terrain.
+    //
+    // Why this exists at all, not just "carve terrain more finely":
+    // terrain's whole grid runs at kTerrainVoxelSize=0.3125 world units
+    // per voxel cell (see the terrain registration constants - this was
+    // bumped up from 0.625, terrain's own carve accuracy improved
+    // directly by that change) - lowering it further, all the way to
+    // mold-workpiece detail, would still multiply every terrain tile's
+    // voxel count by roughly (kTerrainVoxelSize/kWorkpieceVoxelSize)^3,
+    // on the order of 140x more voxels PER TILE, times 9 tiles - not a
+    // safe global change to make casually just to get one small object
+    // carvable in detail.
+    //
+    // A dedicated small object sidesteps that entirely: it needs its own
+    // grid only across its own small volume, not across 9 terrain tiles
+    // worth of world space. kWorkpieceVoxelSize/kWorkpieceChunkDims below
+    // give it 64x24x64 voxels across a 3x0.8x3-unit slab (wide and
+    // shallow on purpose - see kWorkpieceHalfExtents' own comment) -
+    // deliberately NOT pushed as fine as it could go; the ask was for a
+    // mold surface to carve a recognizable cavity into, not something
+    // precise enough to seat a perfect sphere, and every extra bit of
+    // resolution here is a cubic (not linear) cost. At this size that's
+    // ~0.4MB of CPU density field per spawned workpiece, and nothing
+    // currently despawns one (same known gap as before) - fine for a
+    // handful of workpieces in a session, worth knowing before spamming B
+    // dozens of times.
+    //
+    // Known rough edge, not hidden: SpawnRaymarchBox's collision path
+    // always registers a STATIC RigidBodyComponent (inverseMass=0) - a
+    // workpiece spawned in midair stays exactly where it's placed, it
+    // doesn't fall to the ground like a dynamic body would. Fine for
+    // "place it where you want to work," but worth knowing before
+    // wondering why it's floating.
+    void ProcessWorkpieceSpawnInput(GLFWwindow* window, Eden::Renderer& renderer, Eden::Registry& registry,
+                                     Eden::VoxelSystemGPU& voxelSystem, std::vector<Eden::VoxelVolumeHandle>& workpieceVolumes)
+    {
+        if (!g_CursorLocked)
+        {
+            g_WorkpieceKeyWasDown = false;
+            return;
+        }
+
+        bool workpieceKeyDown = glfwGetKey(window, GLFW_KEY_B) == GLFW_PRESS;
+        if (workpieceKeyDown && !g_WorkpieceKeyWasDown)
+        {
+            Eden::Camera& camera = renderer.GetCamera();
+
+            // Far enough out that the block doesn't spawn clipped around
+            // the camera itself, close enough to still be exactly where
+            // you're looking - same distance class as the pour point
+            // (ProcessPourInput's kPourDistance) for the same reason.
+            constexpr float kWorkpieceSpawnDistance = 2.0f;
+            glm::vec3 spawnCenter = camera.Position + glm::normalize(camera.Front) * kWorkpieceSpawnDistance;
+
+            // Width/depth (X/Z) bigger than the original 0.8-unit cube;
+            // height (Y) deliberately left alone - same 0.4 half-extent as
+            // before. A 3x0.8x3-unit slab reads as an actual mold surface
+            // to carve into rather than a single graspable block.
+            constexpr glm::vec3 kWorkpieceHalfExtents(1.5f, 0.4f, 1.5f);
+            // Halved resolution from the original 0.03/(16,6,16) - doubled
+            // voxelSize, halved chunkDims per axis, chosen so the field
+            // span comes out at the SAME physical size as before (see the
+            // fit check below), just at half the resolution: this was
+            // deliberately more detail than a mold needs (fine enough to
+            // carve a recognizably round cavity - "put a perfect sphere in
+            // it," as the ask put it), and at 8x the voxel count for no
+            // real benefit. The carve brush (kWorkpieceCarveRadius=0.1)
+            // still reads as several voxels across at this resolution, not
+            // a single ragged blob - just no longer fine enough to sculpt
+            // detail finer than the brush itself could ever place anyway.
+            constexpr float kWorkpieceVoxelSize = 0.06f;
+            // Same fit requirement as before, now checked per-axis since
+            // halfExtents is no longer a cube: chunkDims.axis *
+            // kVoxelChunkSize(8) * voxelSize >= 2*(halfExtents.axis +
+            // SpawnRaymarchBox's own kFieldMargin=0.2), or that axis's far
+            // face clips past the field boundary (see SpawnRaymarchBox's
+            // own comment on this exact failure mode - confirmed by
+            // direct calculation before picking these, not assumed).
+            // voxelSize doubled from 0.03, chunkDims halved per axis from
+            // (16,6,16) - deliberately lands on the SAME span as before
+            // (1.44 and 3.84 respectively), just at half the resolution:
+            //   Y: needs >= 2*(0.4+0.2)=1.2  -> chunkDims.y=3 gives 1.44 OK
+            //   X/Z: needs >= 2*(1.5+0.2)=3.4 -> chunkDims.x/z=8 gives
+            //        3.84 OK
+            // Anisotropic chunkDims for a wide-but-short volume is an
+            // established pattern already, not new to this project - see
+            // the terrain tiles' own kTerrainChunkDims{8,2,8}.
+            constexpr glm::ivec3 kWorkpieceChunkDims(8, 3, 8); // 64 x 24 x 64 voxels - ~0.4MB density field per workpiece (see this function's own header comment on why nothing despawns these yet)
+
+            Eden::Entity e = SpawnRaymarchBox(registry, voxelSystem, spawnCenter, kWorkpieceHalfExtents,
+                                               glm::vec3(0.75f, 0.72f, 0.68f), RaymarchBoxCollision::Voxel,
+                                               kWorkpieceVoxelSize, kWorkpieceChunkDims);
+
+            // SpawnRaymarchBox always adds VoxelVolumeComponent (see its
+            // own body) - no HasComponent guard needed before this.
+            workpieceVolumes.push_back(registry.GetComponent<Eden::VoxelVolumeComponent>(e).handle);
+        }
+        g_WorkpieceKeyWasDown = workpieceKeyDown;
+    }
+
     void ProcessReformInput(GLFWwindow* window, Eden::Registry& registry, Eden::ParticleSystemGPU& particleSystem,
-                             Eden::VoxelSystemGPU& voxelSystem, std::vector<Eden::VoxelVolumeHandle>& reformedVolumes)
+                             Eden::VoxelSystemGPU& voxelSystem, std::vector<Eden::VoxelVolumeHandle>& reformedVolumes,
+                             std::unordered_map<Eden::VoxelVolumeHandle, Eden::Entity>& reformedVolumeEntities)
     {
         if (!g_CursorLocked)
         {
@@ -1049,10 +1450,15 @@ namespace
             reformedVolumes.insert(reformedVolumes.end(), newVolumes.begin(), newVolumes.end());
 
             // Give each freshly-reformed volume real collision - see
-            // RegisterVoxelPhysicsEntity's comment.
+            // RegisterVoxelPhysicsEntity's comment. The returned entity is
+            // recorded against its handle (not discarded, as it used to
+            // be) so ProcessMeltInput can find and destroy it when this
+            // same volume is later melted - see reformedVolumeEntities'
+            // declaration in the main loop and ProcessMeltInput's own
+            // comment for what went wrong when this wasn't tracked.
             for (Eden::VoxelVolumeHandle newVolume : newVolumes)
             {
-                RegisterVoxelPhysicsEntity(registry, voxelSystem, newVolume);
+                reformedVolumeEntities[newVolume] = RegisterVoxelPhysicsEntity(registry, voxelSystem, newVolume);
             }
 
             std::cout << "Eden: reform pass found " << newVolumes.size() << " cluster(s), "
@@ -1219,7 +1625,7 @@ int main()
         particleSystem.Init(renderer.GetDevice(), renderer.GetPhysicalDevice(), renderer.GetAllocator(),
                              renderer.GetCommandPool(), renderer.GetGraphicsQueue(),
                              voxelSystem.GetDensityBuffer());
-        renderer.RegisterParticleGPUSource(particleSystem.GetPositionBuffer());
+        renderer.RegisterParticleGPUSource(particleSystem.GetPositionBuffer(), particleSystem.GetColorBuffer());
 
         glm::vec3 particleSpawnOrigin{ 0.0f, 6.0f, -2.0f };
         // One box of particles dropped above the static floor/grid so
@@ -1245,22 +1651,25 @@ int main()
         //
         // 3x3 grid, 20m per chunk = 60x60m total footprint, matching
         // Phase 1's coverage exactly. voxelSize dropped slightly (0.75 ->
-        // 0.625) so 20m divides evenly into whole voxels (20 / (8*0.625)
-        // = 4 exactly) - chunkDims (4,1,4) per chunk: 4*8=32 voxels
-        // horizontal (20m), 1*8=8 voxels vertical (5m, -4..+1 around
-        // baseHeight=0 - slightly less carve depth than Phase 1's 6m,
-        // still comfortable). 9 chunks * 33x9x33 = 9,801 samples each =
-        // 88,209 samples total - still comfortably inside
-        // kSharedDensityBufferCapacityElements alongside the other
-        // smoke-test volumes.
+        // 0.625, later bumped again to 0.3125 - see this section's own
+        // resolution-bump comment below) so 20m divides evenly into whole
+        // voxels - chunkDims (8,2,8) per chunk (was (4,1,4) at 0.625):
+        // 8*8=64 voxels horizontal (20m), 2*8=16 voxels vertical (5m,
+        // -4..+1 around baseHeight=0 - slightly less carve depth than
+        // Phase 1's 6m, still comfortable). 9 chunks * 65x17x65 = 71,825
+        // samples each = 646,425 samples total - still comfortably inside
+        // kSharedDensityBufferCapacityElements (12,582,912 elements)
+        // alongside the other smoke-test volumes.
         //
         // Real, immediate payoff from splitting now rather than later:
-        // RecomputeExactDistances (see Phase 1's own flagged concern)
-        // is a whole-VOLUME Dijkstra, and a carve only ever targets ONE
-        // volume (FindTargetedVolume picks whichever chunk the raycast
-        // actually hit). So a carve here recomputes over ~9,801 samples
-        // instead of the old single volume's ~59,049 - about 6x cheaper
-        // per carve, for free, just from chunking existing.
+        // RecomputeExactDistances (see Phase 1's own flagged concern, and
+        // its own since-added local-region bound - see that function's
+        // comment) is a whole-VOLUME Dijkstra, and a carve only ever
+        // targets ONE volume (FindTargetedVolume picks whichever chunk
+        // the raycast actually hit). So a carve here was already cheaper
+        // per-tile than one shared volume would have been even before
+        // RecomputeExactDistances got its own local bound, just from
+        // chunking existing.
         //
         // Noise seams: each chunk samples SeedHeightfieldNoise's fBm at
         // its own absolute worldPos (VoxelVolumeDesc::origin + local
@@ -1271,8 +1680,24 @@ int main()
         // no visible seam. This only holds as long as every chunk here
         // shares those five values - don't let a future per-biome
         // variation pass drift them apart without handling the boundary.
-        constexpr float kTerrainVoxelSize = 0.625f;
-        constexpr glm::ivec3 kTerrainChunkDims{ 4, 1, 4 }; // per world-chunk: 20m x 5m x 20m
+        // Resolution bumped from the original 0.625/{4,1,4} - halved
+        // voxelSize, doubled chunkDims per axis, chosen specifically so
+        // kTerrainChunkWorldSize's 20m x 5m x 20m tile footprint comes out
+        // IDENTICAL (8*8*0.3125=20, 2*8*0.3125=5 - same as
+        // 4*8*0.625=20, 1*8*0.625=5) - this is a detail/accuracy change,
+        // not a world-layout change, so nothing downstream that assumes
+        // 20m tiles (world-chunk placement below, kTerrainGridWorldMin's
+        // math) needed touching. Cost is real but bounded: 8x more
+        // samples per tile (a 3D resolution doubling), ~590k samples
+        // across all 9 tiles combined - still less than a single mold
+        // workpiece's own sample count, and RecomputeExactDistances' now-
+        // local bound (see that function's own comment) means this
+        // doesn't multiply per-carve cost the way it would have before
+        // that fix existed. kCarveRadius=0.3 is now roughly one voxel
+        // cell wide instead of half of one - a real, not just cosmetic,
+        // carving-accuracy improvement.
+        constexpr float kTerrainVoxelSize = 0.3125f;
+        constexpr glm::ivec3 kTerrainChunkDims{ 8, 2, 8 }; // per world-chunk: 20m x 5m x 20m (unchanged - see comment above)
         constexpr int kTerrainGridSize = 3;                // 3x3 world-chunks
         constexpr float kTerrainChunkWorldSize = 20.0f;    // kTerrainChunkDims.x * 8 * kTerrainVoxelSize
         constexpr float kTerrainGridWorldMin = -30.0f;     // -(kTerrainGridSize * kTerrainChunkWorldSize) / 2
@@ -1536,6 +1961,30 @@ int main()
         // voxelSystem rather than folded into it since these are
         // dynamically created, not the one static smoke-test volume.
         std::vector<Eden::VoxelVolumeHandle> reformedVolumes;
+        // Parallel to reformedVolumes: which ECS entity (see
+        // RegisterVoxelPhysicsEntity) owns each handle's collision. Lets
+        // ProcessMeltInput destroy that entity, not just the GPU volume,
+        // when a reformed volume is melted - see ProcessMeltInput's own
+        // comment for what happens if this gets out of sync with
+        // reformedVolumes.
+        std::unordered_map<Eden::VoxelVolumeHandle, Eden::Entity> reformedVolumeEntities;
+
+        // Which of the GPU_MAX_CHEMICALS slots the "Emit box" button AND
+        // the P-key pour trickle (see ProcessPourInput) both spawn.
+        // Hoisted out of the ImGui panel below (was a function-local
+        // static there) so ProcessPourInput can read the same selection
+        // instead of the two diverging into "pour always spawns chemical
+        // 0" - the UI is still the only place it's ever changed.
+        int spawnChemicalId = 0;
+
+        // Grows as ProcessWorkpieceSpawnInput (B key) spawns new mold
+        // workpieces - see that function's comment. Unlike reformedVolumes,
+        // these are never melted/unregistered by anything yet (no despawn
+        // path exists for a workpiece), so this list only ever grows for
+        // now - matches this project's established "editor-driven test
+        // setup, not final game setup" scope (see the planning-notes
+        // addendum's "Scenes" discussion).
+        std::vector<Eden::VoxelVolumeHandle> workpieceVolumes;
 
         while (!glfwWindowShouldClose(window))
         {
@@ -1543,8 +1992,108 @@ int main()
             float deltaTime = static_cast<float>(currentFrameTime - lastFrameTime);
             lastFrameTime = currentFrameTime;
 
-            glfwPollEvents();
-            ProcessKeyboardInput(window, renderer, deltaTime);
+            Eden::Profiler::Get().BeginFrame(deltaTime * 1000.0f);
+
+            // EDEN_BENCH_CARVE=1: every frame, carve a 0.6-radius ball into the
+            // first terrain tile, a 3-step drill stroke, then march + recompute
+            // exactly as ProcessVoxelCarveInput does. Gives the carve cost
+            // rows in the Performance panel without needing mouse input.
+            static const bool envBenchCarve = (std::getenv("EDEN_BENCH_CARVE") != nullptr);
+            if (envBenchCarve && !terrainChunks.empty() && voxelSystem.IsValid(terrainChunks[0].handle))
+            {
+                const Eden::VoxelVolumeHandle tile = terrainChunks[0].handle;
+                const auto tb = voxelSystem.GetVolumeBounds(tile);
+                const glm::vec3 center = (tb.worldMin + tb.worldMax) * 0.5f;
+                for (int step = 0; step < 3; ++step)
+                {
+                    voxelSystem.Carve(tile, center + glm::vec3(0.0f, -0.4f * static_cast<float>(step), 0.0f), 0.6f);
+                    if (std::strcmp(std::getenv("EDEN_BENCH_CARVE"), "old") == 0)
+                    {
+                        voxelSystem.FlushPendingUpload(tile); // emulates the pre-batching behavior: one blocking upload per Carve()
+                    }
+                }
+                voxelSystem.MarchDirtyChunks(tile);
+                voxelSystem.RecomputeExactDistances(tile);
+            }
+
+            // Headless/benchmark helpers (also handy for sending numbers
+            // without touching the UI):
+            //   EDEN_GPU_TIMING=1          start with GPU pass timing on
+            //   EDEN_PERF_AUTOREPORT=<s>   after <s> seconds write
+            //                              eden_perf.txt and quit
+            static const bool envGpuTiming = (std::getenv("EDEN_GPU_TIMING") != nullptr);
+            static const double envAutoReportSeconds =
+                std::getenv("EDEN_PERF_AUTOREPORT") ? std::atof(std::getenv("EDEN_PERF_AUTOREPORT")) : 0.0;
+            if (envGpuTiming)
+            {
+                renderer.GpuTimingEnabled = true;
+            }
+            //   EDEN_CAMERA=x,y,z               start with the camera here (looking down -Z)
+            //   EDEN_HIDE_UI=1                  draw no ImGui panels
+            static bool envCameraApplied = false;
+            if (!envCameraApplied)
+            {
+                envCameraApplied = true;
+                if (const char* v = std::getenv("EDEN_CAMERA"))
+                {
+                    float cx = 0, cy = 0, cz = 0;
+                    if (std::sscanf(v, "%f,%f,%f", &cx, &cy, &cz) == 3)
+                    {
+                        renderer.GetCamera().Position = glm::vec3(cx, cy, cz);
+                    }
+                }
+            }
+            //   EDEN_DEBUG_SKIP=voxel,mesh,raymarch,fluid,bounds   start with those draws/features off
+            static bool envSkipApplied = false;
+            if (!envSkipApplied)
+            {
+                envSkipApplied = true;
+                if (const char* v = std::getenv("EDEN_DEBUG_SKIP"))
+                {
+                    const std::string skip(v);
+                    if (skip.find("voxel") != std::string::npos) { renderer.DebugDrawVoxelGeometry = false; }
+                    if (skip.find("mesh") != std::string::npos) { renderer.DebugDrawMeshes = false; }
+                    if (skip.find("raymarch") != std::string::npos) { renderer.DebugDrawRaymarch = false; }
+                    if (skip.find("fluid") != std::string::npos) { renderer.FluidSurfaceEnabled = false; }
+                    if (skip.find("bounds") != std::string::npos) { renderer.FluidBoundsCullingEnabled = false; }
+                }
+            }
+            //   EDEN_FLUID_SCALE=0.5          start with that fluid resolution scale
+            //   EDEN_FLUID_SCALE_LATER=0.5    switch to it 15 s in (tests the live rebuild)
+            static bool envScaleApplied = false;
+            if (!envScaleApplied)
+            {
+                envScaleApplied = true;
+                if (const char* v = std::getenv("EDEN_FLUID_SCALE")) { renderer.FluidResolutionScale = static_cast<float>(std::atof(v)); renderer.FluidAutoResolution = false; }
+            }
+            //   EDEN_CAMERA_LATER=x,y,z         move the camera there 25 s in (tests liquid leaving the view)
+            static bool envCameraLaterApplied = false;
+            if (!envCameraLaterApplied && currentFrameTime > 25.0)
+            {
+                envCameraLaterApplied = true;
+                if (const char* v = std::getenv("EDEN_CAMERA_LATER"))
+                {
+                    float cx = 0, cy = 0, cz = 0;
+                    if (std::sscanf(v, "%f,%f,%f", &cx, &cy, &cz) == 3) { renderer.GetCamera().Position = glm::vec3(cx, cy, cz); }
+                }
+            }
+            static bool envScaleLaterApplied = false;
+            if (!envScaleLaterApplied && currentFrameTime > 15.0)
+            {
+                envScaleLaterApplied = true;
+                if (const char* v = std::getenv("EDEN_FLUID_SCALE_LATER")) { renderer.FluidResolutionScale = static_cast<float>(std::atof(v)); renderer.FluidAutoResolution = false; }
+            }
+            if (envAutoReportSeconds > 0.0 && currentFrameTime > envAutoReportSeconds)
+            {
+                Eden::Profiler::Get().SaveReport("eden_perf.txt", "Eden performance report (auto)");
+                glfwSetWindowShouldClose(window, GLFW_TRUE);
+            }
+
+            {
+                EDEN_PROFILE_SCOPE("Input: events + keyboard");
+                glfwPollEvents();
+                ProcessKeyboardInput(window, renderer, deltaTime);
+            }
             // reformedVolumes is plain main-loop state, not ECS - it has
             // no way to find out a handle it's holding got destroyed by
             // the editor's entity-list "Destroy" button (EdenUI.cpp),
@@ -1559,7 +2108,19 @@ int main()
             // simple.
             reformedVolumes.erase(
                 std::remove_if(reformedVolumes.begin(), reformedVolumes.end(),
-                                [&voxelSystem](Eden::VoxelVolumeHandle h) { return !voxelSystem.IsValid(h); }),
+                                [&voxelSystem, &reformedVolumeEntities](Eden::VoxelVolumeHandle h) {
+                                    bool stale = !voxelSystem.IsValid(h);
+                                    if (stale)
+                                    {
+                                        // The editor's entity-list Destroy
+                                        // button already destroys this
+                                        // entity itself when it frees the
+                                        // volume - this just drops our own
+                                        // now-dangling record of it.
+                                        reformedVolumeEntities.erase(h);
+                                    }
+                                    return stale;
+                                }),
                 reformedVolumes.end());
 
             // Terrain Phase 3 residency gate - see UpdateTerrainChunkResidency's
@@ -1567,7 +2128,12 @@ int main()
             // position stands in for "player position" the same way
             // FindTargetedVolume already treats it - there's no separate
             // player-controller entity yet.
-            UpdateTerrainChunkResidency(registry, voxelSystem, terrainChunks, renderer.GetCamera().Position);
+            {
+                EDEN_PROFILE_SCOPE("World: terrain chunk residency");
+                UpdateTerrainChunkResidency(registry, voxelSystem, terrainChunks, renderer.GetCamera().Position);
+            }
+
+            const auto editInputStart = Eden::Profiler::Now();
 
             // Every hardened volume that currently exists - the
             // original test sphere plus anything ReformSystem has
@@ -1577,7 +2143,7 @@ int main()
             // here. Rebuilt each frame since reformedVolumes can grow
             // between frames (H key).
             std::vector<Eden::VoxelVolumeHandle> allVoxelVolumes;
-            allVoxelVolumes.reserve(1 + terrainChunks.size() + reformedVolumes.size());
+            allVoxelVolumes.reserve(1 + terrainChunks.size() + reformedVolumes.size() + workpieceVolumes.size());
             // UNFILTERED list of every terrain tile, resident or not -
             // needed by CarveAcrossTerrainTiles' neighbor scan (not the
             // full TerrainChunkState, which isn't visible at that
@@ -1615,6 +2181,19 @@ int main()
                 allVoxelVolumes.push_back(voxelVolume);
             }
             allVoxelVolumes.insert(allVoxelVolumes.end(), reformedVolumes.begin(), reformedVolumes.end());
+            // Mold workpieces (B key) are carve targets too - the whole
+            // point of spawning one is to carve a precise cavity into it.
+            // Filtered the same "still valid" way voxelVolume is above,
+            // since nothing currently prunes workpieceVolumes itself (see
+            // its own declaration comment) and a future editor-Destroy on
+            // one shouldn't leave a stale handle reachable here.
+            for (Eden::VoxelVolumeHandle workpiece : workpieceVolumes)
+            {
+                if (voxelSystem.IsValid(workpiece))
+                {
+                    allVoxelVolumes.push_back(workpiece);
+                }
+            }
 
             // Separate, DELIBERATELY narrower list for melt - terrain is
             // NOT included. Melt's whole-volume->particle conversion
@@ -1640,9 +2219,26 @@ int main()
             }
             meltableVolumes.insert(meltableVolumes.end(), reformedVolumes.begin(), reformedVolumes.end());
 
-            ProcessVoxelCarveInput(window, renderer, registry, voxelSystem, allVoxelVolumes, allTerrainHandles);
-            ProcessMeltInput(window, renderer, registry, voxelSystem, meltableVolumes, particleSystem);
-            ProcessReformInput(window, registry, particleSystem, voxelSystem, reformedVolumes);
+            ProcessVoxelCarveInput(window, renderer, registry, voxelSystem, allVoxelVolumes, allTerrainHandles,
+                                    workpieceVolumes, deltaTime);
+            ProcessPourInput(window, renderer, particleSystem, spawnChemicalId, deltaTime);
+            ProcessWorkpieceSpawnInput(window, renderer, registry, voxelSystem, workpieceVolumes);
+            std::optional<Eden::VoxelVolumeHandle> meltUnregistered =
+                ProcessMeltInput(window, renderer, registry, voxelSystem, meltableVolumes, particleSystem, voxelVolume,
+                                  reformedVolumeEntities);
+            if (meltUnregistered.has_value())
+            {
+                // See ProcessMeltInput's own header comment - this can't
+                // wait for next frame's prune, since render-list-building
+                // code further down THIS frame also reads reformedVolumes.
+                // (reformedVolumeEntities is already cleaned up inside
+                // ProcessMeltInput itself, since it's the one that knows
+                // which entity went with this handle.)
+                reformedVolumes.erase(std::remove(reformedVolumes.begin(), reformedVolumes.end(), *meltUnregistered),
+                                       reformedVolumes.end());
+            }
+            ProcessReformInput(window, registry, particleSystem, voxelSystem, reformedVolumes, reformedVolumeEntities);
+            Eden::Profiler::Get().Add("Input: list building + carve/pour/melt/reform", Eden::Profiler::MsSince(editInputStart));
 
             // TEMP DEBUG - remove after diagnosing.
             if (g_CursorLocked)
@@ -1665,17 +2261,37 @@ int main()
             int physicsStepsThisFrame = 0;
             while (physicsAccumulator >= FIXED_TIMESTEP && physicsStepsThisFrame < MAX_PHYSICS_STEPS_PER_FRAME)
             {
-                physicsSystem.Step(registry, FIXED_TIMESTEP);
-                collisionSystem.Step(registry, FIXED_TIMESTEP, &voxelSystem);
+                {
+                    EDEN_PROFILE_SCOPE("Sim: rigid body physics");
+                    physicsSystem.Step(registry, FIXED_TIMESTEP);
+                }
+                {
+                    EDEN_PROFILE_SCOPE("Sim: collision");
+                    collisionSystem.Step(registry, FIXED_TIMESTEP, &voxelSystem);
+                }
                 // Runs after rigid bodies have already moved/resolved
                 // for this tick, so particles collide against where
                 // solids ended up this step rather than where they
                 // started it (see ParticleSystem::Step's comment).
-                particleSystem.Step(registry, FIXED_TIMESTEP, &voxelSystem);
+                {
+                    EDEN_PROFILE_SCOPE("Sim: particle step (CPU side)");
+                    particleSystem.Step(registry, FIXED_TIMESTEP, &voxelSystem);
+                }
                 physicsAccumulator -= FIXED_TIMESTEP;
                 ++physicsStepsThisFrame;
             }
+            // Hit the cap with time still owed: drop it. Without this the
+            // leftover keeps growing every frame, so every following frame
+            // ALSO runs the maximum number of steps - the sim never recovers
+            // and the frame time stays inflated for good. Dropping it means
+            // simulation time slips behind real time (slow-motion) but the
+            // frame cost stays bounded.
+            if (physicsStepsThisFrame >= MAX_PHYSICS_STEPS_PER_FRAME && physicsAccumulator >= FIXED_TIMESTEP)
+            {
+                physicsAccumulator = 0.0f;
+            }
 
+            const auto drawListStart = Eden::Profiler::Now();
             registry.UpdateSystems(deltaTime);
             auto drawList = Eden::RenderSystem::BuildDrawList(registry, renderer);
 
@@ -1686,12 +2302,26 @@ int main()
             // earlier two-lambda version that iterated registry.View()
             // twice and trusted both passes to agree on order.
             auto raymarchFrame = Eden::RaymarchSystem::BuildObjectList(registry, voxelSystem);
+            Eden::Profiler::Get().Add("Frame: ECS systems + draw lists (incl. culling)", Eden::Profiler::MsSince(drawListStart));
+
+            // Safety net for the deferred carve uploads (see
+            // VoxelSystemGPU::Volume::hasPendingUpload): anything that carved
+            // without a following march still has to reach the GPU before
+            // this frame's raymarch/mesh passes read it. No-op when nothing
+            // is pending.
+            voxelSystem.FlushAllPendingUploads();
 
             renderer.DrawFrame(drawList, [&]()
             {
+                static const bool envHideUi = (std::getenv("EDEN_HIDE_UI") != nullptr); // screenshots / benchmarks without panels covering the view
+                if (envHideUi)
+                {
+                    return;
+                }
                 Eden::UI::DrawMeshPanel(registry, renderer, voxelSystem);
                 Eden::UI::DrawPhysicsSettingsPanel(physicsSystem, collisionSystem);
                 Eden::UI::DrawRendererSettingsPanel(renderer);
+                Eden::UI::DrawPerformancePanel(renderer, MAX_PHYSICS_STEPS_PER_FRAME);
 
                 // GPU particle system has no ImGui panel of its own yet
                 // (DrawParticleSettingsPanel in EdenUI targets the CPU
@@ -1704,21 +2334,88 @@ int main()
                 ImGui::SliderFloat("Point size", &renderer.ParticlePointSize, 1.0f, 32.0f);
                 ImGui::ColorEdit3("Color", &renderer.ParticleGPUColor.x);
 
-                // Live SPH tunables - added alongside the cohesion force
-                // (see SimParamsGPU::cohesion's comment) so tuning
-                // "bouncy droplets vs cohesive liquid" and "explodes/
-                // jitters on impact" doesn't require a rebuild per
-                // attempt. BuildSimParams() reads these fields fresh
-                // every Step() call, so changes here take effect next
-                // physics substep, live.
+                // Live SPH tunables that are still genuinely global -
+                // boundary friction, max acceleration, and substeps
+                // aren't per-chemical properties (they're solver/
+                // collision behavior, not material identity), so they
+                // stay here. Stiffness/viscosity/cohesion sliders used to
+                // live in this panel too - all three are fully per-
+                // chemical now (see the Chemicals section below), with
+                // no remaining global multiplier layered on top, so a
+                // slider for any of them here would silently do nothing.
                 if (ImGui::CollapsingHeader("SPH tuning", ImGuiTreeNodeFlags_DefaultOpen))
                 {
-                    ImGui::SliderFloat("Stiffness", &particleSystem.stiffness, 500.0f, 8000.0f);
-                    ImGui::SliderFloat("Viscosity", &particleSystem.viscosityCoefficient, 0.0f, 5.0f);
-                    ImGui::SliderFloat("Cohesion", &particleSystem.cohesion, 0.0f, 8000.0f);
                     ImGui::SliderFloat("Boundary friction", &particleSystem.boundaryFriction, 0.0f, 1.0f);
                     ImGui::SliderFloat("Max acceleration", &particleSystem.maxAcceleration, 50.0f, 2000.0f);
                     ImGui::SliderInt("Substeps", &particleSystem.substeps, 1, 8);
+                }
+
+                // Chemical ID system - generic editor for any of the
+                // GPU_MAX_CHEMICALS (8) slots, replacing the old fixed
+                // "chemical 0 / chemical 1" layout. There's no separate
+                // "create a chemical" action distinct from this: every
+                // slot already exists (ChemicalTable is a fixed-size
+                // array, not a dynamic list), so "adding" a new chemical
+                // IS picking an ID that hasn't been customized yet and
+                // editing it - same mechanism either way.
+                //
+                // Exposes everything actually load-bearing: mass, rest
+                // density, viscosity, stiffness, cohesion, hardening
+                // threshold, color. Deliberately does NOT expose
+                // hardenedDensity or conductivity - both are real fields
+                // in ChemicalPropertiesGPU, but neither is consumed by
+                // anything yet (see that struct's own comment) - a
+                // slider for either would edit a number nothing reads,
+                // which is exactly the kind of misleading control this
+                // project has specifically avoided elsewhere (see the
+                // old global Stiffness/Tint sliders that got removed
+                // once they stopped doing anything).
+                static int editingChemicalId = 0;
+                if (ImGui::CollapsingHeader("Chemicals", ImGuiTreeNodeFlags_DefaultOpen))
+                {
+                    ImGui::InputInt("Editing chemical ID", &editingChemicalId);
+                    editingChemicalId = std::clamp(editingChemicalId, 0, static_cast<int>(Eden::GPU_MAX_CHEMICALS) - 1);
+
+                    Eden::ChemicalPropertiesGPU& chem = particleSystem.ChemicalTable[editingChemicalId];
+                    std::string& name = particleSystem.ChemicalNames[editingChemicalId];
+
+                    bool edited = false;
+
+                    char nameBuffer[64];
+                    std::snprintf(nameBuffer, sizeof(nameBuffer), "%s", name.c_str());
+                    if (ImGui::InputText("Name", nameBuffer, sizeof(nameBuffer)))
+                    {
+                        name = nameBuffer;
+                    }
+
+                    edited |= ImGui::SliderFloat("Mass", &chem.mass, 0.1f, 10.0f);
+                    edited |= ImGui::SliderFloat("Rest density", &chem.restDensity, 100.0f, 4000.0f);
+                    edited |= ImGui::SliderFloat("Viscosity", &chem.viscosity, 0.0f, 5.0f);
+                    edited |= ImGui::SliderFloat("Stiffness", &chem.stiffness, 500.0f, 8000.0f);
+                    edited |= ImGui::SliderFloat("Cohesion", &chem.cohesion, 0.0f, 8000.0f);
+
+                    // hardeningThreshold < 0 means "never hardens" (see
+                    // that field's own comment) - surfaced as a checkbox
+                    // rather than asking the user to type a negative
+                    // number to mean something categorically different
+                    // from "a very low threshold".
+                    bool canHarden = chem.hardeningThreshold >= 0.0f;
+                    if (ImGui::Checkbox("Can harden", &canHarden))
+                    {
+                        chem.hardeningThreshold = canHarden ? Eden::GPU_HEAT_REFORM_THRESHOLD : -1.0f;
+                        edited = true;
+                    }
+                    if (canHarden)
+                    {
+                        edited |= ImGui::SliderFloat("Hardening threshold", &chem.hardeningThreshold, 0.0f, 1.0f);
+                    }
+
+                    edited |= ImGui::ColorEdit3("Color", &chem.baseColor.x);
+
+                    if (edited)
+                    {
+                        particleSystem.UploadChemicalTable();
+                    }
                 }
 
                 // Screen-space fluid surface (see Renderer::FluidSurfaceEnabled's
@@ -1732,12 +2429,60 @@ int main()
                 {
                     ImGui::Checkbox("Enabled", &renderer.FluidSurfaceEnabled);
                     ImGui::SliderFloat("Visual radius", &renderer.FluidParticleRadius, 0.02f, 0.4f);
-                    ImGui::ColorEdit3("Tint", &renderer.FluidTintColor.x);
+                    // Transparency of the continuous surface (thickness-
+                    // driven - see fluid_thickness.frag/fluid_composite.frag).
+                    ImGui::SliderFloat("Opacity gain", &renderer.FluidAbsorption, 0.05f, 3.0f, "%.2f");
+                    ImGui::SliderFloat("Min opacity (thin liquid)", &renderer.FluidMinAlpha, 0.0f, 1.0f, "%.2f");
+                    ImGui::SliderFloat("Max opacity (deep liquid)", &renderer.FluidMaxAlpha, 0.1f, 1.0f, "%.2f");
+                    // Reworked to fix the stuck-outline ghosting - untested visually;
+                    // untick to compare (see Renderer::FluidTemporalEnabled).
+                    ImGui::Checkbox("Temporal smoothing (reworked)", &renderer.FluidTemporalEnabled);
+                    // Legacy alternative technique, kept for A/B only.
+                    // Discrete choices on purpose: each change rebuilds the fluid
+                    // render targets, so dragging a slider would hitch constantly.
+                    {
+                        const char* kScaleLabels[] = { "Auto (lowers itself if GPU-bound)", "Full (100%)", "Balanced (75%)", "Fast (50%)", "Very fast (35%)" };
+                        const float kScaleValues[] = { 1.0f, 1.0f, 0.75f, 0.5f, 0.35f };
+                        int scaleChoice = renderer.FluidAutoResolution ? 0 : 1;
+                        if (!renderer.FluidAutoResolution)
+                        {
+                            for (int i = 1; i < 5; ++i)
+                            {
+                                if (std::fabs(renderer.FluidResolutionScale - kScaleValues[i]) < 0.01f) { scaleChoice = i; }
+                            }
+                        }
+                        if (ImGui::Combo("Fluid resolution", &scaleChoice, kScaleLabels, 5))
+                        {
+                            renderer.FluidAutoResolution = (scaleChoice == 0);
+                            if (scaleChoice != 0)
+                            {
+                                renderer.FluidResolutionScale = kScaleValues[scaleChoice];
+                            }
+                        }
+                        if (renderer.FluidAutoResolution)
+                        {
+                            ImGui::SameLine();
+                            ImGui::TextDisabled("now %.0f%%", renderer.FluidResolutionScale * 100.0f);
+                        }
+                    }
+                    ImGui::Checkbox("Soft blobs (legacy alternative)", &renderer.FluidUseSoftBlobs);
                 }
+
+                // One spawn button, one chemical ID field - replaces the
+                // old separate "Emit box"/"Emit dye box" pair now that
+                // any of the 8 chemical slots can be edited above; a
+                // second hardcoded button per chemical wouldn't scale
+                // past chemical 1 anyway. spawnChemicalId now lives above
+                // the main loop (see its declaration there) rather than
+                // as a static local here, since ProcessPourInput's P-key
+                // trickle needs to read the same selection.
+                ImGui::InputInt("Chemical ID to spawn", &spawnChemicalId);
+                spawnChemicalId = std::clamp(spawnChemicalId, 0, static_cast<int>(Eden::GPU_MAX_CHEMICALS) - 1);
 
                 if (ImGui::Button("Emit box"))
                 {
-                    particleSystem.EmitBox(particleSpawnOrigin - glm::vec3(0.5f), particleSpawnOrigin + glm::vec3(0.5f));
+                    particleSystem.EmitBox(particleSpawnOrigin - glm::vec3(0.5f), particleSpawnOrigin + glm::vec3(0.5f),
+                                            0.0f, glm::vec3(0.0f), static_cast<uint32_t>(spawnChemicalId));
                 }
                 ImGui::SameLine();
                 if (ImGui::Button("Clear"))
@@ -1779,13 +2524,34 @@ int main()
                 }
                 for (Eden::VoxelVolumeHandle handle : reformedVolumes)
                 {
+                    // Was missing this guard entirely - the comment above
+                    // claimed reformedVolumes was "guarded here the same
+                    // way" as voxelVolume/terrain chunks just above, but
+                    // the code never actually did that for THIS loop. A
+                    // volume unregistered by a melt this same frame is
+                    // supposed to be pruned out of reformedVolumes before
+                    // this point (see the immediate post-melt erase near
+                    // ProcessMeltInput's call site), but that only covers
+                    // ONE specific path - this defensive check is what
+                    // the other two entries already had and this one
+                    // should always have had too, regardless of exactly
+                    // which path left a stale entry here: a real crash
+                    // (VoxelVolumeHandle generational check correctly
+                    // catching a stale handle, then aborting since
+                    // nothing here was prepared to just skip it) traced
+                    // to exactly this gap.
+                    if (!voxelSystem.IsValid(handle))
+                    {
+                        continue;
+                    }
                     sources.push_back({ voxelSystem.GetVertexBuffer(handle), voxelSystem.GetIndirectBuffer(handle),
                                          voxelSystem.GetInstanceBuffer(handle), voxelSystem.GetChunkCount(handle) });
                 }
                 return sources;
             }(),
             raymarchFrame.objects,
-            raymarchFrame.densityBuffer);
+            raymarchFrame.densityBuffer,
+            deltaTime);
         }
 
         // WaitIdle() BEFORE any teardown touches a single buffer/

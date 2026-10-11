@@ -32,6 +32,11 @@ layout(binding = 0) uniform CameraUBO
     vec3 lightColor;
     vec3 ambientColor;
     float particlePointSize; // unused by this shader - see triangle.frag's identical comment
+    vec3 cameraRight;        // unused here; declared so the members after it land at the right offsets
+    vec3 cameraUp;
+    vec3 cameraForward;
+    mat4 prevViewProj;
+    mat4 invViewProj;        // inverse(proj * view), computed once per frame on the CPU - see main() for why that matters
 } camera;
 
 // Must match kRaymarchMaxObjects in RaymarchTypes.h - sizes the
@@ -124,14 +129,23 @@ float SampleDensityTrilinear(uint densityOffset, vec3 localPos, float voxelSize,
     ivec3 i0 = ivec3(floor(clampedGrid));
     vec3 frac = clampedGrid - vec3(i0);
 
-    float c000 = density[densityOffset + SampleIndexClamped(i0 + ivec3(0,0,0), sampleDims)];
-    float c100 = density[densityOffset + SampleIndexClamped(i0 + ivec3(1,0,0), sampleDims)];
-    float c010 = density[densityOffset + SampleIndexClamped(i0 + ivec3(0,1,0), sampleDims)];
-    float c110 = density[densityOffset + SampleIndexClamped(i0 + ivec3(1,1,0), sampleDims)];
-    float c001 = density[densityOffset + SampleIndexClamped(i0 + ivec3(0,0,1), sampleDims)];
-    float c101 = density[densityOffset + SampleIndexClamped(i0 + ivec3(1,0,1), sampleDims)];
-    float c011 = density[densityOffset + SampleIndexClamped(i0 + ivec3(0,1,1), sampleDims)];
-    float c111 = density[densityOffset + SampleIndexClamped(i0 + ivec3(1,1,1), sampleDims)];
+    // clampedGrid <= sampleDims - 1 - 1e-4 and sampleDims >= 2 on every axis
+    // (VoxelDims >= 1, SampleDims = VoxelDims + 1), so i0 <= dims - 2 and
+    // i0 + 1 is always in range: the per-corner SampleIndexClamped() calls
+    // this used to make (3 clamps each, 8 corners) were provably no-ops.
+    // One base index plus constant strides gives the identical 8 reads.
+    int strideY = sampleDims.x;
+    int strideZ = sampleDims.x * sampleDims.y;
+    uint base = densityOffset + uint(i0.x + i0.y * strideY + i0.z * strideZ);
+
+    float c000 = density[base];
+    float c100 = density[base + 1u];
+    float c010 = density[base + uint(strideY)];
+    float c110 = density[base + uint(strideY) + 1u];
+    float c001 = density[base + uint(strideZ)];
+    float c101 = density[base + uint(strideZ) + 1u];
+    float c011 = density[base + uint(strideZ + strideY)];
+    float c111 = density[base + uint(strideZ + strideY) + 1u];
 
     float c00 = mix(c000, c100, frac.x);
     float c10 = mix(c010, c110, frac.x);
@@ -201,36 +215,34 @@ bool RayAabbLocal(vec3 ro, vec3 rd, vec3 boxMin, vec3 boxMax, out float tMin, ou
 
 void main()
 {
-    // Reconstruct a world-space camera ray from this pixel's clip-space
-    // position - standard inverse-view-projection unprojection. Cheap
-    // enough per-pixel at Eden's current object counts (see
-    // RaymarchSystem's comment on why this isn't precomputed on the CPU
-    // and passed in as a per-corner ray direction instead - worth
-    // revisiting only if profiling actually shows this matters).
+    // Per-PIXEL cost matters enormously in this shader - it runs over the
+    // whole screen. The original main() did, for every pixel:
+    //   * inverse(camera.view) and inverse(camera.proj)  (two 4x4 inversions)
+    //   * inverse(obj.invModel) per object (and again at the hit, plus
+    //     transpose(inverse(mat3(...))) for the normal)
+    // All of that is gone; none of it changes a single output pixel:
+    //   * the inverse view-projection comes from the UBO (CPU, once a frame);
+    //   * the local-space ray direction is deliberately NOT normalized, which
+    //     makes the ray parameter t equal WORLD distance along the (normalized)
+    //     world ray - so "world hit distance", the closest-hit comparison and
+    //     the hit position need no model matrix at all. Sphere-tracing steps
+    //     convert a local-space distance d to world t by dividing by the local
+    //     direction's length;
+    //   * for an affine model matrix, inverse(mat3(model)) == mat3(invModel),
+    //     so the normal matrix is just transpose(mat3(invModel)).
     vec2 ndc = fragScreenUV * 2.0 - 1.0;
-    mat4 invView = inverse(camera.view);
-    mat4 invProj = inverse(camera.proj);
-
-    vec4 nearPoint4 = invView * invProj * vec4(ndc, 0.0, 1.0);
-    vec4 farPoint4 = invView * invProj * vec4(ndc, 1.0, 1.0);
-    vec3 nearPoint = nearPoint4.xyz / nearPoint4.w;
+    vec4 farPoint4 = camera.invViewProj * vec4(ndc, 1.0, 1.0);
     vec3 farPoint = farPoint4.xyz / farPoint4.w;
 
     vec3 rayOrigin = camera.cameraPosition;
-    vec3 rayDir = normalize(farPoint - nearPoint);
+    vec3 rayDir = normalize(farPoint - rayOrigin);
 
     float closestT = 1e30;
     int hitObject = -1;
     vec3 hitLocalPos = vec3(0.0);
-    vec3 hitWorldPos = vec3(0.0);
 
     // Loop over MAX_OBJECTS (the ObjectBuffer's fixed capacity) with an
-    // early break past pc.objectCount, the number actually live this
-    // frame. DensityBuffer itself is not per-object - every object
-    // reads from the SAME single bound buffer, using its own
-    // obj.densityOffset to find its region within it (see
-    // SampleDensityTrilinear/DensityBuffer's binding comment above) -
-    // ordinary array indexing, no descriptor-varying behavior at all.
+    // early break past pc.objectCount, the number actually live this frame.
     for (int i = 0; i < MAX_OBJECTS; ++i)
     {
         if (i >= pc.objectCount)
@@ -240,39 +252,24 @@ void main()
 
         RaymarchObjectGPU obj = objects[i];
 
-        vec4 localOrigin4 = obj.invModel * vec4(rayOrigin, 1.0);
-        vec4 localDirEnd4 = obj.invModel * vec4(rayOrigin + rayDir, 1.0);
-        vec3 localOrigin = localOrigin4.xyz;
-        vec3 localDir = normalize(localDirEnd4.xyz - localOrigin);
+        vec3 localOrigin = (obj.invModel * vec4(rayOrigin, 1.0)).xyz;
+        vec3 localDir = mat3(obj.invModel) * rayDir;  // NOT normalized - see the comment at the top of main()
+        float localDirLength = length(localDir);
 
-        float tMin, tMax;
+        float tMin, tMax; // world distances along the ray (thanks to the unnormalized localDir)
         if (!RayAabbLocal(localOrigin, localDir, obj.localMin, obj.localMax, tMin, tMax))
         {
             continue; // ray never enters this object's bounds - skip sphere-tracing it
         }
 
-        // Closest-hit early-exit: convert this object's local-space
-        // entry point back to a world-space distance and skip
-        // sphere-tracing it if it can't possibly beat the closest hit
-        // already found. Deliberately NOT comparing tMin directly
-        // (object-local t units aren't guaranteed to match world-space
-        // units unless the transform is translation-only - a scaled or
-        // rotated raymarch object would silently break that
-        // assumption), so this pays one extra matrix multiply per
-        // object instead - correct for every transform, not just the
-        // unscaled/unrotated ones every current spawn site happens to
-        // use.
-        if (hitObject >= 0)
+        // Closest-hit early-exit: this object's nearest possible surface is
+        // already farther than the best hit found so far.
+        if (hitObject >= 0 && tMin >= closestT)
         {
-            vec3 localEntryPoint = localOrigin + localDir * tMin;
-            vec4 worldEntry4 = inverse(obj.invModel) * vec4(localEntryPoint, 1.0);
-            float worldEntryT = length(worldEntry4.xyz - rayOrigin);
-            if (worldEntryT >= closestT)
-            {
-                continue; // this object's nearest possible surface is already farther than our best hit
-            }
+            continue;
         }
 
+        float invLocalDirLength = 1.0 / localDirLength;
         float t = tMin;
         for (int step = 0; step < MAX_STEPS && t < tMax; ++step)
         {
@@ -281,36 +278,19 @@ void main()
 
             if (d < HIT_EPSILON)
             {
-                // Hit found at this local-space t - world position and
-                // closest-hit comparison against OTHER objects happens
-                // below, once, outside the step loop (see the comment
-                // there for why: avoids paying a matrix multiply on
-                // every step just to maybe discard the result).
                 break;
             }
 
-            t += max(d, HIT_EPSILON * 0.5);
+            // d is a distance in the object's local space; the ray moves
+            // localDirLength local units per unit of world t.
+            t += max(d, HIT_EPSILON * 0.5) * invLocalDirLength;
         }
 
-        // Second pass only runs when the march above actually found a
-        // hit inside this object - recompute worldHit properly here
-        // rather than inside the loop, keeping the hot loop free of the
-        // extra matrix multiply on every step.
-        if (t < tMax)
+        if (t < tMax && t < closestT)
         {
-            vec3 localHitPos = localOrigin + localDir * t;
-            mat4 model = inverse(obj.invModel);
-            vec4 worldHit4 = model * vec4(localHitPos, 1.0);
-            vec3 worldHit = worldHit4.xyz;
-            float worldT = length(worldHit - rayOrigin);
-
-            if (worldT < closestT)
-            {
-                closestT = worldT;
-                hitObject = i;
-                hitLocalPos = localHitPos;
-                hitWorldPos = worldHit;
-            }
+            closestT = t;
+            hitObject = i;
+            hitLocalPos = localOrigin + localDir * t;
         }
     }
 
@@ -319,15 +299,11 @@ void main()
         discard; // no object hit at this pixel - let whatever rasterized underneath (terrain, clear color) show through
     }
 
+    vec3 hitWorldPos = rayOrigin + rayDir * closestT;
+
     RaymarchObjectGPU hitObj = objects[hitObject];
     vec3 localNormal = SampleGradientLocal(hitObj.densityOffset, hitLocalPos, hitObj.fieldOffset, hitObj.localMax, hitObj.voxelSize, hitObj.sampleDims);
-    // Normal matrix from the object's forward model matrix (inverse of
-    // invModel, computed once here rather than re-inverting per step -
-    // see the hit-refinement pass above for the same model matrix,
-    // computed separately there since this scope can't see a variable
-    // local to that earlier block).
-    mat4 hitModel = inverse(hitObj.invModel);
-    mat3 normalMatrix = transpose(inverse(mat3(hitModel)));
+    mat3 normalMatrix = transpose(mat3(hitObj.invModel)); // == transpose(inverse(mat3(model))) for an affine model
     vec3 N = normalize(normalMatrix * localNormal);
 
     vec3 L = normalize(-camera.lightDirection);
@@ -346,11 +322,7 @@ void main()
 
     // Write real depth so rasterized terrain (drawn earlier in the same
     // render pass, same depth buffer) correctly occludes/is-occluded-by
-    // this hit instead of one path always winning. Reproject the world
-    // hit through camera.proj*camera.view rather than deriving depth
-    // from closestT directly - matches exactly what the rasterizer's
-    // own gl_Position pipeline produces, so the two paths agree at the
-    // boundary between a raymarched object and rasterized geometry.
+    // this hit instead of one path always winning.
     vec4 clipHit = camera.proj * camera.view * vec4(hitWorldPos, 1.0);
     gl_FragDepth = clipHit.z / clipHit.w;
 }

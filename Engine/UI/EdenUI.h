@@ -52,4 +52,10 @@ namespace Eden::UI
     // no real tradeoff to tune, unlike occlusion culling's AABB-vs-exact-
     // silhouette accuracy tradeoff - see SoftwareOcclusionBuffer.h).
     void DrawRendererSettingsPanel(Renderer& renderer);
+
+    // Frame-time graph, per-section CPU/GPU timings (see
+    // Engine/Core/Profiler.h), a GPU-bound/CPU-bound verdict, and a button
+    // that saves a pasteable report to eden_perf.txt. maxPhysicsSteps is
+    // main.cpp's catch-up cap, exposed here so it can be tuned live.
+    void DrawPerformancePanel(Renderer& renderer, int& maxPhysicsSteps);
 }

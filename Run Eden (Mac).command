@@ -16,7 +16,13 @@ mkdir -p build
 cd build
 
 echo "Configuring..."
-cmake .. -DCMAKE_BUILD_TYPE=Debug > /tmp/eden_cmake.log 2>&1 || {
+# Release by default: Debug builds are several times slower on the CPU AND
+# switch on Vulkan validation layers (see Renderer.cpp's NDEBUG check), which
+# costs a lot of frame time. For debugging with validation, run:
+#   EDEN_BUILD_TYPE=Debug ./"Run Eden (Mac).command"
+BUILD_TYPE="${EDEN_BUILD_TYPE:-Release}"
+echo "Build type: $BUILD_TYPE"
+cmake .. -DCMAKE_BUILD_TYPE="$BUILD_TYPE" > /tmp/eden_cmake.log 2>&1 || {
     echo ""
     echo "CMake configuration failed. Full log:"
     cat /tmp/eden_cmake.log
@@ -57,6 +63,15 @@ if [ ! -d ".git" ]; then
     exit 0
 fi
 
+# Shared safety helpers (restore remote-only files instead of deleting them on
+# GitHub, refuse >100 MB files, explain push errors).
+if [ ! -f "Tools/eden_git_safety.sh" ]; then
+    echo "Tools/eden_git_safety.sh is missing - re-extract the project zip."
+    read -p "Press Enter to close this window..."
+    exit 1
+fi
+source "Tools/eden_git_safety.sh"
+
 # Always asks, even with nothing new to push (matches how this was
 # asked for) - a plain "git push" with nothing pending just reports
 # "Everything up-to-date" and exits 0, so that case is cheap to allow
@@ -79,7 +94,14 @@ fi
 GH_TOKEN=$(cat /tmp/eden_pat_$$.txt)
 rm -f /tmp/eden_pat_$$.txt /tmp/eden_pat_cancelled_$$.txt
 
+eden_protect_remote_only_files
+
 git add -A
+git reset -q -- ':(glob).eden_askpass*' 2>/dev/null || true
+if ! eden_check_large_staged_files; then
+    read -p "Press Enter to close this window..."
+    exit 1
+fi
 if ! git diff --cached --quiet; then
     TIMESTAMP=$(date "+%Y-%m-%d %H:%M")
     git commit -m "Eden session $TIMESTAMP" > /dev/null
@@ -90,7 +112,9 @@ fi
 # explicitly disabled for this one command so nothing gets cached to
 # Keychain, token never written anywhere durable. See that script's
 # comment for the full reasoning.
-ASKPASS_SCRIPT="$(pwd)/.eden_askpass_$$.sh"
+# Temp file OUTSIDE the project folder: it holds the token in plaintext while
+# this runs and must never be reachable by `git add -A`.
+ASKPASS_SCRIPT="$(mktemp "${TMPDIR:-/tmp}/eden_askpass.XXXXXX")"
 cat > "$ASKPASS_SCRIPT" << EOF
 #!/bin/bash
 echo "$GH_TOKEN"
@@ -107,6 +131,11 @@ else
     unset GH_TOKEN
     echo "Push failed:"
     echo "$ERR"
+    HINT=$(eden_explain_push_error "$ERR")
+    if [ -n "$HINT" ]; then
+        echo ""
+        echo "What this probably means: $HINT"
+    fi
     osascript -e "display dialog \"Push failed:\n\n$(echo "$ERR" | sed 's/"/\\"/g' | head -c 500)\" buttons {\"OK\"} default button \"OK\" with icon stop" > /dev/null 2>&1
 fi
 

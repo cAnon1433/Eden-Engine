@@ -39,6 +39,15 @@
 set -e
 cd "$(dirname "$0")"
 
+# Shared safety helpers (restore remote-only files instead of deleting them on
+# GitHub, refuse >100 MB files, explain push errors) - see that file.
+if [ ! -f "Tools/eden_git_safety.sh" ]; then
+    echo "Tools/eden_git_safety.sh is missing - it is part of the project. Re-extract the zip."
+    read -p "Press Enter to close..."
+    exit 1
+fi
+source "Tools/eden_git_safety.sh"
+
 REPO_URL="https://x-access-token@github.com/cAnon1433/Eden-Engine.git"
 
 echo "Eden - connect to GitHub"
@@ -87,7 +96,11 @@ rm -f /tmp/eden_pat_$$.txt /tmp/eden_pat_cancelled_$$.txt
 # macOS Keychain either, matching "type it every time, don't save it."
 # Used for BOTH fetch and push below, not just push - see the token
 # prompt's own comment on why.
-ASKPASS_SCRIPT="$(pwd)/.eden_askpass_$$.sh"
+# Written to a temp file OUTSIDE the project folder (it contains the token in
+# plaintext while this runs). Previously it lived in the project folder and relied
+# on .gitignore to keep it out of `git add -A` - and a freshly unzipped folder has
+# no .gitignore, so the token file could be committed and pushed.
+ASKPASS_SCRIPT="$(mktemp "${TMPDIR:-/tmp}/eden_askpass.XXXXXX")"
 cat > "$ASKPASS_SCRIPT" << EOF
 #!/bin/bash
 echo "$GH_TOKEN"
@@ -130,7 +143,19 @@ if [ -z "$(git config user.name)" ]; then
     git config user.name "cAnon1433"
 fi
 
+# A fresh unzip has no .git/.gitignore/.github: keep files that exist on GitHub
+# but not here (esp. .github/workflows) instead of staging their deletion.
+eden_protect_remote_only_files
+
 git add -A
+
+# Belt and braces - never commit a token relay, whatever .gitignore says.
+git reset -q -- ':(glob).eden_askpass*' 2>/dev/null || true
+
+if ! eden_check_large_staged_files; then
+    read -p "Press Enter to close..."
+    exit 1
+fi
 
 if git diff --cached --quiet; then
     echo "Nothing differs from the repo's current state - connected, no commit needed."
@@ -152,6 +177,11 @@ else
     rm -f /tmp/eden_push_err_$$.log
     echo "Push failed:"
     echo "$ERR"
+    HINT=$(eden_explain_push_error "$ERR")
+    if [ -n "$HINT" ]; then
+        echo ""
+        echo "What this probably means: $HINT"
+    fi
     osascript -e "display dialog \"Push failed:\n\n$(echo "$ERR" | sed 's/"/\\"/g' | head -c 500)\" buttons {\"OK\"} default button \"OK\" with icon stop" > /dev/null 2>&1
 fi
 

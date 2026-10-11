@@ -10,8 +10,10 @@
 // on the CPU.
 //
 // Output vertices land in THIS cell's owning chunk's reserved slot range
-// of the shared vertex buffer (chunkIndex * maxVerticesPerChunk +
-// atomically-allocated offset), which is also directly consumable as a
+// of the shared vertex buffer (compactChunkIndex * maxVerticesPerChunk +
+// atomically-allocated offset - see ChunkRemapBuffer's own comment below
+// for what compactChunkIndex is and why it isn't always the same as this
+// chunk's raw grid index), which is also directly consumable as a
 // vertex buffer by Renderer's existing triangle pipeline - see
 // RendererTypes.h's Vertex layout, matched field-for-field below.
 //
@@ -76,8 +78,11 @@ const int kFloatsPerVertex = 11;
 layout(std430, binding = 0) readonly buffer DensityBuffer { float density[]; };
 layout(std430, binding = 1) buffer VertexBuffer { float vertexData[]; };
 // Mirrors VkDrawIndirectCommand's 4 uint32 fields per chunk - see
-// VoxelSystemGPU.cpp's IndirectCommand struct. commands[chunkIndex*4+0]
+// VoxelSystemGPU.cpp's IndirectCommand struct. commands[compactChunkIndex*4+0]
 // is vertexCount, the one field this shader ever writes (via atomicAdd).
+// Indexed by compactChunkIndex (see ChunkRemapBuffer below), NOT the raw
+// chunk index - this buffer may only have entries for chunks that
+// actually have geometry, not the full grid.
 layout(std430, binding = 2) buffer IndirectBuffer { uint commands[]; };
 // Single flat table blob replacing the old separate edge-table/tri-table
 // bindings - see MarchingCubesTables33.h for what's packed in here and
@@ -86,6 +91,22 @@ layout(std430, binding = 2) buffer IndirectBuffer { uint commands[]; };
 // "one binding per table" a non-starter).
 layout(std430, binding = 3) readonly buffer MC33TableBuffer { int mc33[]; };
 layout(std430, binding = 4) readonly buffer DirtyFlagsBuffer { uint dirtyFlags[]; };
+
+// Chunk compaction (see VoxelSystemGPU::RegisterVolume's
+// vertexBufferChunkCountOverride comment and CountSurfaceCrossingChunks/
+// BuildChunkRemapTable for the CPU side of this). Maps this chunk's RAW
+// grid index to a COMPACT index for writing into VertexBuffer/
+// IndirectBuffer, which may be sized for far fewer chunks than the full
+// grid - see kChunkRemapUnused below for how a chunk that was
+// pre-classified as having no geometry at all is handled. For a
+// non-compacted volume (the identity case - every existing caller before
+// this scheme existed, and every volume that's still subject to later
+// Carve() edits, since a one-time static classification isn't safe for a
+// volume whose surface can change after creation), chunkRemap[i] == i for
+// every i, so this is a no-op indirection, not a special case the shader
+// needs to branch on.
+layout(std430, binding = 5) readonly buffer ChunkRemapBuffer { uint chunkRemap[]; };
+const uint kChunkRemapUnused = 0xFFFFFFFFu;
 
 layout(push_constant) uniform VoxelParams
 {
@@ -669,16 +690,38 @@ void main()
     ivec3 cell = ivec3(cx, cy, cz);
 
     // Which chunk owns this cell, and that chunk's flat index into the
-    // per-chunk buffers - this mapping only needs to be self-consistent
-    // within this shader (dirty-flag lookup and vertex-slot/indirect-
-    // command lookup both use it identically); the CPU side treats
-    // chunk indices as opaque slots and never needs to know which
-    // spatial chunk a given index corresponds to.
+    // per-chunk buffers. Used to be true that the CPU side never needed
+    // to know this mapping - that changed with chunk compaction:
+    // VoxelSystemGPU::BuildChunkRemapTable computes this EXACT SAME flat
+    // index (chunkCoord.x + chunkCoord.y*chunkDims.x +
+    // chunkCoord.z*chunkDims.x*chunkDims.y) on the CPU side, to know
+    // which raw chunk index a given ChunkRemapBuffer entry corresponds
+    // to. If this formula ever changes here, BuildChunkRemapTable's own
+    // copy of it must change identically, or a compacted volume's
+    // triangles land in the wrong slot.
     ivec3 chunkCoord = cell / params.chunkVoxelSize;
     int chunkIndex = chunkCoord.x + chunkCoord.y * params.chunkDims.x
                     + chunkCoord.z * params.chunkDims.x * params.chunkDims.y;
 
     if (dirtyFlags[chunkIndex] == 0u)
+    {
+        return;
+    }
+
+    // Compaction lookup - see ChunkRemapBuffer's own comment above. A
+    // chunk pre-classified as having no geometry at all (this reads
+    // kChunkRemapUnused) is skipped here, before any of the actual
+    // marching-cubes work below - correct AND cheap, since a chunk with
+    // no geometry was never going to emit anything regardless, this just
+    // avoids doing the corner-sampling/case-lookup work to discover that
+    // the hard way. compactChunkIndex, not chunkIndex, is what actually
+    // addresses VertexBuffer/IndirectBuffer from here on - chunkIndex
+    // itself is now only used for DensityBuffer/DirtyFlagsBuffer/
+    // ChunkRemapBuffer lookups (all sized for the FULL raw grid, never
+    // compacted, since a chunk always needs a density/dirty/remap slot
+    // regardless of whether it turns out to have geometry).
+    uint compactChunkIndex = chunkRemap[chunkIndex];
+    if (compactChunkIndex == kChunkRemapUnused)
     {
         return;
     }
@@ -779,7 +822,7 @@ void main()
     centerPos /= centerWeightSum;
     vec3 centerNormal = normalize(centerGradSum);
 
-    uint chunkVertexBase = uint(chunkIndex) * uint(params.maxVerticesPerChunk);
+    uint chunkVertexBase = compactChunkIndex * uint(params.maxVerticesPerChunk);
 
     for (int tri = 0; tri < nt * 3; tri += 3)
     {
@@ -794,12 +837,17 @@ void main()
         vec3 n1 = (i1 == 12) ? centerNormal : edgeNormal[i1];
         vec3 n2 = (i2 == 12) ? centerNormal : edgeNormal[i2];
 
-        // Reserve 3 vertex slots for this triangle. commands[chunkIndex*4]
+        // Reserve 3 vertex slots for this triangle. commands[compactChunkIndex*4]
         // is the chunk's vertexCount field (see IndirectBuffer's layout
         // comment) - atomicAdd both allocates this triangle's slot AND
         // grows the vertex count vkCmdDrawIndirect will actually draw,
-        // in one op, with no CPU involvement.
-        uint slot = atomicAdd(commands[chunkIndex * 4 + 0], 3u);
+        // in one op, with no CPU involvement. Addressed by
+        // compactChunkIndex, not the raw chunkIndex - see
+        // ChunkRemapBuffer's comment for why: IndirectBuffer is sized for
+        // however many chunks actually have geometry, not the full raw
+        // grid, so it must be addressed the same compacted way the
+        // vertex buffer is.
+        uint slot = atomicAdd(commands[compactChunkIndex * 4 + 0], 3u);
         if (slot + 3u > uint(params.maxVerticesPerChunk))
         {
             // Over this chunk's worst-case capacity (kVoxelMaxVerticesPerChunk
@@ -810,7 +858,7 @@ void main()
             // Undo the reservation via unsigned wraparound (matches
             // atomicAdd's own uint domain - avoids any ambiguity from
             // casting a negative literal to uint).
-            atomicAdd(commands[chunkIndex * 4 + 0], 0u - 3u);
+            atomicAdd(commands[compactChunkIndex * 4 + 0], 0u - 3u);
             continue;
         }
 

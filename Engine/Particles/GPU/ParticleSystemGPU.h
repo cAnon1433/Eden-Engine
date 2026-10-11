@@ -11,6 +11,7 @@
 #include <glm/glm.hpp>
 #include <vector>
 #include <array>
+#include <string>
 
 namespace Eden
 {
@@ -121,6 +122,60 @@ namespace Eden
         // defaults far below any real scene so it's a no-op otherwise.
         float voidKillY = -1.0e9f;
 
+        // --- Chemical ID table (base build) --------------------------------
+        // Public, directly editable - same "live-tunable field, no
+        // getter/setter ceremony" pattern `cohesion` above already uses.
+        // Index 0 always exists (every Emit/EmitBox/EmitPoints call
+        // defaults to chemicalId=0) and is seeded here to reproduce the
+        // exact single-material behavior this class had before this
+        // field existed (mass/restDensity/stiffness/viscosity matching
+        // the old global SimParamsGPU defaults, hardeningThreshold ==
+        // GPU_HEAT_REFORM_THRESHOLD). Index 1 is seeded as a second,
+        // visibly different example chemical (a dark tint, lower
+        // viscosity) purely so a fresh build has something to test
+        // "differing properties + color mixing" against immediately via
+        // EmitBox(..., chemicalId=1) without hand-authoring one first.
+        // Indices 2+ start as copies of index 0 - edit them (directly, or
+        // via ImGui) and call UploadChemicalTable() to push changes to
+        // the GPU; entries are otherwise inert (never emitted, never
+        // referenced) until something actually uses that ID.
+        std::array<ChemicalPropertiesGPU, GPU_MAX_CHEMICALS> ChemicalTable = []
+        {
+            std::array<ChemicalPropertiesGPU, GPU_MAX_CHEMICALS> table;
+            table[1].viscosity = 0.4f;
+            table[1].stiffness = 2200.0f;
+            table[1].baseColor = glm::vec4(0.05f, 0.35f, 0.1f, 1.0f); // dark green, per the "drop dye into a pool" test case
+            return table;
+        }();
+
+        // Display-only labels for the ImGui chemical editor - purely a
+        // UI convenience, never read by any shader or by anything on the
+        // GPU side (a chemical is fully identified by its integer ID
+        // everywhere else in the engine; this exists only so a human
+        // editing/spawning chemicals doesn't have to remember "ID 4 is
+        // the honey one"). Indices 0/1 match ChemicalTable's own seeded
+        // defaults; everything else starts as a generic placeholder
+        // until someone names it.
+        std::array<std::string, GPU_MAX_CHEMICALS> ChemicalNames = []
+        {
+            std::array<std::string, GPU_MAX_CHEMICALS> names;
+            for (uint32_t i = 0; i < GPU_MAX_CHEMICALS; ++i)
+            {
+                names[i] = "Chemical " + std::to_string(i);
+            }
+            names[0] = "Default";
+            names[1] = "Dye";
+            return names;
+        }();
+
+        // Re-uploads the whole ChemicalTable (a handful of chemicals,
+        // 48 bytes each - trivial) to the GPU. Cheap enough to call
+        // unconditionally once a frame after ImGui edits ChemicalTable
+        // directly, same reasoning BuildSimParams() re-sending every
+        // tunable every Step() already relies on - no dirty-tracking
+        // needed for something this small and infrequent.
+        void UploadChemicalTable();
+
         // Heat/cooldown tunables (Eden Particle State Transitions) - see
         // SimParamsGPU's own comment for why these ride along in the
         // formerly-padding push-constant slots. Mirrored into
@@ -179,24 +234,63 @@ namespace Eden
         // real staged GPU upload + queue wait (see .cpp), not meant for
         // per-frame use.
         //
-        // Both set the new particles' heat to GPU_HEAT_NOT_MELTED -
-        // ordinary emission (initial scene liquid, water boxes, etc.)
-        // is never part of the melt/reform system and should never
-        // decay or become reform-eligible. Only MeltSystem::Melt's
-        // particles (via EmitPoints' initialHeat) start "hot".
-        void Emit(const glm::vec3& position, const glm::vec3& velocity = glm::vec3(0.0f));
-        void EmitBox(const glm::vec3& min, const glm::vec3& max, float spacing = 0.0f, const glm::vec3& initialVelocity = glm::vec3(0.0f));
+        // Both set the new particles' heat to a normal starting value
+        // (1.0 - "freshly poured, hasn't cooled yet") rather than any
+        // kind of "exempt from the melt system" sentinel - see
+        // GPU_HEAT_NOT_MELTED's comment for what changed and why. Any
+        // particle can now decay/conduct heat and become reform-eligible
+        // over time, gated only by its OWN chemical's hardeningThreshold
+        // (see ChemicalPropertiesGPU), not by how it was created.
+        //
+        // chemicalId indexes ChemicalTable (see that field's comment) -
+        // defaults to 0 so every existing call site (nothing in this
+        // codebase passed a chemical before this base build existed)
+        // keeps behaving exactly as before. The new particle's color is
+        // initialized from ChemicalTable[chemicalId].baseColor at emit
+        // time, then left free to diffuse independently afterward (see
+        // m_Colors' comment) - color is a per-PARTICLE value from this
+        // point on, not a live lookup into the table.
+        void Emit(const glm::vec3& position, const glm::vec3& velocity = glm::vec3(0.0f), uint32_t chemicalId = 0);
+        void EmitBox(const glm::vec3& min, const glm::vec3& max, float spacing = 0.0f,
+                     const glm::vec3& initialVelocity = glm::vec3(0.0f), uint32_t chemicalId = 0);
 
         // Batch-emits an arbitrary, pre-computed scatter of positions
         // (same single-upload-per-call shape as EmitBox, which fills an
         // AABB uniformly - this is for callers, like MeltSystem, whose
         // spawn set isn't a filled box, e.g. only the solid samples of a
         // voxel density field). All particles share one initial
-        // velocity/heat; per-particle values aren't needed for the
-        // callers this exists for today. initialHeat defaults to
-        // GPU_HEAT_NOT_MELTED - MeltSystem passes 1.0 explicitly.
+        // velocity/heat/chemical; per-particle values aren't needed for
+        // the callers this exists for today. initialHeat defaults to
+        // 1.0, same "starts warm, needs to cool before it can harden"
+        // convention Emit/EmitBox now use - MeltSystem also passes 1.0
+        // explicitly (freshly melted particles start just as warm as
+        // freshly poured ones; there's no meaningful difference anymore,
+        // see GPU_HEAT_NOT_MELTED's comment).
+        //
+        // colorOverride defaults to glm::vec4(0.0f) meaning "use
+        // ChemicalTable[chemicalId].baseColor" - the SAME "transparent
+        // black = no explicit color set" convention
+        // VoxelSystemGPU::SetTransform already established (see that
+        // function's own default parameter), reused here rather than
+        // inventing a second, different sentinel value for the same
+        // "nothing was actually set" meaning. This matters concretely:
+        // Volume::lastColor defaults to exactly this value for any
+        // volume that's never had an explicit color set (e.g. the
+        // original hardcoded test sphere, which predates the Chemical ID
+        // system) - MeltSystem passes that default straight through, and
+        // it needs to resolve to "use the chemical's real color", not to
+        // literal black.
+        //
+        // MeltSystem passes an explicit non-zero color here whenever one
+        // exists - a volume's actual hardened color (see
+        // VoxelSystemGPU::GetVolumeColor) may have drifted from its
+        // chemical's flat default through diffusion before it ever
+        // reformed (see ReformSystem/ReformCluster::averageColor), and
+        // melting it back should hand out particles of THAT color, not
+        // reset everything to the chemical's out-of-the-box default.
         void EmitPoints(const std::vector<glm::vec3>& positions, const glm::vec3& initialVelocity = glm::vec3(0.0f),
-                         float initialHeat = GPU_HEAT_NOT_MELTED);
+                         float initialHeat = 1.0f, uint32_t chemicalId = 0,
+                         const glm::vec4& colorOverride = glm::vec4(0.0f));
 
         void Clear();
 
@@ -233,6 +327,20 @@ namespace Eden
         // never reallocated) - safe to build a descriptor set against
         // once and keep it, see Renderer::RegisterParticleGPUSource.
         VkBuffer GetPositionBuffer() const { return m_Positions.Get(); }
+        // See m_Colors' comment - per-particle, diffusing color, added
+        // for the Chemical ID base build. Same "stable for the object's
+        // lifetime" guarantee as GetPositionBuffer.
+        VkBuffer GetColorBuffer() const { return m_Colors.Get(); }
+        // World-space units/second, vec4 (w unused, same layout as
+        // GetPositionBuffer). General-purpose accessor, same "stable for
+        // the object's lifetime" guarantee as GetPositionBuffer. Not
+        // currently bound by Renderer - an earlier version of the fluid
+        // temporal reprojection pass used this to approximate each
+        // particle's previous position, but that was replaced by an
+        // exact previous-position buffer snapshot the renderer maintains
+        // itself (see Renderer.h's m_ParticlePreviousPositions comment
+        // for why the velocity-based estimate was wrong).
+        VkBuffer GetVelocityBuffer() const { return m_Velocities.Get(); }
 
         // Blocking GPU->CPU readback of every active particle's
         // position, velocity, and heat - a deliberate, narrow,
@@ -247,7 +355,15 @@ namespace Eden
         // shape Emit/EmitBox/EmitPoints already use for uploads - never
         // meant to run per-frame. Used by ClusterSystem.
         void ReadBackAll(std::vector<glm::vec4>& outPositions, std::vector<glm::vec4>& outVelocities,
-                          std::vector<float>& outHeat) const;
+                          std::vector<float>& outHeat, std::vector<uint32_t>& outChemicalIds) const;
+
+        // Colors aren't part of ReadBackAll above (nothing needs them
+        // alongside position/velocity/heat/chemicalId today) - separate,
+        // dedicated readback for ClusterSystem, which needs each
+        // reform-eligible cluster's actual (possibly diffused-away-from-
+        // its-chemical's-default) color to hand to ReformSystem - see
+        // ReformCluster::averageColor's comment.
+        void ReadBackColors(std::vector<glm::vec4>& outColors) const;
 
         // Removes the given particle indices (each must be <
         // ParticleCount()) by reading everything back, compacting on
@@ -273,18 +389,51 @@ namespace Eden
         // Staged upload into an existing DEVICE_LOCAL buffer at a byte
         // offset - the "existing buffer, partial range" case
         // VulkanBuffer::InitDeviceLocalWithData doesn't cover (that one
-        // always creates+fills a brand new buffer). Blocks on
-        // vkQueueWaitIdle, same "simple and correct, not fast"
-        // reasoning as InitDeviceLocalWithData's own comment - fine for
-        // Emit/EmitBox, which aren't per-frame calls.
+        // always creates+fills a brand new buffer).
+        //
+        // Used to block on vkQueueWaitIdle with a fresh staging buffer +
+        // command buffer created and destroyed every call, on the
+        // stated assumption that "Emit/EmitBox aren't per-frame calls."
+        // That stopped being true the moment ProcessPourInput (main.cpp)
+        // started calling EmitBox on a HELD key at ~12/sec - the exact
+        // same "object churn in a path that turned out to become hot"
+        // mistake VoxelSystemGPU's carve path had three separate
+        // instances of (fence, staging buffer, command buffer - see that
+        // class's own comments). Now uses the same persistent-resource
+        // pattern: one staging buffer (grown, never recreated per call),
+        // one reusable command buffer, one reusable fence.
         void UploadRange(VkBuffer dst, VkDeviceSize dstOffset, const void* data, VkDeviceSize size);
 
         // Read-side counterpart to UploadRange - stages through a
         // host-visible buffer + one-time command buffer + blocking
         // queue wait, same shape, just copying GPU->staging->CPU
         // instead of CPU->staging->GPU. See ReadBackAll's public
-        // comment for why this exists at all.
+        // comment for why this exists at all. Still only called from
+        // ClusterSystem's reform pass (H key, edge-triggered, not
+        // held) - unlike UploadRange, nothing has turned this into a
+        // hot path yet, so it's left as-is rather than fixed
+        // speculatively. Worth revisiting with the same fix if that
+        // ever changes.
         void DownloadRange(VkBuffer src, VkDeviceSize srcOffset, void* data, VkDeviceSize size) const;
+
+        // (Re)creates m_UploadStagingBuffer only if requiredBytes
+        // exceeds its current capacity - same shape as VoxelSystemGPU's
+        // EnsureDensityStagingCapacity, see that function's own comment.
+        void EnsureUploadStagingCapacity(VkDeviceSize requiredBytes);
+
+        // Returns m_UploadCommandBuffer, allocating it once and
+        // resetting (never reallocating) it on every later call - same
+        // shape as VoxelSystemGPU::GetReusableCommandBuffer.
+        VkCommandBuffer GetReusableUploadCommandBuffer();
+
+        // Submits a fully-recorded m_UploadCommandBuffer and blocks only
+        // until it finishes, via m_UploadFence (reset and reused every
+        // call, never recreated) - same shape as VoxelSystemGPU::
+        // SubmitAndWaitForCommandBuffer, see that function's own comment
+        // for why a fence scoped to just this submission (not
+        // vkQueueWaitIdle's whole-queue drain, and not a fresh VkFence
+        // per call either) is the actual fix.
+        void SubmitAndWaitForUploadCommandBuffer();
 
         SimParamsGPU BuildSimParams(float subDt, uint32_t numColliders) const;
 
@@ -293,12 +442,41 @@ namespace Eden
         VkCommandPool m_CommandPool = VK_NULL_HANDLE;
         VkQueue m_GraphicsQueue = VK_NULL_HANDLE;
 
+        // Persistent resources for UploadRange/EmitBox's batched upload -
+        // see EnsureUploadStagingCapacity/GetReusableUploadCommandBuffer/
+        // SubmitAndWaitForUploadCommandBuffer's own comments.
+        VkBuffer m_UploadStagingBuffer = VK_NULL_HANDLE;
+        VmaAllocation m_UploadStagingAllocation = VK_NULL_HANDLE;
+        VkDeviceSize m_UploadStagingCapacityBytes = 0;
+        void* m_UploadStagingMappedPtr = nullptr;
+        VkCommandBuffer m_UploadCommandBuffer = VK_NULL_HANDLE;
+        VkFence m_UploadFence = VK_NULL_HANDLE;
+
         VulkanBuffer m_Positions;
         VulkanBuffer m_Velocities;
         VulkanBuffer m_Densities;
         VulkanBuffer m_Pressures;
         VulkanBuffer m_Forces;
         VulkanBuffer m_Heats;
+        // Chemical ID system (base build) - see ChemicalTable's own
+        // comment for the table itself. m_ChemicalIds is per-particle
+        // (like positions/heat - needs an initial upload at emit time and
+        // compaction in KillParticles, since it's identity data, not
+        // scratch). m_Colors is also per-particle and also needs initial
+        // upload/compaction for the same reason (its value at any given
+        // moment depends on this particle's history of diffusion, not
+        // something recomputable from scratch each substep). m_ColorsAvg
+        // is pure scratch, mirroring m_Forces' category exactly - written
+        // in full by particle_force.comp every substep before
+        // particle_integrate.comp reads it, never needs initial upload or
+        // KillParticles compaction. m_ChemicalProperties is NOT indexed
+        // by particle slot at all - it's the small fixed-size table
+        // (ChemicalTable's GPU copy), entirely separate from per-particle
+        // buffer management.
+        VulkanBuffer m_ChemicalIds;
+        VulkanBuffer m_Colors;
+        VulkanBuffer m_ColorsAvg;
+        VulkanBuffer m_ChemicalProperties;
         VulkanBuffer m_CellCounts;
         VulkanBuffer m_CellBuckets;
 

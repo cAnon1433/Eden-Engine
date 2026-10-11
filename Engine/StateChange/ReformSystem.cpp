@@ -1,8 +1,11 @@
 #include "ReformSystem.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdio>
 #include <limits>
+#include <utility>
 
 namespace Eden
 {
@@ -80,6 +83,34 @@ namespace Eden
         // while a genuinely distant straggler naturally can't fit any
         // existing group and gets its own, still-full-resolution volume
         // instead of degrading everyone else's.
+        //
+        // kMaxMergeGap is the second, previously-missing half of that
+        // "genuinely distant" check: the resolution-fit test above only
+        // asks "would the combined box still fit the sample budget", NOT
+        // "are these two things actually near each other" - with a fine
+        // voxelSize (particleRadius*0.6, deliberately not coarsened -
+        // see that constant's own comment), kMaxSamplesPerAxis*voxelSize
+        // can easily span several meters, comfortably wide enough to
+        // scoop up droplets nowhere near the main pool purely because
+        // the fine resolution "affords" the box, not because they
+        // belong together - this was a real, observed bug: hardening
+        // one pool was also hardening scattered droplets well outside
+        // it. Reusing clusterRadius (the same "particles this close
+        // count as one contiguous body" threshold ClusterSystem itself
+        // already uses one level down) as the basis for "clusters this
+        // close count as one hardened body" keeps both merge decisions
+        // grounded in the same physical notion of "close enough",
+        // instead of one being physical and the other an accidental
+        // side effect of voxel resolution. The x3 multiplier is
+        // deliberate headroom, not the same strict adjacency test -
+        // cluster BOUNDING BOXES already have real extent (unlike the
+        // point-particles clusterRadius normally compares), so the gap
+        // between two cluster boxes can legitimately be a bit larger
+        // than a single clusterRadius while still clearly reading as
+        // "one puddle, several fingers" rather than "two unrelated
+        // puddles."
+        float maxMergeGap = clusterRadius * 3.0f;
+
         std::vector<std::vector<size_t>> groups;
         std::vector<glm::vec3> groupMin, groupMax;
 
@@ -94,7 +125,18 @@ namespace Eden
                 float maxComponent = std::max({ candidateExtent.x, candidateExtent.y, candidateExtent.z });
                 int32_t neededSamples = static_cast<int32_t>(std::ceil(maxComponent / voxelSize)) + 1;
 
-                if (neededSamples <= kMaxSamplesPerAxis)
+                // AABB-to-AABB gap (0 if the boxes already overlap/touch)
+                // between this cluster and the group's CURRENT bounds -
+                // the actual proximity test the resolution-fit check
+                // above was missing. Computed against groupMin/groupMax
+                // (not candidateMin/Max) deliberately: this asks "is the
+                // new cluster near the group AS IT STANDS", not "would
+                // it be near the group after we've already grown the box
+                // to include it", which would trivially always pass.
+                glm::vec3 gap = glm::max(glm::vec3(0.0f), glm::max(groupMin[g] - clusterMax[ci], clusterMin[ci] - groupMax[g]));
+                float gapDistance = glm::length(gap);
+
+                if (neededSamples <= kMaxSamplesPerAxis && gapDistance <= maxMergeGap)
                 {
                     groups[g].push_back(ci);
                     groupMin[g] = candidateMin;
@@ -131,8 +173,6 @@ namespace Eden
             desc.voxelSize = voxelSize;
             desc.chunkDims = chunkDims;
 
-            VoxelVolumeHandle handle = voxels.RegisterVolume(desc);
-
             std::vector<glm::vec3> localPositions;
             for (size_t ci : groups[g])
             {
@@ -144,13 +184,135 @@ namespace Eden
                                          clusters[ci].particleIndices.end());
             }
 
-            voxels.SeedFromParticles(handle, localPositions, particleRadius, smoothRadius);
+            // Chunk compaction - compute this group's REAL density field
+            // and classify which chunks actually need geometry BEFORE
+            // registering anything, instead of always reserving
+            // worst-case vertex space for every chunk in desc regardless
+            // of whether it ever produces a triangle. See
+            // VoxelSystemGPU::BuildChunkRemapTable/RegisterVolume's
+            // chunkRemapOverride comment for the full mechanism (a GPU-
+            // side remap table voxel_march.comp consults so it can
+            // safely write into a buffer sized for only the chunks that
+            // matter) - this is what makes a genuinely large, spread-out
+            // pool (mostly empty/solid interior, thin surface shell)
+            // affordable instead of hitting the same worst-case cost a
+            // small, dense one would.
+            std::vector<float> density(desc.NumSamples());
+            VoxelSystemGPU::SplatParticlesIntoDensityField(density, desc, localPositions, particleRadius, smoothRadius);
+
+            std::vector<uint32_t> chunkRemap;
+            uint32_t compactChunkCount = VoxelSystemGPU::BuildChunkRemapTable(density, desc, chunkRemap);
+
+            if (compactChunkCount == 0)
+            {
+                // No chunk in this group's bounding box actually crosses
+                // the isosurface at all - nothing would ever be visible.
+                // Not a safety-cap situation, just genuinely nothing to
+                // build (e.g. particles too sparse relative to voxelSize/
+                // smoothRadius to ever connect into a real surface) -
+                // leave the particles liquid and move on quietly, same
+                // as the safety-cap skip below does, just without a
+                // warning since this isn't a size problem.
+                continue;
+            }
+
+            // Hard safety check BEFORE committing to RegisterVolume - see
+            // VoxelSystemGPU::EstimateVertexBufferBytes' own comment for
+            // the crash this closes: a real reform produced a desc whose
+            // vertex buffer needed a single 5.26GB allocation, which
+            // exceeded the actual device limit (4GB - maxMemoryAllocationSize,
+            // reported directly in the resulting Vulkan error) and took
+            // the whole VkDevice down.
+            //
+            // Now checked against the REAL compact cost (compactChunkCount),
+            // not the old worst-case-for-every-chunk estimate - this is
+            // the actual point of chunk compaction: a pool that used to
+            // get rejected purely because its BOUNDING BOX was large now
+            // only gets rejected if its ACTUAL surface geometry is large,
+            // which is a much rarer, much more honest reason to say no.
+            // 2GB is calibrated against the ACTUAL reported device
+            // ceiling from the crash that motivated this check (4GB) -
+            // half of a real, hardware-reported number, not a guess. This
+            // is still a real simplification worth flagging: fixed at
+            // build time, not queried from the running device's own
+            // maxMemoryAllocationSize (that would need
+            // vkGetPhysicalDeviceProperties2 with a
+            // VkPhysicalDeviceVulkan11Properties/Maintenance3 chain, which
+            // this project doesn't set up anywhere yet).
+            constexpr VkDeviceSize kMaxVertexBufferBytes = 2ull * 1024ull * 1024ull * 1024ull;
+            VkDeviceSize estimatedBytes = VoxelSystemGPU::EstimateVertexBufferBytes(desc, compactChunkCount);
+            if (estimatedBytes > kMaxVertexBufferBytes)
+            {
+                // Rate-limited to one message per DISTINCT (chunkDims,
+                // compactChunkCount) pair, not once per call - see this
+                // check's own original comment for why (Reform() runs
+                // periodically; an unchanging oversized pool would
+                // otherwise spam this every cycle forever).
+                static std::vector<std::pair<glm::ivec3, uint32_t>> s_LastWarned;
+                auto key = std::make_pair(chunkDims, compactChunkCount);
+                bool alreadyWarned = std::find(s_LastWarned.begin(), s_LastWarned.end(), key) != s_LastWarned.end();
+                if (!alreadyWarned)
+                {
+                    std::printf("[Reform] skipped a group (chunkDims=(%d,%d,%d), %u/%u chunks actually need "
+                                "geometry, estimated vertex buffer %.1f MB) - exceeds the %.0f MB per-volume "
+                                "safety cap. Its particles remain liquid rather than risk the out-of-device-memory "
+                                "crash this check exists to prevent. (This message won't repeat for the same size "
+                                "until it changes.)\n",
+                                chunkDims.x, chunkDims.y, chunkDims.z, compactChunkCount, desc.NumChunks(),
+                                static_cast<double>(estimatedBytes) / (1024.0 * 1024.0),
+                                static_cast<double>(kMaxVertexBufferBytes) / (1024.0 * 1024.0));
+                    s_LastWarned.push_back(key);
+                }
+                continue;
+            }
+
+            VoxelVolumeHandle handle = voxels.RegisterVolume(desc, chunkRemap, compactChunkCount);
+            voxels.SetDensityFieldDirect(handle, std::move(density));
             voxels.MarchDirtyChunks(handle);
+
+            // Chemical ID round-trip (see VoxelSystemGPU::SetChemicalId's
+            // comment) - a GROUP can span multiple clusters (grouping
+            // above is purely a GPU-efficiency decision, see this
+            // function's own comment on why), so this weights each
+            // cluster's already-computed averageColor/dominantChemicalId
+            // by that cluster's particle count, same "simple majority
+            // over particles" reasoning ClusterSystem itself uses one
+            // level down. Not a real alloy/mixture model, same
+            // disclaimer as ReformCluster's own comment.
+            glm::vec3 groupColorSum(0.0f);
+            uint32_t groupParticleCount = 0;
+            std::array<uint32_t, GPU_MAX_CHEMICALS> groupChemicalVotes{};
+            for (size_t ci : groups[g])
+            {
+                uint32_t clusterSize = static_cast<uint32_t>(clusters[ci].positions.size());
+                groupColorSum += glm::vec3(clusters[ci].averageColor) * static_cast<float>(clusterSize);
+                groupParticleCount += clusterSize;
+                groupChemicalVotes[clusters[ci].dominantChemicalId] += clusterSize;
+            }
+            glm::vec4 groupColor = groupParticleCount > 0
+                ? glm::vec4(groupColorSum / static_cast<float>(groupParticleCount), 1.0f)
+                : glm::vec4(1.0f);
+            uint32_t groupChemical = 0;
+            uint32_t bestVotes = 0;
+            for (uint32_t c = 0; c < GPU_MAX_CHEMICALS; ++c)
+            {
+                if (groupChemicalVotes[c] > bestVotes)
+                {
+                    bestVotes = groupChemicalVotes[c];
+                    groupChemical = c;
+                }
+            }
+            voxels.SetChemicalId(handle, groupChemical);
 
             // World placement is already baked into desc.origin (worldMin
             // above) - same convention the main.cpp smoke-test volume
             // uses, identity transform on top of a world-space origin.
-            voxels.SetTransform(handle, glm::mat4(1.0f));
+            // groupColor (not a fixed/absent tint) is what makes "the
+            // hardened form keeps properties like colour" actually true -
+            // this volume now visibly renders as whatever color its
+            // source particles had actually diffused to, not the
+            // chemical's flat default or the old "no override" white.
+            voxels.SetTransform(handle, glm::mat4(1.0f), groupColor);
 
             newVolumes.push_back(handle);
         }

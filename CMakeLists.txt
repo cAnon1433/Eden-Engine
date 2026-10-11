@@ -16,6 +16,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Mac/Linux (MSVC_RUNTIME_LIBRARY is a no-op there).
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
+# Single-config generators (Makefiles/Ninja): if nobody asked for a build type,
+# build Release. An empty build type means NO optimization and NDEBUG unset
+# (=> Vulkan validation layers on), which is the slowest way to run Eden.
+if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 find_package(Vulkan REQUIRED)
 
 # GLFW and GLM are vendored directly under ThirdParty/ (same pattern as
@@ -42,6 +49,13 @@ find_package(Vulkan REQUIRED)
 # doesn't currently have one, but no reason to let GLFW add one).
 set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
+# Linux: build GLFW's X11 backend only. GLFW 3.4 auto-enables its Wayland
+# backend whenever the Wayland dev packages are installed, but the vendored
+# copy in ThirdParty/glfw/ doesn't include deps/wayland/*.xml (needed to
+# generate the protocol headers), so that configuration fails to build.
+# Wayland desktops still run Eden fine through XWayland. No effect on
+# Windows/macOS.
+set(GLFW_BUILD_WAYLAND OFF CACHE BOOL "" FORCE)
 add_subdirectory("${CMAKE_SOURCE_DIR}/ThirdParty/glfw")
 
 # GLM (ThirdParty/glm/, pinned at release 1.0.1) is header-only - no
@@ -146,6 +160,12 @@ set(IMGUI_SOURCES
 list(APPEND EDEN_SOURCES ${IMGUI_SOURCES})
 
 add_executable(Eden ${EDEN_SOURCES})
+
+# Every file that includes <GLFW/glfw3.h> gets Vulkan's header instead of
+# OpenGL's. Without this, only main.cpp avoided <GL/gl.h> - fine on macOS
+# (OpenGL ships with the OS) but a hard compile error on Linux machines
+# without libgl-dev, which Eden never needs.
+target_compile_definitions(Eden PRIVATE GLFW_INCLUDE_NONE GLFW_INCLUDE_VULKAN)
 add_dependencies(Eden EdenShaders)
 
 target_include_directories(Eden PRIVATE

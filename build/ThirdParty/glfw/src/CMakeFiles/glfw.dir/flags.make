@@ -4,9 +4,9 @@
 # compile C with /usr/bin/cc
 C_DEFINES = -D_GLFW_COCOA
 
-C_INCLUDES = -I/Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/ThirdParty/glfw/include -I/Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/ThirdParty/glfw/src -I/Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build/ThirdParty/glfw/src
+C_INCLUDES = -I"/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/ThirdParty/glfw/include" -I"/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/ThirdParty/glfw/src" -I"/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/build/ThirdParty/glfw/src"
 
-C_FLAGSarm64 = -g -std=c99 -arch arm64 -fPIC -Wall
+C_FLAGSarm64 = -O3 -DNDEBUG -std=c99 -arch arm64 -fPIC -Wall
 
-C_FLAGS = -g -std=c99 -arch arm64 -fPIC -Wall
+C_FLAGS = -O3 -DNDEBUG -std=c99 -arch arm64 -fPIC -Wall
 

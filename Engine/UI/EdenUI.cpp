@@ -1,4 +1,6 @@
 #include "EdenUI.h"
+#include "../Core/Profiler.h"
+#include "../Renderer/Renderer.h"
 
 #include "../ECS/Components/TransformComponent.h"
 #include "../ECS/Components/MeshComponent.h"
@@ -730,6 +732,95 @@ namespace Eden::UI
         ImGui::SliderInt("Max Sweep Iterations##part", &particleSystem.maxSweepIterations, 1, 32);
         ImGui::TextDisabled("Sweep (tunnelling fix) only runs for particles moving faster than Boundary Radius per substep.");
         ImGui::TextDisabled("Particles are deflected by any TransformComponent + ColliderComponent entity; no force is applied back onto it yet.");
+
+        ImGui::End();
+    }
+
+    void DrawPerformancePanel(Renderer& renderer, int& maxPhysicsSteps)
+    {
+        Profiler& profiler = Profiler::Get();
+        // Anchor top-right on first use so it doesn't land on top of the
+        // other default-positioned panels; the user can still move it.
+        ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x - 470.0f, 10.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(460.0f, 520.0f), ImGuiCond_FirstUseEver);
+        ImGui::Begin("Eden - Performance");
+
+        const float avg = profiler.FrameAvgMs() > 0.0001f ? profiler.FrameAvgMs() : 0.0001f;
+        ImGui::Text("%.1f fps   (%.2f ms avg, %.2f ms worst recent)", 1000.0f / avg, avg, profiler.FramePeakMs());
+        ImGui::PlotLines("##frametimes", profiler.History(), Profiler::kHistory, profiler.HistoryOffset(), nullptr, 0.0f,
+                          50.0f, ImVec2(0.0f, 56.0f));
+
+        const float waitGpu = profiler.AvgOf("Frame: waiting for GPU (fence)");
+        if (waitGpu / avg > 0.45f)
+        {
+            ImGui::TextColored(ImVec4(1.0f, 0.65f, 0.3f, 1.0f), "GPU-bound: the CPU spends %.0f%% of the frame waiting on the GPU.", 100.0f * waitGpu / avg);
+        }
+        else
+        {
+            ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1.0f), "Not GPU-bound (GPU wait %.0f%% of frame). Check the CPU rows.", 100.0f * waitGpu / avg);
+        }
+
+        if (!profiler.WorstFrameBreakdown().empty())
+        {
+            ImGui::SeparatorText("Slowest recent frame");
+            ImGui::Text("%.2f ms - biggest contributors:", profiler.WorstFrameMs());
+            int shown = 0;
+            for (const auto& item : profiler.WorstFrameBreakdown())
+            {
+                if (item.second < 0.05f || shown++ >= 6) { break; }
+                ImGui::Text("  %-46s %6.2f", item.first.c_str(), item.second);
+            }
+        }
+
+        ImGui::SeparatorText("CPU sections (ms: avg / recent worst)");
+        for (const Profiler::Entry& e : profiler.Entries())
+        {
+            if (!e.gpu)
+            {
+                ImGui::Text("%-46s %6.2f / %6.2f", e.name.c_str(), e.avg, e.peak);
+            }
+        }
+
+        ImGui::SeparatorText("GPU passes");
+        if (!renderer.GpuTimingSupported())
+        {
+            ImGui::TextDisabled("GPU timestamps not supported on this device.");
+        }
+        else
+        {
+            ImGui::Checkbox("Measure GPU pass times", &renderer.GpuTimingEnabled);
+            ImGui::TextDisabled("Approximate on Apple GPUs. Off = zero overhead.");
+            for (const Profiler::Entry& e : profiler.Entries())
+            {
+                if (e.gpu)
+                {
+                    ImGui::Text("%-46s %6.2f / %6.2f", e.name.c_str(), e.avg, e.peak);
+                }
+            }
+        }
+
+        ImGui::SeparatorText("Debug: what to draw (find the expensive part)");
+        ImGui::Checkbox("Draw meshes", &renderer.DebugDrawMeshes);
+        ImGui::SameLine();
+        ImGui::Checkbox("Draw terrain / voxel geometry", &renderer.DebugDrawVoxelGeometry);
+        ImGui::Checkbox("Draw raymarched objects", &renderer.DebugDrawRaymarch);
+        ImGui::Checkbox("Draw liquid", &renderer.FluidSurfaceEnabled);
+        ImGui::Checkbox("Confine liquid passes to where liquid is visible", &renderer.FluidBoundsCullingEnabled);
+        ImGui::TextDisabled("Untick one at a time and watch the frame time / GPU rows.");
+
+        ImGui::SeparatorText("Tuning");
+        ImGui::SliderInt("Max physics catch-up steps per frame", &maxPhysicsSteps, 1, 8);
+        ImGui::TextDisabled("Lower = bounded frame cost on slow machines (sim runs slow-motion below 60/steps fps).");
+
+        if (ImGui::Button("Save report to eden_perf.txt"))
+        {
+            profiler.SaveReport("eden_perf.txt", "Eden performance report");
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Copy report to clipboard"))
+        {
+            ImGui::SetClipboardText(profiler.BuildReport("Eden performance report").c_str());
+        }
 
         ImGui::End();
     }

@@ -1,0 +1,33 @@
+# --- Build output (never commit) ---
+build/
+build-*/
+dist/
+out/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+*.o
+*.obj
+*.pdb
+*.ilk
+*.exe
+*.spv
+
+# --- Generated at runtime / by tools ---
+eden_perf.txt
+eden_cmake.log
+eden_make.log
+eden_package_*.log
+*.log
+
+# --- Secrets / helper files (the Mac sync scripts write their token relay to
+#     a temp file outside this folder now, but keep these out regardless) ---
+.eden_askpass*
+
+# --- OS / editor junk ---
+.DS_Store
+Thumbs.db
+.vs/
+.vscode/
+.idea/
+*.swp

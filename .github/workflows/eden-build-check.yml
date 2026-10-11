@@ -1,0 +1,60 @@
+name: Eden build check
+
+# Compiles Eden on every push/PR so platform build problems show up here
+# instead of on a tester's machine. This is a build check only - it publishes
+# nothing (see eden-release.yml for publishing).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    name: Linux (GCC)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential libvulkan-dev glslang-tools \
+            libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build --parallel
+
+  windows:
+    name: Windows (MSVC)
+    runs-on: windows-latest
+    # Not yet proven in CI - a setup hiccup here shouldn't hide a real result
+    # from the other jobs. Read this job's log either way.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Vulkan SDK
+        uses: jakoch/install-vulkan-sdk-action@v1
+        with:
+          vulkan_version: latest
+          install_runtime: false
+          cache: true
+          stripdown: true
+      - name: Configure
+        run: cmake -S . -B build -A x64
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+  macos:
+    name: macOS (Clang + MoltenVK)
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: brew install cmake vulkan-headers vulkan-loader molten-vk glslang
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build --parallel

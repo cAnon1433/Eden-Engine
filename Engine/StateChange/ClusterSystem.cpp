@@ -3,6 +3,7 @@
 
 #include <unordered_map>
 #include <deque>
+#include <array>
 
 namespace Eden
 {
@@ -31,22 +32,39 @@ namespace Eden
 
         std::vector<glm::vec4> allPositions, allVelocities;
         std::vector<float> allHeat;
-        particles.ReadBackAll(allPositions, allVelocities, allHeat);
+        std::vector<uint32_t> allChemicalIds;
+        particles.ReadBackAll(allPositions, allVelocities, allHeat, allChemicalIds);
+
+        std::vector<glm::vec4> allColors;
+        particles.ReadBackColors(allColors);
 
         if (allPositions.empty() || clusterRadius <= 0.0f)
         {
             return result;
         }
 
-        // Eligible = actually part of the melt system (not
-        // GPU_HEAT_NOT_MELTED) and cooled enough to be a reform
-        // candidate.
+        // Eligible = this particle's chemical actually hardens at all
+        // (threshold >= 0 - see ChemicalPropertiesGPU::hardeningThreshold's
+        // comment; negative means "never hardens", e.g. an Aqua-like
+        // chemical) AND its heat has cooled to/below that threshold.
+        // Previously also required heat >= 0.0 as a per-PARTICLE "is this
+        // even part of the melt system" gate (particles from ordinary
+        // EmitBox were permanently excluded via GPU_HEAT_NOT_MELTED) -
+        // that's gone. ANY particle can be reform-eligible now, provided
+        // its own chemical allows hardening at all; the exemption moved
+        // from "how was this particle created" to "what chemical is it"
+        // - see GPU_HEAT_NOT_MELTED's comment for the full reasoning.
         std::vector<uint32_t> eligible;
         eligible.reserve(allPositions.size());
         for (uint32_t i = 0; i < allPositions.size(); ++i)
         {
+            float threshold = particles.ChemicalTable[allChemicalIds[i]].hardeningThreshold;
+            if (threshold < 0.0f)
+            {
+                continue; // this chemical never hardens, regardless of heat
+            }
             float heat = allHeat[i];
-            if (heat >= 0.0f && heat <= GPU_HEAT_REFORM_THRESHOLD)
+            if (heat >= 0.0f && heat <= threshold)
             {
                 eligible.push_back(i);
             }
@@ -128,11 +146,35 @@ namespace Eden
                 ReformCluster cluster;
                 cluster.positions.reserve(component.size());
                 cluster.particleIndices.reserve(component.size());
+
+                // Majority-vote chemical + mean color across the whole
+                // cluster - see ReformCluster's own comment on why
+                // neither is a fully principled "the" answer for a
+                // mixed cluster, just a reasonable simple one.
+                std::array<uint32_t, GPU_MAX_CHEMICALS> chemicalCounts{};
+                glm::vec3 colorSum(0.0f);
+
                 for (uint32_t index : component)
                 {
                     cluster.positions.push_back(glm::vec3(allPositions[index]));
                     cluster.particleIndices.push_back(index);
+                    chemicalCounts[allChemicalIds[index]]++;
+                    colorSum += glm::vec3(allColors[index]);
                 }
+
+                uint32_t bestChemical = 0;
+                uint32_t bestCount = 0;
+                for (uint32_t c = 0; c < GPU_MAX_CHEMICALS; ++c)
+                {
+                    if (chemicalCounts[c] > bestCount)
+                    {
+                        bestCount = chemicalCounts[c];
+                        bestChemical = c;
+                    }
+                }
+                cluster.dominantChemicalId = bestChemical;
+                cluster.averageColor = glm::vec4(colorSum / static_cast<float>(component.size()), 1.0f);
+
                 result.push_back(std::move(cluster));
             }
         }

@@ -16,6 +16,26 @@ layout(std430, binding = 3) buffer PressuresBuffer { float pressures[]; };
 layout(std430, binding = 5) readonly buffer CellCountsBuffer { uint cellCounts[]; };
 layout(std430, binding = 6) readonly buffer CellBucketsBuffer { uint cellBuckets[]; };
 
+// Chemical ID system (base build) - see ParticleGPUTypes.h's
+// ChemicalPropertiesGPU comment for which fields are load-bearing here.
+// Byte-identical to that C++ struct (std430, hand-synced, same
+// convention SimParams already uses across all four compute shaders).
+struct ChemicalProperties
+{
+    float mass;
+    float restDensity;
+    float viscosity;
+    float stiffness;
+    float hardeningThreshold; // unused in this shader - read CPU-side by ClusterSystem
+    float hardenedDensity;    // unused in this shader - reserved, see C++ struct comment
+    float conductivity;       // inert - see C++ struct comment
+    float cohesion;           // unused in THIS shader - see particle_force.comp's cohesionIJ
+    vec4 baseColor;           // unused in this shader - see fluid_depth.vert/.frag
+};
+
+layout(std430, binding = 10) readonly buffer ChemicalIdBuffer { uint chemicalIds[]; };
+layout(std430, binding = 13) readonly buffer ChemicalPropertiesBuffer { ChemicalProperties chemicals[]; };
+
 layout(push_constant) uniform SimParams
 {
     uint particleCount;
@@ -109,7 +129,13 @@ void main()
         {
             uint j = cellBuckets[base + s];
             float r = length(pi - positions[j].xyz);
-            density += sim.mass * Poly6(r, sim.h);
+            // Each neighbor contributes ITS OWN mass, not a shared
+            // global one - the standard multi-material SPH density
+            // formulation (see ChemicalProperties' comment). A particle
+            // made of a heavier chemical genuinely weighs more into its
+            // neighbors' density estimates, exactly as it should.
+            float massJ = chemicals[chemicalIds[j]].mass;
+            density += massJ * Poly6(r, sim.h);
         }
     }
 
@@ -119,7 +145,15 @@ void main()
 
     // Tait equation of state, clamped non-negative - see ParticleSystem.h's
     // `stiffness` comment for why (tensile instability otherwise).
-    float ratio = density / sim.restDensity;
-    float pressure = sim.stiffness * (pow(ratio, sim.gamma) - 1.0);
+    // restDensity/stiffness now come from THIS particle's own chemical,
+    // not a single global value - two different chemicals genuinely
+    // resist compression differently now, which is what "differing
+    // properties, not all shared globally" actually requires. gamma
+    // stays global (sim.gamma) - an EOS exponent, not something the
+    // Design Document lists as a Chemical ID field, so keeping it shared
+    // is a deliberate scope line, not an oversight.
+    uint chemI = chemicalIds[i];
+    float ratio = density / chemicals[chemI].restDensity;
+    float pressure = chemicals[chemI].stiffness * (pow(ratio, sim.gamma) - 1.0);
     pressures[i] = max(0.0, pressure);
 }

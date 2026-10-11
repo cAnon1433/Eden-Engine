@@ -53,10 +53,10 @@ RM = /opt/homebrew/bin/cmake -E rm -f
 EQUALS = =
 
 # The top-level source directory on which CMake was run.
-CMAKE_SOURCE_DIR = /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30
+CMAKE_SOURCE_DIR = "/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2"
 
 # The top-level build directory on which CMake was run.
-CMAKE_BINARY_DIR = /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build
+CMAKE_BINARY_DIR = "/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/build"
 
 # Utility rule file for EdenShaders.
 
@@ -66,10 +66,17 @@ include CMakeFiles/EdenShaders.dir/compiler_depend.make
 # Include the progress variables for this target.
 include CMakeFiles/EdenShaders.dir/progress.make
 
+CMakeFiles/EdenShaders: Shaders/Compiled/fluid_blob.frag.spv
+CMakeFiles/EdenShaders: Shaders/Compiled/fluid_blob.vert.spv
 CMakeFiles/EdenShaders: Shaders/Compiled/fluid_blur.frag.spv
+CMakeFiles/EdenShaders: Shaders/Compiled/fluid_blur_polish.frag.spv
+CMakeFiles/EdenShaders: Shaders/Compiled/fluid_bounds.comp.spv
 CMakeFiles/EdenShaders: Shaders/Compiled/fluid_composite.frag.spv
 CMakeFiles/EdenShaders: Shaders/Compiled/fluid_depth.frag.spv
 CMakeFiles/EdenShaders: Shaders/Compiled/fluid_depth.vert.spv
+CMakeFiles/EdenShaders: Shaders/Compiled/fluid_temporal.frag.spv
+CMakeFiles/EdenShaders: Shaders/Compiled/fluid_thickness.frag.spv
+CMakeFiles/EdenShaders: Shaders/Compiled/fluid_thickness.vert.spv
 CMakeFiles/EdenShaders: Shaders/Compiled/particle_build_grid.comp.spv
 CMakeFiles/EdenShaders: Shaders/Compiled/particle_density.comp.spv
 CMakeFiles/EdenShaders: Shaders/Compiled/particle_force.comp.spv
@@ -83,78 +90,113 @@ CMakeFiles/EdenShaders: Shaders/Compiled/triangle.frag.spv
 CMakeFiles/EdenShaders: Shaders/Compiled/triangle.vert.spv
 CMakeFiles/EdenShaders: Shaders/Compiled/voxel_march.comp.spv
 
-Shaders/Compiled/fluid_blur.frag.spv: /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/Shaders/Source/fluid_blur.frag
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir=/Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_1) "Compiling shader: fluid_blur.frag"
-	/usr/local/bin/glslangValidator -V --target-env vulkan1.2 /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/Shaders/Source/fluid_blur.frag -o /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build/Shaders/Compiled/fluid_blur.frag.spv
+Shaders/Compiled/fluid_blob.frag.spv: /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/fluid_blob.frag
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir="/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/build/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_1) "Compiling shader: fluid_blob.frag"
+	/usr/local/bin/glslangValidator -V --target-env vulkan1.2 /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/fluid_blob.frag -o /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/build/Shaders/Compiled/fluid_blob.frag.spv
 
-Shaders/Compiled/fluid_composite.frag.spv: /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/Shaders/Source/fluid_composite.frag
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir=/Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Compiling shader: fluid_composite.frag"
-	/usr/local/bin/glslangValidator -V --target-env vulkan1.2 /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/Shaders/Source/fluid_composite.frag -o /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build/Shaders/Compiled/fluid_composite.frag.spv
+Shaders/Compiled/fluid_blob.vert.spv: /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/fluid_blob.vert
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir="/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/build/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_2) "Compiling shader: fluid_blob.vert"
+	/usr/local/bin/glslangValidator -V --target-env vulkan1.2 /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/fluid_blob.vert -o /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/build/Shaders/Compiled/fluid_blob.vert.spv
 
-Shaders/Compiled/fluid_depth.frag.spv: /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/Shaders/Source/fluid_depth.frag
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir=/Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_3) "Compiling shader: fluid_depth.frag"
-	/usr/local/bin/glslangValidator -V --target-env vulkan1.2 /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/Shaders/Source/fluid_depth.frag -o /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build/Shaders/Compiled/fluid_depth.frag.spv
+Shaders/Compiled/fluid_blur.frag.spv: /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/fluid_blur.frag
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir="/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/build/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_3) "Compiling shader: fluid_blur.frag"
+	/usr/local/bin/glslangValidator -V --target-env vulkan1.2 /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/fluid_blur.frag -o /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/build/Shaders/Compiled/fluid_blur.frag.spv
 
-Shaders/Compiled/fluid_depth.vert.spv: /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/Shaders/Source/fluid_depth.vert
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir=/Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_4) "Compiling shader: fluid_depth.vert"
-	/usr/local/bin/glslangValidator -V --target-env vulkan1.2 /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/Shaders/Source/fluid_depth.vert -o /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build/Shaders/Compiled/fluid_depth.vert.spv
+Shaders/Compiled/fluid_blur_polish.frag.spv: /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/fluid_blur_polish.frag
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir="/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/build/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_4) "Compiling shader: fluid_blur_polish.frag"
+	/usr/local/bin/glslangValidator -V --target-env vulkan1.2 /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/fluid_blur_polish.frag -o /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/build/Shaders/Compiled/fluid_blur_polish.frag.spv
 
-Shaders/Compiled/particle_build_grid.comp.spv: /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/Shaders/Source/particle_build_grid.comp
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir=/Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_5) "Compiling shader: particle_build_grid.comp"
-	/usr/local/bin/glslangValidator -V --target-env vulkan1.2 /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/Shaders/Source/particle_build_grid.comp -o /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build/Shaders/Compiled/particle_build_grid.comp.spv
+Shaders/Compiled/fluid_bounds.comp.spv: /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/fluid_bounds.comp
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir="/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/build/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_5) "Compiling shader: fluid_bounds.comp"
+	/usr/local/bin/glslangValidator -V --target-env vulkan1.2 /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/fluid_bounds.comp -o /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/build/Shaders/Compiled/fluid_bounds.comp.spv
 
-Shaders/Compiled/particle_density.comp.spv: /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/Shaders/Source/particle_density.comp
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir=/Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_6) "Compiling shader: particle_density.comp"
-	/usr/local/bin/glslangValidator -V --target-env vulkan1.2 /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/Shaders/Source/particle_density.comp -o /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build/Shaders/Compiled/particle_density.comp.spv
+Shaders/Compiled/fluid_composite.frag.spv: /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/fluid_composite.frag
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir="/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/build/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_6) "Compiling shader: fluid_composite.frag"
+	/usr/local/bin/glslangValidator -V --target-env vulkan1.2 /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/fluid_composite.frag -o /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/build/Shaders/Compiled/fluid_composite.frag.spv
 
-Shaders/Compiled/particle_force.comp.spv: /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/Shaders/Source/particle_force.comp
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir=/Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_7) "Compiling shader: particle_force.comp"
-	/usr/local/bin/glslangValidator -V --target-env vulkan1.2 /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/Shaders/Source/particle_force.comp -o /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build/Shaders/Compiled/particle_force.comp.spv
+Shaders/Compiled/fluid_depth.frag.spv: /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/fluid_depth.frag
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir="/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/build/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_7) "Compiling shader: fluid_depth.frag"
+	/usr/local/bin/glslangValidator -V --target-env vulkan1.2 /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/fluid_depth.frag -o /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/build/Shaders/Compiled/fluid_depth.frag.spv
 
-Shaders/Compiled/particle_integrate.comp.spv: /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/Shaders/Source/particle_integrate.comp
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir=/Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_8) "Compiling shader: particle_integrate.comp"
-	/usr/local/bin/glslangValidator -V --target-env vulkan1.2 /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/Shaders/Source/particle_integrate.comp -o /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build/Shaders/Compiled/particle_integrate.comp.spv
+Shaders/Compiled/fluid_depth.vert.spv: /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/fluid_depth.vert
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir="/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/build/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_8) "Compiling shader: fluid_depth.vert"
+	/usr/local/bin/glslangValidator -V --target-env vulkan1.2 /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/fluid_depth.vert -o /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/build/Shaders/Compiled/fluid_depth.vert.spv
 
-Shaders/Compiled/particle_point.frag.spv: /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/Shaders/Source/particle_point.frag
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir=/Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_9) "Compiling shader: particle_point.frag"
-	/usr/local/bin/glslangValidator -V --target-env vulkan1.2 /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/Shaders/Source/particle_point.frag -o /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build/Shaders/Compiled/particle_point.frag.spv
+Shaders/Compiled/fluid_temporal.frag.spv: /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/fluid_temporal.frag
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir="/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/build/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_9) "Compiling shader: fluid_temporal.frag"
+	/usr/local/bin/glslangValidator -V --target-env vulkan1.2 /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/fluid_temporal.frag -o /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/build/Shaders/Compiled/fluid_temporal.frag.spv
 
-Shaders/Compiled/particle_point.vert.spv: /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/Shaders/Source/particle_point.vert
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir=/Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_10) "Compiling shader: particle_point.vert"
-	/usr/local/bin/glslangValidator -V --target-env vulkan1.2 /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/Shaders/Source/particle_point.vert -o /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build/Shaders/Compiled/particle_point.vert.spv
+Shaders/Compiled/fluid_thickness.frag.spv: /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/fluid_thickness.frag
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir="/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/build/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_10) "Compiling shader: fluid_thickness.frag"
+	/usr/local/bin/glslangValidator -V --target-env vulkan1.2 /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/fluid_thickness.frag -o /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/build/Shaders/Compiled/fluid_thickness.frag.spv
 
-Shaders/Compiled/particle_point_gpu.vert.spv: /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/Shaders/Source/particle_point_gpu.vert
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir=/Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_11) "Compiling shader: particle_point_gpu.vert"
-	/usr/local/bin/glslangValidator -V --target-env vulkan1.2 /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/Shaders/Source/particle_point_gpu.vert -o /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build/Shaders/Compiled/particle_point_gpu.vert.spv
+Shaders/Compiled/fluid_thickness.vert.spv: /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/fluid_thickness.vert
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir="/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/build/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_11) "Compiling shader: fluid_thickness.vert"
+	/usr/local/bin/glslangValidator -V --target-env vulkan1.2 /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/fluid_thickness.vert -o /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/build/Shaders/Compiled/fluid_thickness.vert.spv
 
-Shaders/Compiled/raymarch.frag.spv: /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/Shaders/Source/raymarch.frag
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir=/Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_12) "Compiling shader: raymarch.frag"
-	/usr/local/bin/glslangValidator -V --target-env vulkan1.2 /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/Shaders/Source/raymarch.frag -o /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build/Shaders/Compiled/raymarch.frag.spv
+Shaders/Compiled/particle_build_grid.comp.spv: /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/particle_build_grid.comp
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir="/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/build/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_12) "Compiling shader: particle_build_grid.comp"
+	/usr/local/bin/glslangValidator -V --target-env vulkan1.2 /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/particle_build_grid.comp -o /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/build/Shaders/Compiled/particle_build_grid.comp.spv
 
-Shaders/Compiled/raymarch.vert.spv: /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/Shaders/Source/raymarch.vert
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir=/Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_13) "Compiling shader: raymarch.vert"
-	/usr/local/bin/glslangValidator -V --target-env vulkan1.2 /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/Shaders/Source/raymarch.vert -o /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build/Shaders/Compiled/raymarch.vert.spv
+Shaders/Compiled/particle_density.comp.spv: /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/particle_density.comp
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir="/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/build/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_13) "Compiling shader: particle_density.comp"
+	/usr/local/bin/glslangValidator -V --target-env vulkan1.2 /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/particle_density.comp -o /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/build/Shaders/Compiled/particle_density.comp.spv
 
-Shaders/Compiled/triangle.frag.spv: /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/Shaders/Source/triangle.frag
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir=/Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_14) "Compiling shader: triangle.frag"
-	/usr/local/bin/glslangValidator -V --target-env vulkan1.2 /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/Shaders/Source/triangle.frag -o /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build/Shaders/Compiled/triangle.frag.spv
+Shaders/Compiled/particle_force.comp.spv: /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/particle_force.comp
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir="/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/build/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_14) "Compiling shader: particle_force.comp"
+	/usr/local/bin/glslangValidator -V --target-env vulkan1.2 /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/particle_force.comp -o /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/build/Shaders/Compiled/particle_force.comp.spv
 
-Shaders/Compiled/triangle.vert.spv: /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/Shaders/Source/triangle.vert
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir=/Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_15) "Compiling shader: triangle.vert"
-	/usr/local/bin/glslangValidator -V --target-env vulkan1.2 /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/Shaders/Source/triangle.vert -o /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build/Shaders/Compiled/triangle.vert.spv
+Shaders/Compiled/particle_integrate.comp.spv: /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/particle_integrate.comp
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir="/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/build/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_15) "Compiling shader: particle_integrate.comp"
+	/usr/local/bin/glslangValidator -V --target-env vulkan1.2 /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/particle_integrate.comp -o /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/build/Shaders/Compiled/particle_integrate.comp.spv
 
-Shaders/Compiled/voxel_march.comp.spv: /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/Shaders/Source/voxel_march.comp
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir=/Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_16) "Compiling shader: voxel_march.comp"
-	/usr/local/bin/glslangValidator -V --target-env vulkan1.2 /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/Shaders/Source/voxel_march.comp -o /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build/Shaders/Compiled/voxel_march.comp.spv
+Shaders/Compiled/particle_point.frag.spv: /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/particle_point.frag
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir="/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/build/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_16) "Compiling shader: particle_point.frag"
+	/usr/local/bin/glslangValidator -V --target-env vulkan1.2 /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/particle_point.frag -o /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/build/Shaders/Compiled/particle_point.frag.spv
+
+Shaders/Compiled/particle_point.vert.spv: /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/particle_point.vert
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir="/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/build/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_17) "Compiling shader: particle_point.vert"
+	/usr/local/bin/glslangValidator -V --target-env vulkan1.2 /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/particle_point.vert -o /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/build/Shaders/Compiled/particle_point.vert.spv
+
+Shaders/Compiled/particle_point_gpu.vert.spv: /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/particle_point_gpu.vert
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir="/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/build/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_18) "Compiling shader: particle_point_gpu.vert"
+	/usr/local/bin/glslangValidator -V --target-env vulkan1.2 /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/particle_point_gpu.vert -o /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/build/Shaders/Compiled/particle_point_gpu.vert.spv
+
+Shaders/Compiled/raymarch.frag.spv: /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/raymarch.frag
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir="/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/build/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_19) "Compiling shader: raymarch.frag"
+	/usr/local/bin/glslangValidator -V --target-env vulkan1.2 /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/raymarch.frag -o /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/build/Shaders/Compiled/raymarch.frag.spv
+
+Shaders/Compiled/raymarch.vert.spv: /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/raymarch.vert
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir="/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/build/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_20) "Compiling shader: raymarch.vert"
+	/usr/local/bin/glslangValidator -V --target-env vulkan1.2 /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/raymarch.vert -o /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/build/Shaders/Compiled/raymarch.vert.spv
+
+Shaders/Compiled/triangle.frag.spv: /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/triangle.frag
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir="/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/build/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_21) "Compiling shader: triangle.frag"
+	/usr/local/bin/glslangValidator -V --target-env vulkan1.2 /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/triangle.frag -o /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/build/Shaders/Compiled/triangle.frag.spv
+
+Shaders/Compiled/triangle.vert.spv: /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/triangle.vert
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir="/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/build/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_22) "Compiling shader: triangle.vert"
+	/usr/local/bin/glslangValidator -V --target-env vulkan1.2 /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/triangle.vert -o /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/build/Shaders/Compiled/triangle.vert.spv
+
+Shaders/Compiled/voxel_march.comp.spv: /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/voxel_march.comp
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir="/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/build/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_23) "Compiling shader: voxel_march.comp"
+	/usr/local/bin/glslangValidator -V --target-env vulkan1.2 /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/Shaders/Source/voxel_march.comp -o /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/build/Shaders/Compiled/voxel_march.comp.spv
 
 CMakeFiles/EdenShaders.dir/codegen:
 .PHONY : CMakeFiles/EdenShaders.dir/codegen
 
 EdenShaders: CMakeFiles/EdenShaders
+EdenShaders: Shaders/Compiled/fluid_blob.frag.spv
+EdenShaders: Shaders/Compiled/fluid_blob.vert.spv
 EdenShaders: Shaders/Compiled/fluid_blur.frag.spv
+EdenShaders: Shaders/Compiled/fluid_blur_polish.frag.spv
+EdenShaders: Shaders/Compiled/fluid_bounds.comp.spv
 EdenShaders: Shaders/Compiled/fluid_composite.frag.spv
 EdenShaders: Shaders/Compiled/fluid_depth.frag.spv
 EdenShaders: Shaders/Compiled/fluid_depth.vert.spv
+EdenShaders: Shaders/Compiled/fluid_temporal.frag.spv
+EdenShaders: Shaders/Compiled/fluid_thickness.frag.spv
+EdenShaders: Shaders/Compiled/fluid_thickness.vert.spv
 EdenShaders: Shaders/Compiled/particle_build_grid.comp.spv
 EdenShaders: Shaders/Compiled/particle_density.comp.spv
 EdenShaders: Shaders/Compiled/particle_force.comp.spv
@@ -179,6 +221,6 @@ CMakeFiles/EdenShaders.dir/clean:
 .PHONY : CMakeFiles/EdenShaders.dir/clean
 
 CMakeFiles/EdenShaders.dir/depend:
-	cd /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build && $(CMAKE_COMMAND) -E cmake_depends "Unix Makefiles" /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30 /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30 /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build/CMakeFiles/EdenShaders.dir/DependInfo.cmake "--color=$(COLOR)" EdenShaders
+	cd "/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/build" && $(CMAKE_COMMAND) -E cmake_depends "Unix Makefiles" "/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2" "/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2" "/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/build" "/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/build" "/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/build/CMakeFiles/EdenShaders.dir/DependInfo.cmake" "--color=$(COLOR)" EdenShaders
 .PHONY : CMakeFiles/EdenShaders.dir/depend
 

@@ -59,7 +59,36 @@ namespace Eden
                   VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
                   VkCullModeFlags cullMode = VK_CULL_MODE_BACK_BIT,
                   bool depthTestEnable = true,
-                  bool depthWriteEnable = true);
+                  bool depthWriteEnable = true,
+                  // Number of color attachments the render pass this
+                  // pipeline is built for actually has. Defaults to 1 -
+                  // every existing call site unaffected. The fluid depth
+                  // prepass is the one call site that passes 2 (distance+
+                  // color, and a second motion-vector target - see
+                  // Renderer::m_FluidDepthPipeline and fluid_depth.frag's
+                  // two outputs). Blending stays disabled on every
+                  // attachment regardless of count - nothing here needs
+                  // blending, every fluid pass fully overwrites its
+                  // target(s) every pixel.
+                  uint32_t colorAttachmentCount = 1,
+                  // False (default) matches every existing call site -
+                  // opaque, blending disabled. True enables standard
+                  // alpha compositing (SRC_ALPHA, ONE_MINUS_SRC_ALPHA) on
+                  // every color attachment - the one call site that needs
+                  // this is Renderer::m_FluidBlobPipeline (see
+                  // fluid_blob.frag), which outputs real partial alpha
+                  // and needs it to actually blend against whatever was
+                  // drawn before it, not overwrite it.
+                  bool enableAlphaBlend = false,
+                  // Only meaningful alongside enableAlphaBlend = true.
+                  // Premultiplied: src ONE, dst ONE_MINUS_SRC_ALPHA - for
+                  // shaders that output rgb already multiplied by alpha
+                  // plus un-attenuated additive terms (fluid_composite.frag's
+                  // specular). Additive: src ONE, dst ONE - order-independent
+                  // accumulation (fluid_thickness.frag). If both are set,
+                  // additive wins.
+                  bool premultipliedBlend = false,
+                  bool additiveBlend = false);
         void Shutdown();
 
         VkPipeline Get() const { return m_Pipeline; }

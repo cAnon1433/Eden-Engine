@@ -93,12 +93,37 @@ namespace Eden
         CreateStorageBuffers();
         CreateComputeDescriptors(voxelDensityBuffer);
         CreateComputePipelines();
+
+        // Push ChemicalTable's default-seeded values (see that field's
+        // comment - index 0 reproduces old single-material behavior,
+        // index 1 is a ready-to-use second example chemical) to the GPU
+        // now that m_ChemicalProperties actually exists. Whoever edits
+        // ChemicalTable afterward (code or ImGui) is responsible for
+        // calling UploadChemicalTable() again - see that function's
+        // comment.
+        UploadChemicalTable();
     }
 
     void ParticleSystemGPU::CreateStorageBuffers()
     {
+        // TRANSFER_SRC_BIT included alongside TRANSFER_DST_BIT/
+        // STORAGE_BUFFER_BIT - this was actually MISSING before the
+        // Chemical ID base build and is a real, separate bug this
+        // session's testing surfaced (not something introduced by that
+        // work): DownloadRange (used by ReadBackAll/ReadBackColors/
+        // KillParticles) does a staged vkCmdCopyBuffer FROM these
+        // buffers, and per the Vulkan spec that requires the SOURCE
+        // buffer to have TRANSFER_SRC_BIT regardless of what memory type
+        // it actually ends up allocated in - a buffer created without it
+        // is invalid to use as a copy source even if some driver
+        // happens to tolerate it silently. Positions/velocities/heat
+        // apparently got away with this before (whatever memory type
+        // VMA happened to give them on a given run, or simply not
+        // hitting the validation layer's duplicate-message cap), but
+        // it's the same latent bug either way, not something specific
+        // to the newer buffers below that finally made it visible.
         constexpr VkBufferUsageFlags kParticleUsage =
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
 
         m_Positions.Init(m_Allocator, GPU_MAX_PARTICLES * sizeof(glm::vec4), kParticleUsage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
         m_Velocities.Init(m_Allocator, GPU_MAX_PARTICLES * sizeof(glm::vec4), kParticleUsage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
@@ -123,6 +148,20 @@ namespace Eden
         // (TRANSFER_DST) like positions/velocities, not the plain
         // STORAGE_BUFFER-only usage the other three scratch buffers get.
         m_Heats.Init(m_Allocator, GPU_MAX_PARTICLES * sizeof(float), kParticleUsage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+
+        // Chemical ID system (base build) - see ChemicalTable's comment
+        // and m_ChemicalIds/m_Colors/m_ColorsAvg's own comments in the
+        // header for which category (identity-data-needing-initial-
+        // upload vs. pure-scratch) each falls into.
+        m_ChemicalIds.Init(m_Allocator, GPU_MAX_PARTICLES * sizeof(uint32_t), kParticleUsage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+        m_Colors.Init(m_Allocator, GPU_MAX_PARTICLES * sizeof(glm::vec4), kParticleUsage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+        m_ColorsAvg.Init(m_Allocator, GPU_MAX_PARTICLES * sizeof(glm::vec4), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+        // Small fixed-size table (GPU_MAX_CHEMICALS entries, NOT indexed
+        // by particle slot) - needs TRANSFER_DST since UploadChemicalTable
+        // writes it via the same staged UploadRange path as everything
+        // else here, just infrequently (on Init, and whenever the table
+        // is edited) rather than at emit time.
+        m_ChemicalProperties.Init(m_Allocator, GPU_MAX_CHEMICALS * sizeof(ChemicalPropertiesGPU), kParticleUsage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
 
         // TRANSFER_DST needed here too - not for CPU upload, but because
         // RecordPendingSteps clears this buffer every substep via
@@ -167,7 +206,14 @@ namespace Eden
         // declares binding 9 in its own GLSL - same "reserved but not
         // every shader touches every binding" pattern bindings 3/5/6
         // already have.
-        std::array<VkDescriptorSetLayoutBinding, 10> bindings{};
+        // 14, not 10 - bindings 10-13 are the Chemical ID system's
+        // buffers (chemicalIds, colors, colorsAvg, chemicalProperties -
+        // see those members' comments in ParticleSystemGPU.h).
+        // particle_build_grid.comp doesn't declare any of bindings
+        // 10-13 (it never needs per-particle chemical data, only
+        // positions), same "reserved but not every shader touches every
+        // binding" pattern bindings 3/5/6/9 already established.
+        std::array<VkDescriptorSetLayoutBinding, 14> bindings{};
         for (uint32_t i = 0; i < bindings.size(); ++i)
         {
             bindings[i].binding = i;
@@ -196,7 +242,7 @@ namespace Eden
             VkDescriptorSet set = m_ComputeDescriptorPool.AllocateSet(m_ComputeSetLayout);
             m_ComputeDescriptorSets[slot] = set;
 
-            std::array<VkDescriptorBufferInfo, 10> bufferInfos{};
+            std::array<VkDescriptorBufferInfo, 14> bufferInfos{};
             bufferInfos[0] = { m_Positions.Get(), 0, VK_WHOLE_SIZE };
             bufferInfos[1] = { m_Velocities.Get(), 0, VK_WHOLE_SIZE };
             bufferInfos[2] = { m_Densities.Get(), 0, VK_WHOLE_SIZE };
@@ -221,8 +267,12 @@ namespace Eden
             // wouldn't exist yet if VoxelSystemGPU were skipped
             // entirely).
             bufferInfos[9] = { voxelDensityBuffer, 0, VK_WHOLE_SIZE };
+            bufferInfos[10] = { m_ChemicalIds.Get(), 0, VK_WHOLE_SIZE };
+            bufferInfos[11] = { m_Colors.Get(), 0, VK_WHOLE_SIZE };
+            bufferInfos[12] = { m_ColorsAvg.Get(), 0, VK_WHOLE_SIZE };
+            bufferInfos[13] = { m_ChemicalProperties.Get(), 0, VK_WHOLE_SIZE };
 
-            std::array<VkWriteDescriptorSet, 10> writes{};
+            std::array<VkWriteDescriptorSet, 14> writes{};
             for (uint32_t b = 0; b < writes.size(); ++b)
             {
                 writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -254,6 +304,27 @@ namespace Eden
 
     void ParticleSystemGPU::Shutdown()
     {
+        if (m_UploadFence != VK_NULL_HANDLE)
+        {
+            vkDestroyFence(m_Device, m_UploadFence, nullptr);
+            m_UploadFence = VK_NULL_HANDLE;
+        }
+
+        if (m_UploadCommandBuffer != VK_NULL_HANDLE)
+        {
+            vkFreeCommandBuffers(m_Device, m_CommandPool, 1, &m_UploadCommandBuffer);
+            m_UploadCommandBuffer = VK_NULL_HANDLE;
+        }
+
+        if (m_UploadStagingBuffer != VK_NULL_HANDLE)
+        {
+            vmaDestroyBuffer(m_Allocator, m_UploadStagingBuffer, m_UploadStagingAllocation);
+            m_UploadStagingBuffer = VK_NULL_HANDLE;
+            m_UploadStagingAllocation = VK_NULL_HANDLE;
+            m_UploadStagingMappedPtr = nullptr;
+            m_UploadStagingCapacityBytes = 0;
+        }
+
         m_BuildGridPipeline.Shutdown();
         m_DensityPipeline.Shutdown();
         m_ForcePipeline.Shutdown();
@@ -274,6 +345,10 @@ namespace Eden
         m_CellBuckets.Shutdown();
         m_CellCounts.Shutdown();
         m_Heats.Shutdown();
+        m_ChemicalIds.Shutdown();
+        m_Colors.Shutdown();
+        m_ColorsAvg.Shutdown();
+        m_ChemicalProperties.Shutdown();
         m_Forces.Shutdown();
         m_Pressures.Shutdown();
         m_Densities.Shutdown();
@@ -281,14 +356,30 @@ namespace Eden
         m_Positions.Shutdown();
     }
 
-    void ParticleSystemGPU::UploadRange(VkBuffer dst, VkDeviceSize dstOffset, const void* data, VkDeviceSize size)
+    void ParticleSystemGPU::EnsureUploadStagingCapacity(VkDeviceSize requiredBytes)
     {
-        VkBuffer stagingBuffer;
-        VmaAllocation stagingAllocation;
+        if (requiredBytes <= m_UploadStagingCapacityBytes)
+        {
+            return; // common case - existing buffer already has enough room, zero allocation this call
+        }
+
+        if (m_UploadStagingBuffer != VK_NULL_HANDLE)
+        {
+            vmaDestroyBuffer(m_Allocator, m_UploadStagingBuffer, m_UploadStagingAllocation);
+            m_UploadStagingBuffer = VK_NULL_HANDLE;
+            m_UploadStagingAllocation = VK_NULL_HANDLE;
+            m_UploadStagingMappedPtr = nullptr;
+            m_UploadStagingCapacityBytes = 0;
+        }
+
+        // Grow with headroom (doubling), not exactly-to-fit - see
+        // VoxelSystemGPU::EnsureDensityStagingCapacity's identical
+        // reasoning.
+        VkDeviceSize newCapacity = std::max<VkDeviceSize>(requiredBytes, m_UploadStagingCapacityBytes * 2);
 
         VkBufferCreateInfo stagingInfo{};
         stagingInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-        stagingInfo.size = size;
+        stagingInfo.size = newCapacity;
         stagingInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
         stagingInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
@@ -297,21 +388,73 @@ namespace Eden
         stagingAllocInfo.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
 
         VmaAllocationInfo stagingInfoOut{};
-        if (vmaCreateBuffer(m_Allocator, &stagingInfo, &stagingAllocInfo, &stagingBuffer, &stagingAllocation, &stagingInfoOut) != VK_SUCCESS)
+        if (vmaCreateBuffer(m_Allocator, &stagingInfo, &stagingAllocInfo, &m_UploadStagingBuffer,
+                             &m_UploadStagingAllocation, &stagingInfoOut) != VK_SUCCESS)
         {
-            throw std::runtime_error("Eden: ParticleSystemGPU failed to create staging buffer");
+            throw std::runtime_error("Eden: ParticleSystemGPU failed to (re)create the persistent upload staging buffer");
         }
 
-        std::memcpy(stagingInfoOut.pMappedData, data, static_cast<size_t>(size));
+        m_UploadStagingMappedPtr = stagingInfoOut.pMappedData;
+        m_UploadStagingCapacityBytes = newCapacity;
+    }
 
-        VkCommandBufferAllocateInfo cmdAllocInfo{};
-        cmdAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cmdAllocInfo.commandPool = m_CommandPool;
-        cmdAllocInfo.commandBufferCount = 1;
+    VkCommandBuffer ParticleSystemGPU::GetReusableUploadCommandBuffer()
+    {
+        if (m_UploadCommandBuffer == VK_NULL_HANDLE)
+        {
+            VkCommandBufferAllocateInfo cmdAllocInfo{};
+            cmdAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+            cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            cmdAllocInfo.commandPool = m_CommandPool;
+            cmdAllocInfo.commandBufferCount = 1;
+            vkAllocateCommandBuffers(m_Device, &cmdAllocInfo, &m_UploadCommandBuffer);
+        }
+        else
+        {
+            vkResetCommandBuffer(m_UploadCommandBuffer, 0);
+        }
+        return m_UploadCommandBuffer;
+    }
 
-        VkCommandBuffer cmd;
-        vkAllocateCommandBuffers(m_Device, &cmdAllocInfo, &cmd);
+    void ParticleSystemGPU::SubmitAndWaitForUploadCommandBuffer()
+    {
+        if (m_UploadFence == VK_NULL_HANDLE)
+        {
+            VkFenceCreateInfo fenceInfo{};
+            fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+            if (vkCreateFence(m_Device, &fenceInfo, nullptr, &m_UploadFence) != VK_SUCCESS)
+            {
+                m_UploadFence = VK_NULL_HANDLE;
+            }
+        }
+
+        VkSubmitInfo submitInfo{};
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &m_UploadCommandBuffer;
+
+        if (m_UploadFence == VK_NULL_HANDLE)
+        {
+            // Fallback matching VoxelSystemGPU::SubmitAndWaitForCommandBuffer's
+            // own fallback - no working fence, so fall back to the
+            // always-correct-if-slower vkQueueWaitIdle rather than
+            // proceeding with no wait at all.
+            vkQueueSubmit(m_GraphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
+            vkQueueWaitIdle(m_GraphicsQueue);
+            return;
+        }
+
+        vkResetFences(m_Device, 1, &m_UploadFence);
+        vkQueueSubmit(m_GraphicsQueue, 1, &submitInfo, m_UploadFence);
+        vkWaitForFences(m_Device, 1, &m_UploadFence, VK_TRUE, UINT64_MAX);
+    }
+
+    void ParticleSystemGPU::UploadRange(VkBuffer dst, VkDeviceSize dstOffset, const void* data, VkDeviceSize size)
+    {
+        EnsureUploadStagingCapacity(size);
+        std::memcpy(m_UploadStagingMappedPtr, data, static_cast<size_t>(size));
+
+        VkCommandBuffer cmd = GetReusableUploadCommandBuffer();
 
         VkCommandBufferBeginInfo beginInfo{};
         beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -321,23 +464,10 @@ namespace Eden
         VkBufferCopy copyRegion{};
         copyRegion.dstOffset = dstOffset;
         copyRegion.size = size;
-        vkCmdCopyBuffer(cmd, stagingBuffer, dst, 1, &copyRegion);
+        vkCmdCopyBuffer(cmd, m_UploadStagingBuffer, dst, 1, &copyRegion);
 
         vkEndCommandBuffer(cmd);
-
-        VkSubmitInfo submitInfo{};
-        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &cmd;
-
-        // Same "simple and correct, not fast" tradeoff as
-        // VulkanBuffer::InitDeviceLocalWithData - Emit/EmitBox aren't
-        // per-frame calls, so blocking here costs nothing that matters.
-        vkQueueSubmit(m_GraphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
-        vkQueueWaitIdle(m_GraphicsQueue);
-
-        vkFreeCommandBuffers(m_Device, m_CommandPool, 1, &cmd);
-        vmaDestroyBuffer(m_Allocator, stagingBuffer, stagingAllocation);
+        SubmitAndWaitForUploadCommandBuffer();
     }
 
     void ParticleSystemGPU::DownloadRange(VkBuffer src, VkDeviceSize srcOffset, void* data, VkDeviceSize size) const
@@ -416,11 +546,12 @@ namespace Eden
     }
 
     void ParticleSystemGPU::ReadBackAll(std::vector<glm::vec4>& outPositions, std::vector<glm::vec4>& outVelocities,
-                                         std::vector<float>& outHeat) const
+                                         std::vector<float>& outHeat, std::vector<uint32_t>& outChemicalIds) const
     {
         outPositions.resize(m_ParticleCount);
         outVelocities.resize(m_ParticleCount);
         outHeat.resize(m_ParticleCount);
+        outChemicalIds.resize(m_ParticleCount);
 
         if (m_ParticleCount == 0)
         {
@@ -430,6 +561,17 @@ namespace Eden
         DownloadRange(m_Positions.Get(), 0, outPositions.data(), m_ParticleCount * sizeof(glm::vec4));
         DownloadRange(m_Velocities.Get(), 0, outVelocities.data(), m_ParticleCount * sizeof(glm::vec4));
         DownloadRange(m_Heats.Get(), 0, outHeat.data(), m_ParticleCount * sizeof(float));
+        DownloadRange(m_ChemicalIds.Get(), 0, outChemicalIds.data(), m_ParticleCount * sizeof(uint32_t));
+    }
+
+    void ParticleSystemGPU::ReadBackColors(std::vector<glm::vec4>& outColors) const
+    {
+        outColors.resize(m_ParticleCount);
+        if (m_ParticleCount == 0)
+        {
+            return;
+        }
+        DownloadRange(m_Colors.Get(), 0, outColors.data(), m_ParticleCount * sizeof(glm::vec4));
     }
 
     void ParticleSystemGPU::KillParticles(const std::vector<uint32_t>& indices)
@@ -441,7 +583,19 @@ namespace Eden
 
         std::vector<glm::vec4> positions, velocities;
         std::vector<float> heats;
-        ReadBackAll(positions, velocities, heats);
+        std::vector<uint32_t> chemicalIds;
+        ReadBackAll(positions, velocities, heats, chemicalIds);
+
+        // Colors aren't part of ReadBackAll (nothing outside this
+        // function needs them today - see that function's own comment on
+        // why it only reads back what ReformSystem/ClusterSystem
+        // actually use), but they DO need the same compact-on-removal
+        // treatment as positions/heat/chemicalIds - it's per-particle
+        // identity data, not scratch (see m_Colors' header comment) - so
+        // a separate, dedicated download here rather than growing
+        // ReadBackAll's signature for a field only this function needs.
+        std::vector<glm::vec4> colors(m_ParticleCount);
+        DownloadRange(m_Colors.Get(), 0, colors.data(), m_ParticleCount * sizeof(glm::vec4));
 
         std::vector<bool> remove(m_ParticleCount, false);
         for (uint32_t index : indices)
@@ -452,11 +606,14 @@ namespace Eden
             }
         }
 
-        std::vector<glm::vec4> keptPositions, keptVelocities;
+        std::vector<glm::vec4> keptPositions, keptVelocities, keptColors;
         std::vector<float> keptHeats;
+        std::vector<uint32_t> keptChemicalIds;
         keptPositions.reserve(m_ParticleCount);
         keptVelocities.reserve(m_ParticleCount);
         keptHeats.reserve(m_ParticleCount);
+        keptChemicalIds.reserve(m_ParticleCount);
+        keptColors.reserve(m_ParticleCount);
 
         for (uint32_t i = 0; i < m_ParticleCount; ++i)
         {
@@ -465,6 +622,8 @@ namespace Eden
                 keptPositions.push_back(positions[i]);
                 keptVelocities.push_back(velocities[i]);
                 keptHeats.push_back(heats[i]);
+                keptChemicalIds.push_back(chemicalIds[i]);
+                keptColors.push_back(colors[i]);
             }
         }
 
@@ -474,11 +633,18 @@ namespace Eden
             UploadRange(m_Positions.Get(), 0, keptPositions.data(), newCount * sizeof(glm::vec4));
             UploadRange(m_Velocities.Get(), 0, keptVelocities.data(), newCount * sizeof(glm::vec4));
             UploadRange(m_Heats.Get(), 0, keptHeats.data(), newCount * sizeof(float));
+            UploadRange(m_ChemicalIds.Get(), 0, keptChemicalIds.data(), newCount * sizeof(uint32_t));
+            UploadRange(m_Colors.Get(), 0, keptColors.data(), newCount * sizeof(glm::vec4));
         }
         m_ParticleCount = newCount;
     }
 
-    void ParticleSystemGPU::Emit(const glm::vec3& position, const glm::vec3& velocity)
+    void ParticleSystemGPU::UploadChemicalTable()
+    {
+        UploadRange(m_ChemicalProperties.Get(), 0, ChemicalTable.data(), ChemicalTable.size() * sizeof(ChemicalPropertiesGPU));
+    }
+
+    void ParticleSystemGPU::Emit(const glm::vec3& position, const glm::vec3& velocity, uint32_t chemicalId)
     {
         if (m_ParticleCount >= GPU_MAX_PARTICLES)
         {
@@ -487,24 +653,33 @@ namespace Eden
             return;
         }
 
+        uint32_t clampedChemicalId = std::min(chemicalId, GPU_MAX_CHEMICALS - 1);
         glm::vec4 pos4(position, 1.0f);
         glm::vec4 vel4(velocity, 0.0f);
-        float heat4 = GPU_HEAT_NOT_MELTED;
+        float heat4 = 1.0f; // starts warm, needs to cool - see GPU_HEAT_NOT_MELTED's comment
+        glm::vec4 color4 = ChemicalTable[clampedChemicalId].baseColor;
         UploadRange(m_Positions.Get(), m_ParticleCount * sizeof(glm::vec4), &pos4, sizeof(glm::vec4));
         UploadRange(m_Velocities.Get(), m_ParticleCount * sizeof(glm::vec4), &vel4, sizeof(glm::vec4));
         UploadRange(m_Heats.Get(), m_ParticleCount * sizeof(float), &heat4, sizeof(float));
+        UploadRange(m_ChemicalIds.Get(), m_ParticleCount * sizeof(uint32_t), &clampedChemicalId, sizeof(uint32_t));
+        UploadRange(m_Colors.Get(), m_ParticleCount * sizeof(glm::vec4), &color4, sizeof(glm::vec4));
         ++m_ParticleCount;
     }
 
-    void ParticleSystemGPU::EmitBox(const glm::vec3& min, const glm::vec3& max, float spacing, const glm::vec3& initialVelocity)
+    void ParticleSystemGPU::EmitBox(const glm::vec3& min, const glm::vec3& max, float spacing,
+                                     const glm::vec3& initialVelocity, uint32_t chemicalId)
     {
         // Same fill-spacing convention as ParticleSystem::EmitBox - see
         // its ParticleSystem.h comment for why 0.6 * h.
         float actualSpacing = spacing > 0.0f ? spacing : smoothingRadius * 0.6f;
+        uint32_t clampedChemicalId = std::min(chemicalId, GPU_MAX_CHEMICALS - 1);
+        glm::vec4 color4 = ChemicalTable[clampedChemicalId].baseColor;
 
         std::vector<glm::vec4> positions;
         std::vector<glm::vec4> velocities;
         std::vector<float> heats;
+        std::vector<uint32_t> chemicalIds;
+        std::vector<glm::vec4> colors;
 
         for (float x = min.x; x <= max.x; x += actualSpacing)
         {
@@ -514,7 +689,9 @@ namespace Eden
                 {
                     positions.emplace_back(x, y, z, 1.0f);
                     velocities.emplace_back(initialVelocity, 0.0f);
-                    heats.push_back(GPU_HEAT_NOT_MELTED);
+                    heats.push_back(1.0f); // starts warm, needs to cool - see GPU_HEAT_NOT_MELTED's comment
+                    chemicalIds.push_back(clampedChemicalId);
+                    colors.push_back(color4);
                 }
             }
         }
@@ -534,18 +711,97 @@ namespace Eden
             return;
         }
 
-        UploadRange(m_Positions.Get(), m_ParticleCount * sizeof(glm::vec4), positions.data(), countToUpload * sizeof(glm::vec4));
-        UploadRange(m_Velocities.Get(), m_ParticleCount * sizeof(glm::vec4), velocities.data(), countToUpload * sizeof(glm::vec4));
-        UploadRange(m_Heats.Get(), m_ParticleCount * sizeof(float), heats.data(), countToUpload * sizeof(float));
+        // Batched into ONE staging write + ONE command buffer (five
+        // copy regions, one per destination buffer - vkCmdCopyBuffer
+        // can't target multiple different destinations in a single call,
+        // but multiple vkCmdCopyBuffer calls recorded into the same
+        // command buffer still submit and wait exactly once) + ONE
+        // submit+wait, instead of five separate UploadRange calls. Even
+        // with UploadRange's own persistent resources (see that
+        // function's comment), five separate submissions per EmitBox
+        // call is still five separate driver round trips - with
+        // ProcessPourInput (main.cpp) calling EmitBox on a held key at
+        // ~12/sec, that's up to 60 submissions/sec for something that
+        // only needs 1. This is what actually gets that down to 12/sec.
+        VkDeviceSize positionsBytes = static_cast<VkDeviceSize>(countToUpload) * sizeof(glm::vec4);
+        VkDeviceSize velocitiesBytes = static_cast<VkDeviceSize>(countToUpload) * sizeof(glm::vec4);
+        VkDeviceSize heatsBytes = static_cast<VkDeviceSize>(countToUpload) * sizeof(float);
+        VkDeviceSize chemicalIdsBytes = static_cast<VkDeviceSize>(countToUpload) * sizeof(uint32_t);
+        VkDeviceSize colorsBytes = static_cast<VkDeviceSize>(countToUpload) * sizeof(glm::vec4);
+        VkDeviceSize totalBytes = positionsBytes + velocitiesBytes + heatsBytes + chemicalIdsBytes + colorsBytes;
+
+        EnsureUploadStagingCapacity(totalBytes);
+
+        char* stagingPtr = static_cast<char*>(m_UploadStagingMappedPtr);
+        VkDeviceSize positionsStagingOffset = 0;
+        VkDeviceSize velocitiesStagingOffset = positionsStagingOffset + positionsBytes;
+        VkDeviceSize heatsStagingOffset = velocitiesStagingOffset + velocitiesBytes;
+        VkDeviceSize chemicalIdsStagingOffset = heatsStagingOffset + heatsBytes;
+        VkDeviceSize colorsStagingOffset = chemicalIdsStagingOffset + chemicalIdsBytes;
+
+        std::memcpy(stagingPtr + positionsStagingOffset, positions.data(), static_cast<size_t>(positionsBytes));
+        std::memcpy(stagingPtr + velocitiesStagingOffset, velocities.data(), static_cast<size_t>(velocitiesBytes));
+        std::memcpy(stagingPtr + heatsStagingOffset, heats.data(), static_cast<size_t>(heatsBytes));
+        std::memcpy(stagingPtr + chemicalIdsStagingOffset, chemicalIds.data(), static_cast<size_t>(chemicalIdsBytes));
+        std::memcpy(stagingPtr + colorsStagingOffset, colors.data(), static_cast<size_t>(colorsBytes));
+
+        VkCommandBuffer cmd = GetReusableUploadCommandBuffer();
+
+        VkCommandBufferBeginInfo beginInfo{};
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(cmd, &beginInfo);
+
+        VkBufferCopy positionsCopy{};
+        positionsCopy.srcOffset = positionsStagingOffset;
+        positionsCopy.dstOffset = m_ParticleCount * sizeof(glm::vec4);
+        positionsCopy.size = positionsBytes;
+        vkCmdCopyBuffer(cmd, m_UploadStagingBuffer, m_Positions.Get(), 1, &positionsCopy);
+
+        VkBufferCopy velocitiesCopy{};
+        velocitiesCopy.srcOffset = velocitiesStagingOffset;
+        velocitiesCopy.dstOffset = m_ParticleCount * sizeof(glm::vec4);
+        velocitiesCopy.size = velocitiesBytes;
+        vkCmdCopyBuffer(cmd, m_UploadStagingBuffer, m_Velocities.Get(), 1, &velocitiesCopy);
+
+        VkBufferCopy heatsCopy{};
+        heatsCopy.srcOffset = heatsStagingOffset;
+        heatsCopy.dstOffset = m_ParticleCount * sizeof(float);
+        heatsCopy.size = heatsBytes;
+        vkCmdCopyBuffer(cmd, m_UploadStagingBuffer, m_Heats.Get(), 1, &heatsCopy);
+
+        VkBufferCopy chemicalIdsCopy{};
+        chemicalIdsCopy.srcOffset = chemicalIdsStagingOffset;
+        chemicalIdsCopy.dstOffset = m_ParticleCount * sizeof(uint32_t);
+        chemicalIdsCopy.size = chemicalIdsBytes;
+        vkCmdCopyBuffer(cmd, m_UploadStagingBuffer, m_ChemicalIds.Get(), 1, &chemicalIdsCopy);
+
+        VkBufferCopy colorsCopy{};
+        colorsCopy.srcOffset = colorsStagingOffset;
+        colorsCopy.dstOffset = m_ParticleCount * sizeof(glm::vec4);
+        colorsCopy.size = colorsBytes;
+        vkCmdCopyBuffer(cmd, m_UploadStagingBuffer, m_Colors.Get(), 1, &colorsCopy);
+
+        vkEndCommandBuffer(cmd);
+        SubmitAndWaitForUploadCommandBuffer();
+
         m_ParticleCount += countToUpload;
     }
 
-    void ParticleSystemGPU::EmitPoints(const std::vector<glm::vec3>& positions, const glm::vec3& initialVelocity, float initialHeat)
+    void ParticleSystemGPU::EmitPoints(const std::vector<glm::vec3>& positions, const glm::vec3& initialVelocity,
+                                        float initialHeat, uint32_t chemicalId, const glm::vec4& colorOverride)
     {
         if (positions.empty())
         {
             return;
         }
+
+        uint32_t clampedChemicalId = std::min(chemicalId, GPU_MAX_CHEMICALS - 1);
+        // vec4(0,0,0,0) means "no override" - see this function's
+        // header comment (reuses VoxelSystemGPU::SetTransform's existing
+        // convention for the same meaning).
+        bool hasOverride = colorOverride != glm::vec4(0.0f);
+        glm::vec4 resolvedColor = hasOverride ? colorOverride : ChemicalTable[clampedChemicalId].baseColor;
 
         uint32_t availableCapacity = GPU_MAX_PARTICLES - m_ParticleCount;
         uint32_t countToUpload = std::min(static_cast<uint32_t>(positions.size()), availableCapacity);
@@ -565,6 +821,8 @@ namespace Eden
         std::vector<glm::vec4> uploadPositions(countToUpload);
         std::vector<glm::vec4> uploadVelocities(countToUpload, glm::vec4(initialVelocity, 0.0f));
         std::vector<float> uploadHeats(countToUpload, initialHeat);
+        std::vector<uint32_t> uploadChemicalIds(countToUpload, clampedChemicalId);
+        std::vector<glm::vec4> uploadColors(countToUpload, resolvedColor);
         for (uint32_t i = 0; i < countToUpload; ++i)
         {
             uploadPositions[i] = glm::vec4(positions[i], 1.0f);
@@ -573,6 +831,8 @@ namespace Eden
         UploadRange(m_Positions.Get(), m_ParticleCount * sizeof(glm::vec4), uploadPositions.data(), countToUpload * sizeof(glm::vec4));
         UploadRange(m_Velocities.Get(), m_ParticleCount * sizeof(glm::vec4), uploadVelocities.data(), countToUpload * sizeof(glm::vec4));
         UploadRange(m_Heats.Get(), m_ParticleCount * sizeof(float), uploadHeats.data(), countToUpload * sizeof(float));
+        UploadRange(m_ChemicalIds.Get(), m_ParticleCount * sizeof(uint32_t), uploadChemicalIds.data(), countToUpload * sizeof(uint32_t));
+        UploadRange(m_Colors.Get(), m_ParticleCount * sizeof(glm::vec4), uploadColors.data(), countToUpload * sizeof(glm::vec4));
         m_ParticleCount += countToUpload;
     }
 

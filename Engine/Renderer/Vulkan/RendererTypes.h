@@ -103,6 +103,24 @@ namespace Eden
         alignas(16) glm::vec3 cameraRight;
         alignas(16) glm::vec3 cameraUp;
         alignas(16) glm::vec3 cameraForward;
+
+        // THIS frame's view*proj as of the END of the PREVIOUS frame -
+        // i.e. "how the camera looked last frame." Added for
+        // fluid_depth.vert's motion-vector output (see that shader's own
+        // comment) - projecting a particle's approximate previous
+        // position through this (not the current view/proj above) gives
+        // where it actually appeared on screen last frame, which is what
+        // fluid_temporal.frag needs to reproject history correctly. Same
+        // "appended at the end, existing shaders unaffected" reasoning as
+        // cameraRight/Up/Forward above - only fluid_depth.vert declares
+        // this field. See Renderer::m_PreviousViewProj for where the
+        // value itself comes from.
+        alignas(16) glm::mat4 prevViewProj;
+        // inverse(proj * view), computed once per frame on the CPU. Only
+        // fluid_composite.frag declares this (it used to call inverse() twice
+        // PER PIXEL). Kept LAST so every other shader's shorter UBO block
+        // still matches the layout of everything before it.
+        alignas(16) glm::mat4 invViewProj;
     };
 
     // Opaque handle into Renderer's mesh resource registry (see

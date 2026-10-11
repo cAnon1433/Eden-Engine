@@ -1,7 +1,7 @@
 CMakeFiles/Eden.dir/ThirdParty/imgui/backends/imgui_impl_glfw.cpp.o: \
-  /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/ThirdParty/imgui/backends/imgui_impl_glfw.cpp \
-  /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/ThirdParty/imgui/imgui.h \
-  /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/ThirdParty/imgui/imconfig.h \
+  /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/ThirdParty/imgui/backends/imgui_impl_glfw.cpp \
+  /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/ThirdParty/imgui/imgui.h \
+  /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/ThirdParty/imgui/imconfig.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1/float.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1/__config \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1/__config_site \
@@ -71,10 +71,9 @@ CMakeFiles/Eden.dir/ThirdParty/imgui/backends/imgui_impl_glfw.cpp.o: \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_ssize_t.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/_strings.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/assert.h \
-  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/_assert.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/_static_assert.h \
-  /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/ThirdParty/imgui/backends/imgui_impl_glfw.h \
-  /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/ThirdParty/glfw/include/GLFW/glfw3.h \
+  /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/ThirdParty/imgui/backends/imgui_impl_glfw.h \
+  /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/ThirdParty/glfw/include/GLFW/glfw3.h \
   /Library/Developer/CommandLineTools/usr/lib/clang/21/include/__stddef_rsize_t.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1/stdint.h \
   /Library/Developer/CommandLineTools/usr/lib/clang/21/include/stdint.h \
@@ -85,11 +84,22 @@ CMakeFiles/Eden.dir/ThirdParty/imgui/backends/imgui_impl_glfw.cpp.o: \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/_types/_uint64_t.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/_types/_intmax_t.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/_types/_uintmax_t.h \
-  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks/OpenGL.framework/Headers/gl.h \
-  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks/OpenGL.framework/Headers/gltypes.h \
-  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks/OpenGL.framework/Headers/OpenGLAvailability.h \
-  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/os/availability.h \
-  /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/ThirdParty/glfw/include/GLFW/glfw3native.h \
+  /usr/local/include/vulkan/vulkan.h \
+  /usr/local/include/vulkan/vk_platform.h \
+  /usr/local/include/vulkan/vulkan_core.h \
+  /usr/local/include/vk_video/vulkan_video_codec_h264std.h \
+  /usr/local/include/vk_video/vulkan_video_codecs_common.h \
+  /usr/local/include/vk_video/vulkan_video_codec_h264std_encode.h \
+  /usr/local/include/vk_video/vulkan_video_codec_h265std.h \
+  /usr/local/include/vk_video/vulkan_video_codec_h265std_encode.h \
+  /usr/local/include/vk_video/vulkan_video_codec_h264std_decode.h \
+  /usr/local/include/vk_video/vulkan_video_codec_h265std_decode.h \
+  /usr/local/include/vk_video/vulkan_video_codec_av1std.h \
+  /usr/local/include/vk_video/vulkan_video_codec_av1std_decode.h \
+  /usr/local/include/vk_video/vulkan_video_codec_av1std_encode.h \
+  /usr/local/include/vk_video/vulkan_video_codec_vp9std.h \
+  /usr/local/include/vk_video/vulkan_video_codec_vp9std_decode.h \
+  /Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync\ 2/ThirdParty/glfw/include/GLFW/glfw3native.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks/ApplicationServices.framework/Headers/ApplicationServices.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks/CoreServices.framework/Headers/CoreServices.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks/CoreFoundation.framework/Headers/CoreFoundation.h \
@@ -325,6 +335,7 @@ CMakeFiles/Eden.dir/ThirdParty/imgui/backends/imgui_impl_glfw.cpp.o: \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_timespec.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks/CoreFoundation.framework/Headers/CFBase.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks/CoreFoundation.framework/Headers/CFAvailability.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/os/availability.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/AvailabilityMacros.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1/stdbool.h \
   /Library/Developer/CommandLineTools/usr/lib/clang/21/include/stdbool.h \

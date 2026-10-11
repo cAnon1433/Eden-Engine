@@ -45,6 +45,7 @@ namespace Eden
             VkBufferUsageFlags extraUsage);
 
         VkBuffer Get() const { return m_Buffer; }
+        VmaAllocation GetAllocation() const { return m_Allocation; } // for vmaInvalidateAllocation on host-read buffers
         VkDeviceSize GetSize() const { return m_Size; }
 
     private:

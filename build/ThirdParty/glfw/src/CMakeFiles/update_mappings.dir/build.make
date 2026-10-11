@@ -53,10 +53,10 @@ RM = /opt/homebrew/bin/cmake -E rm -f
 EQUALS = =
 
 # The top-level source directory on which CMake was run.
-CMAKE_SOURCE_DIR = /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30
+CMAKE_SOURCE_DIR = "/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2"
 
 # The top-level build directory on which CMake was run.
-CMAKE_BINARY_DIR = /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build
+CMAKE_BINARY_DIR = "/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/build"
 
 # Utility rule file for update_mappings.
 
@@ -67,8 +67,8 @@ include ThirdParty/glfw/src/CMakeFiles/update_mappings.dir/compiler_depend.make
 include ThirdParty/glfw/src/CMakeFiles/update_mappings.dir/progress.make
 
 ThirdParty/glfw/src/CMakeFiles/update_mappings:
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir=/Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_1) "Updating gamepad mappings from upstream repository"
-	cd /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/ThirdParty/glfw/src && /opt/homebrew/bin/cmake -P /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/ThirdParty/glfw/CMake/GenerateMappings.cmake mappings.h.in mappings.h
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir="/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/build/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_1) "Updating gamepad mappings from upstream repository"
+	cd "/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/ThirdParty/glfw/src" && /opt/homebrew/bin/cmake -P "/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/ThirdParty/glfw/CMake/GenerateMappings.cmake" mappings.h.in mappings.h
 
 ThirdParty/glfw/src/CMakeFiles/update_mappings.dir/codegen:
 .PHONY : ThirdParty/glfw/src/CMakeFiles/update_mappings.dir/codegen
@@ -82,10 +82,10 @@ ThirdParty/glfw/src/CMakeFiles/update_mappings.dir/build: update_mappings
 .PHONY : ThirdParty/glfw/src/CMakeFiles/update_mappings.dir/build
 
 ThirdParty/glfw/src/CMakeFiles/update_mappings.dir/clean:
-	cd /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build/ThirdParty/glfw/src && $(CMAKE_COMMAND) -P CMakeFiles/update_mappings.dir/cmake_clean.cmake
+	cd "/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/build/ThirdParty/glfw/src" && $(CMAKE_COMMAND) -P CMakeFiles/update_mappings.dir/cmake_clean.cmake
 .PHONY : ThirdParty/glfw/src/CMakeFiles/update_mappings.dir/clean
 
 ThirdParty/glfw/src/CMakeFiles/update_mappings.dir/depend:
-	cd /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build && $(CMAKE_COMMAND) -E cmake_depends "Unix Makefiles" /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30 /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/ThirdParty/glfw/src /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build/ThirdParty/glfw/src /Users/oliverhawkins/Downloads/Eden_Engine_FluidSurface_Update_30/build/ThirdParty/glfw/src/CMakeFiles/update_mappings.dir/DependInfo.cmake "--color=$(COLOR)" update_mappings
+	cd "/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/build" && $(CMAKE_COMMAND) -E cmake_depends "Unix Makefiles" "/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2" "/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/ThirdParty/glfw/src" "/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/build" "/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/build/ThirdParty/glfw/src" "/Users/oliverhawkins/Downloads/Eden_Engine_AutoRes_GitSync 2/build/ThirdParty/glfw/src/CMakeFiles/update_mappings.dir/DependInfo.cmake" "--color=$(COLOR)" update_mappings
 .PHONY : ThirdParty/glfw/src/CMakeFiles/update_mappings.dir/depend
 

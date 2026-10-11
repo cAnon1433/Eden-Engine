@@ -40,11 +40,20 @@ namespace Eden
         }
 
         uint32_t countBefore = particles.ParticleCount();
-        // Melted particles start fully "hot" (1.0) - ordinary Emit/
-        // EmitBox particles default to GPU_HEAT_NOT_MELTED and never
-        // decay, so this is what actually enrolls these particles in
-        // the heat/cooldown -> reform pipeline.
-        particles.EmitPoints(spawnPositions, initialVelocity, 1.0f);
+        // Chemical ID round-trip (see VoxelSystemGPU::SetChemicalId's
+        // comment) - the volume remembers which chemical it hardened as
+        // and what color it actually was at that moment (which may have
+        // drifted from that chemical's flat default via diffusion before
+        // it ever reformed - see ReformSystem). Melting it back hands
+        // out particles carrying BOTH, so a melted solid's liquid keeps
+        // its physical properties (mass/viscosity/stiffness, via
+        // chemicalId) and its actual appearance (via the explicit color
+        // override), rather than resetting to chemical 0/white the way
+        // this call used to implicitly do before the Chemical ID system
+        // existed.
+        uint32_t chemicalId = voxels.GetChemicalId(volume);
+        glm::vec4 color = voxels.GetVolumeColor(volume);
+        particles.EmitPoints(spawnPositions, initialVelocity, 1.0f, chemicalId, color);
         uint32_t spawned = particles.ParticleCount() - countBefore;
 
         // The solid is gone regardless of whether every sample point

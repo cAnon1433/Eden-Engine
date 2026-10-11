@@ -12,7 +12,9 @@ namespace Eden
                                        const std::vector<VkVertexInputBindingDescription>& bindingDescriptions,
                                        const std::vector<VkVertexInputAttributeDescription>& attributeDescriptions,
                                        VkPrimitiveTopology topology, VkCullModeFlags cullMode,
-                                       bool depthTestEnable, bool depthWriteEnable)
+                                       bool depthTestEnable, bool depthWriteEnable,
+                                       uint32_t colorAttachmentCount, bool enableAlphaBlend,
+                                       bool premultipliedBlend, bool additiveBlend)
     {
         m_DeviceHandle = device;
 
@@ -97,16 +99,43 @@ namespace Eden
         depthStencil.depthBoundsTestEnable = VK_FALSE;
         depthStencil.stencilTestEnable = VK_FALSE;
 
+        // One identical (blending-disabled) entry per color attachment -
+        // see colorAttachmentCount's own comment (VulkanGraphicsPipeline.h)
+        // for the one call site (the fluid depth prepass) that passes
+        // more than 1.
         VkPipelineColorBlendAttachmentState colorBlendAttachment{};
         colorBlendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                                                VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-        colorBlendAttachment.blendEnable = VK_FALSE;
+        colorBlendAttachment.blendEnable = enableAlphaBlend ? VK_TRUE : VK_FALSE;
+        if (enableAlphaBlend)
+        {
+            // Standard "over" alpha compositing - out.rgb = src.rgb*src.a
+            // + dst.rgb*(1-src.a), out.a = src.a + dst.a*(1-src.a). Color
+            // and alpha use the same factors here since nothing in this
+            // renderer currently needs a separate alpha blend curve.
+            colorBlendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+            colorBlendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+            colorBlendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
+            colorBlendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+            colorBlendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+            colorBlendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
+
+            if (premultipliedBlend || additiveBlend)
+            {
+                const VkBlendFactor dstFactor = additiveBlend ? VK_BLEND_FACTOR_ONE : VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+                colorBlendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+                colorBlendAttachment.dstColorBlendFactor = dstFactor;
+                colorBlendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+                colorBlendAttachment.dstAlphaBlendFactor = dstFactor;
+            }
+        }
+        std::vector<VkPipelineColorBlendAttachmentState> colorBlendAttachments(colorAttachmentCount, colorBlendAttachment);
 
         VkPipelineColorBlendStateCreateInfo colorBlending{};
         colorBlending.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
         colorBlending.logicOpEnable = VK_FALSE;
-        colorBlending.attachmentCount = 1;
-        colorBlending.pAttachments = &colorBlendAttachment;
+        colorBlending.attachmentCount = static_cast<uint32_t>(colorBlendAttachments.size());
+        colorBlending.pAttachments = colorBlendAttachments.data();
 
         VkGraphicsPipelineCreateInfo pipelineInfo{};
         pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;

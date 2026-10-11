@@ -30,6 +30,13 @@ REM the full IDE isn't required.
 
 cd /d "%~dp0"
 
+REM Release by default: Debug is much slower on the CPU and also turns on
+REM Vulkan validation layers. To build Debug instead, run this from a
+REM terminal with:  set EDEN_BUILD_TYPE=Debug   (then run the .bat)
+set BUILD_CONFIG=Release
+if not "%EDEN_BUILD_TYPE%"=="" set BUILD_CONFIG=%EDEN_BUILD_TYPE%
+echo Build type: %BUILD_CONFIG%
+
 echo Eden - build ^& run
 echo ==================
 echo.
@@ -43,7 +50,7 @@ set GENERATOR_FOUND=0
 
 if not "%GENERATOR_FOUND%"=="1" (
     echo Configuring ^(trying Visual Studio 2022^)...
-    cmake .. -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Debug > eden_cmake.log 2>&1
+    cmake .. -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=%BUILD_CONFIG% > eden_cmake.log 2>&1
     if not errorlevel 1 set GENERATOR_FOUND=1
 )
 
@@ -55,7 +62,7 @@ if not "%GENERATOR_FOUND%"=="1" (
     REM first rather than surfacing that as a second, confusing error.
     del /f /q CMakeCache.txt >nul 2>&1
     rmdir /s /q CMakeFiles >nul 2>&1
-    cmake .. -G "Visual Studio 16 2019" -A x64 -DCMAKE_BUILD_TYPE=Debug > eden_cmake.log 2>&1
+    cmake .. -G "Visual Studio 16 2019" -A x64 -DCMAKE_BUILD_TYPE=%BUILD_CONFIG% > eden_cmake.log 2>&1
     if not errorlevel 1 set GENERATOR_FOUND=1
 )
 
@@ -79,7 +86,7 @@ if not "%GENERATOR_FOUND%"=="1" (
 
 echo.
 echo Building...
-cmake --build . --config Debug > eden_make.log 2>&1
+cmake --build . --config %BUILD_CONFIG% > eden_make.log 2>&1
 if errorlevel 1 (
     echo.
     echo Build failed. Full log:
@@ -93,12 +100,12 @@ echo.
 echo Build succeeded. Launching Eden...
 echo.
 
-if exist Debug\Eden.exe (
-    Debug\Eden.exe
+if exist %BUILD_CONFIG%\Eden.exe (
+    %BUILD_CONFIG%\Eden.exe
 ) else if exist Eden.exe (
     Eden.exe
 ) else (
-    echo Could not find Eden.exe in build\Debug\ or build\ - build layout
+    echo Could not find Eden.exe in build\%BUILD_CONFIG%\ or build\ - build layout
     echo may differ from what this script expects.
     pause
     exit /b 1

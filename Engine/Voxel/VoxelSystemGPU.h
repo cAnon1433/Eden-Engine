@@ -91,7 +91,32 @@ namespace Eden
         // first March call). Does NOT seed or march - call SeedSphere
         // and then MarchDirtyChunks separately, same "construct empty,
         // fill explicitly" shape as ParticleSystemGPU's Init-then-Emit.
-        VoxelVolumeHandle RegisterVolume(const VoxelVolumeDesc& desc);
+        //
+        // chunkRemapOverride: empty (default) means "identity mapping" -
+        // chunkRemap[i] == i for every chunk, a pure no-op indirection
+        // that costs one small extra buffer per volume but changes
+        // nothing else - this is the ONLY safe choice for a volume that
+        // will be Carve()'d after creation, since carving can make a
+        // previously-empty chunk need geometry later, which a one-time
+        // static classification can't anticipate. A non-empty override
+        // lets a caller who has ALREADY computed a volume's real density
+        // field (see SplatParticlesIntoDensityField/BuildChunkRemapTable)
+        // register vertex/indirect buffers sized for only the chunks that
+        // actually have geometry - see ReformSystem::Reform for the real
+        // use case (a reform volume is built once and never carved
+        // afterward, so a static classification is safe there in a way
+        // it wouldn't be for the original test sphere or terrain). Must
+        // have exactly desc.NumChunks() entries if non-empty - asserted,
+        // not silently truncated/padded, since a mismatched remap table
+        // is a caller bug, not a recoverable situation.
+        //
+        // compactChunkCountOverride is the real vertex/indirect buffer
+        // size to use when chunkRemapOverride is non-empty (the caller
+        // already computed this alongside the remap table itself, via
+        // BuildChunkRemapTable's return value - not re-derived here to
+        // avoid a second, possibly-inconsistent scan).
+        VoxelVolumeHandle RegisterVolume(const VoxelVolumeDesc& desc, const std::vector<uint32_t>& chunkRemapOverride = {},
+                                          uint32_t compactChunkCountOverride = 0);
 
         // Writes a sphere SDF (Physics/SDF.h's own convention - negative
         // = inside) into densityCPU with a plain CPU loop, uploads the
@@ -174,6 +199,36 @@ namespace Eden
         // Blocks on vkQueueWaitIdle (see .cpp); infrequent/event-driven,
         // not meant to run every frame.
         void MarchDirtyChunks(VoxelVolumeHandle handle);
+
+        // Clears volume.dirtyChunkIndices WITHOUT doing any GPU work -
+        // for volumes whose marched mesh is never actually read by
+        // anything (raymarch-only volumes like a spawned mold workpiece
+        // render by sampling the density field directly every frame, the
+        // same way collision does - see ColliderShape::Voxel's own
+        // comment - so the vertex/indirect buffers MarchDirtyChunks would
+        // populate have no consumer at all). SeedBox marks every chunk in
+        // a freshly-registered volume dirty (see its own comment) with no
+        // corresponding march call, on the assumption something will
+        // march it before that matters - true for a mesh-rendered volume,
+        // never true for a raymarch-only one. Left unmarched, that
+        // backlog would otherwise be march at whatever OTHER call
+        // happens to touch the volume next - for a spawned workpiece,
+        // that's the player's first carve, which would silently inherit
+        // an expensive full-volume march (real marching-cubes work
+        // across every chunk, not the early-exit most chunks get) it did
+        // nothing to deserve and gets no benefit from. Called instead of
+        // MarchDirtyChunks by ProcessVoxelCarveInput specifically for
+        // workpiece targets - see that function's own comment.
+        void DiscardPendingMarch(VoxelVolumeHandle handle);
+
+        // Copies any Carve()-changed region of this volume's densityCPU to the
+        // GPU density buffer (one blocking upload for the merged region; no-op
+        // if nothing is pending). MarchDirtyChunks/DiscardPendingMarch call
+        // this themselves; FlushAllPendingUploads is called once per frame by
+        // main so a Carve() followed by neither of those still reaches the
+        // GPU before the frame renders.
+        void FlushPendingUpload(VoxelVolumeHandle handle);
+        void FlushAllPendingUploads();
 
         // CSG-subtracts a sphere from densityCPU (density = max(density,
         // -carveSDF), the standard SDF boolean-subtraction identity)
@@ -427,10 +482,121 @@ namespace Eden
         // volume placement isn't re-read from ECS every frame yet).
         void SetTransform(VoxelVolumeHandle handle, const glm::mat4& model, const glm::vec4& colorOverride = glm::vec4(0.0f));
 
+        // Computes what RegisterVolume's vertex buffer allocation WOULD
+        // cost for a hypothetical desc, without actually registering
+        // anything - lets a caller (ReformSystem, specifically) check
+        // "is this safe to attempt" before committing to a real
+        // allocation. Static and self-contained: this is real
+        // information about the future cost, not an approximation, since
+        // it's the exact same formula RegisterVolume itself uses (see
+        // that function's own vertices.Init call) - kept in sync by
+        // living right next to it rather than being duplicated
+        // elsewhere. Added after a real crash: a sufficiently large
+        // reform cluster produced a desc whose vertex buffer needed
+        // 5.26GB in one allocation, exceeding the device's actual
+        // maxMemoryAllocationSize (4GB, reported directly in the
+        // resulting Vulkan validation message) - a single failed
+        // vkAllocateMemory call that took the whole VkDevice down with
+        // it, not a graceful "that one thing didn't work."
+        //
+        // compactChunkCountOverride: 0 (default) estimates the
+        // worst-case-for-every-chunk cost (desc.NumChunks()), matching
+        // RegisterVolume's own default. Pass the REAL compact count (from
+        // BuildChunkRemapTable) to estimate what a compacted volume would
+        // actually cost instead - see ReformSystem::Reform, which now
+        // checks against the real, compacted cost rather than the
+        // worst-case one, since that's what actually gets allocated once
+        // the chunk-remapping scheme is used.
+        static VkDeviceSize EstimateVertexBufferBytes(const VoxelVolumeDesc& desc, uint32_t compactChunkCountOverride = 0);
+
+        // Standalone version of SeedFromParticles' splat algorithm - same
+        // exact math, but operating on a plain density array and a desc,
+        // not a registered Volume. Exists so a caller (ReformSystem,
+        // specifically) can compute a cluster's REAL density field
+        // BEFORE deciding how large a vertex buffer to register for it,
+        // instead of always reserving worst-case space for every chunk
+        // regardless of whether that chunk will ever contain a single
+        // triangle. SeedFromParticles itself now just calls this with
+        // volume.densityCPU as the output - one implementation, two
+        // entry points.
+        static void SplatParticlesIntoDensityField(std::vector<float>& densityCPU, const VoxelVolumeDesc& desc,
+                                                     const std::vector<glm::vec3>& localPositions, float particleRadius,
+                                                     float smoothRadius);
+
+        // Counts chunks that actually cross the isosurface (at least one
+        // sample below kVoxelIsoLevel AND at least one at/above it, among
+        // the samples that chunk owns) - the marching-cubes algorithm
+        // only ever emits triangles for THESE chunks; a chunk that's
+        // entirely solid or entirely empty contributes zero triangles no
+        // matter what. For a compact blob or cube (surface area growing
+        // roughly as volume^(2/3)), this is typically a SMALL fraction of
+        // total chunk count, especially as the cluster gets bigger - the
+        // exact reason a uniform "reserve worst-case for every chunk"
+        // buffer sizing gets more wasteful, not less, as clusters grow.
+        // Kept as its own simple query (some callers may only want the
+        // count) even though BuildChunkRemapTable below computes the
+        // exact same classification and returns a count too - the two
+        // aren't required to be called together.
+        static uint32_t CountSurfaceCrossingChunks(const std::vector<float>& densityCPU, const VoxelVolumeDesc& desc);
+
+        // Same surface-crossing classification as CountSurfaceCrossingChunks,
+        // but also BUILDS the actual remap table (outRemap, resized to
+        // desc.NumChunks()): a surface-crossing chunk gets a compact
+        // index (assigned in raw-chunk-index order, 0, 1, 2... as they're
+        // encountered), every other chunk gets kVoxelChunkRemapUnused
+        // (VoxelTypes.h) - see voxel_march.comp's ChunkRemapBuffer for
+        // how the shader consumes this. Returns the compact chunk count
+        // (one past the highest compact index assigned) - pass this AND
+        // outRemap straight into RegisterVolume's chunkRemapOverride/
+        // compactChunkCountOverride parameters.
+        static uint32_t BuildChunkRemapTable(const std::vector<float>& densityCPU, const VoxelVolumeDesc& desc,
+                                              std::vector<uint32_t>& outRemap);
+
+        // Directly installs an ALREADY-COMPUTED density field (e.g. one
+        // built via SplatParticlesIntoDensityField for classification
+        // purposes before RegisterVolume was even called) onto a
+        // just-registered volume, skipping a redundant second splat pass.
+        // Uploads to the GPU and marks every chunk dirty, same end state
+        // SeedFromParticles leaves a volume in - this is a different way
+        // to REACH that state, not a different state.
+        void SetDensityFieldDirect(VoxelVolumeHandle handle, std::vector<float> densityCPU);
+
+        // Chemical ID system round-trip (see ParticleSystemGPU::ChemicalTable's
+        // comment and ReformSystem/MeltSystem for where these are
+        // actually set/read). A hardened volume needs to remember which
+        // chemical (and displayed color) it solidified from so melting
+        // it back can hand ParticleSystemGPU real particles of the same
+        // chemical/color instead of defaulting to chemical 0 - "the
+        // hardened form keeps properties like colour, and melting it
+        // retains them too" only works if this round-trips somewhere,
+        // and a Volume is the only thing that persists across the
+        // particle-despawn/respawn that Reform/Melt each do.
+        void SetChemicalId(VoxelVolumeHandle handle, uint32_t chemicalId);
+        uint32_t GetChemicalId(VoxelVolumeHandle handle) const;
+        // The color last passed to SetTransform for this volume (see
+        // that function - now also mirrored into Volume::lastColor,
+        // purely so it can be read back later; SetTransform's own
+        // behavior/signature is unchanged). Distinct from chemicalId's
+        // BASE color: a hardened cluster's actual color is whatever it
+        // diffused to by the moment it reformed (see ReformSystem), which
+        // may no longer match ChemicalTable[chemicalId].baseColor at all -
+        // this is the one that should be used when melting it back.
+        glm::vec4 GetVolumeColor(VoxelVolumeHandle handle) const;
+
     private:
         struct Volume
         {
             VoxelVolumeDesc desc;
+
+            // Chemical ID system round-trip - see SetChemicalId/
+            // GetChemicalId/GetVolumeColor's comments. Default chemicalId
+            // 0 and lastColor of transparent-black match this volume's
+            // state before any Reform/SetTransform call ever touches it
+            // (i.e. the original hardcoded test sphere, which predates
+            // the Chemical ID system entirely) - harmless defaults, not
+            // meaningful until something actually sets them.
+            uint32_t chemicalId = 0;
+            glm::vec4 lastColor = glm::vec4(0.0f);
 
             // The authoritative SDF data - see the class comment on
             // CPU ownership. Indexed identically to how voxel_march.comp
@@ -455,9 +621,34 @@ namespace Eden
             // offset (see SetVolumeNeighbors/MarchDirtyChunks), so
             // nothing here actually needed to change.
             VkDeviceSize densityOffsetElements = 0;
-            VulkanBuffer vertices;   // Vertex, desc.NumChunks() * kVoxelMaxVerticesPerChunk entries
-            VulkanBuffer indirect;   // VkDrawIndirectCommand, desc.NumChunks() entries
-            VulkanBuffer dirtyFlags; // uint32, desc.NumChunks() entries (1 = needs re-march)
+            // See RegisterVolume's chunkRemapOverride/compactChunkCountOverride
+            // comment - vertices/indirect are sized for compactChunkCount
+            // chunks (== desc.NumChunks() for the default identity case,
+            // every existing caller before chunk compaction existed), NOT
+            // always desc.NumChunks() directly anymore.
+            VulkanBuffer vertices;   // Vertex, compactChunkCount * kVoxelMaxVerticesPerChunk entries
+            VulkanBuffer indirect;   // VkDrawIndirectCommand, compactChunkCount entries
+            VulkanBuffer dirtyFlags; // uint32, desc.NumChunks() entries (1 = needs re-march) - NOT compacted, every raw chunk needs its own dirty flag regardless of whether it has geometry
+            // uint32 per RAW chunk -> compact index, or kVoxelChunkRemapUnused
+            // (VoxelTypes.h) if that chunk has no geometry at all - see
+            // voxel_march.comp's ChunkRemapBuffer. Identity (chunkRemap[i]==i
+            // for every i) unless RegisterVolume was given a real
+            // compaction - see that function's own comment.
+            VulkanBuffer chunkRemap;
+            // CPU mirror of the buffer above (same values, same indexing -
+            // raw chunk index in, compact index or kVoxelChunkRemapUnused
+            // out). Needed because MarchDirtyChunks's per-dirty-chunk
+            // vkCmdFillBuffer resets against `indirect` must address it by
+            // COMPACT index (indirect is only compactChunkCount entries
+            // long), not raw chunk index - without this, any caller that
+            // marks every raw chunk dirty on a compacted volume (ClearVolume,
+            // SetDensityFieldDirect, SeedFromParticles/SeedHeightfieldNoise's
+            // MarkAllChunksDirty) drives vkCmdFillBuffer straight past the
+            // end of `indirect`. Empty for the non-compacted/identity case
+            // (every existing caller before chunk compaction existed) -
+            // treat empty as "chunkIndex is already the compact index".
+            std::vector<uint32_t> chunkRemapCPU;
+            uint32_t compactChunkCount = 0; // == desc.NumChunks() unless a real compaction was provided at RegisterVolume time
             VulkanBuffer instance;   // InstanceData, 1 entry
 
             // Captured from VulkanBuffer::Init's out-param when
@@ -493,6 +684,35 @@ namespace Eden
             // of chunks did (Carve).
             std::vector<uint32_t> dirtyChunkIndices;
 
+            // Sample-space AABB touched by Carve() since the last
+            // RecomputeExactDistances call on this volume, unioned across
+            // however many Carve() calls happen in one gesture (a single
+            // click, or every ball along a drill-through stroke) - lets
+            // RecomputeExactDistances bound its flood-fill to roughly
+            // where things actually changed instead of re-walking the
+            // WHOLE field every carve. See RecomputeExactDistances' own
+            // comment for why this existed as a whole-field operation
+            // and why that scaled badly. Consumed (and reset) at the
+            // start of RecomputeExactDistances.
+            bool hasPendingExactDistanceRegion = false;
+
+            // Union of every sample region Carve() has changed in densityCPU
+            // but not yet copied to the GPU density buffer. Carve() used to
+            // upload (and BLOCK on the GPU) once per call, so a drill-through
+            // stroke - dozens of Carve() calls - stalled the CPU dozens of
+            // times for what is one logical edit. Now Carve() only records
+            // the region here, and ONE upload of the bounding box happens
+            // when something actually needs the GPU copy: the start of
+            // MarchDirtyChunks / DiscardPendingMarch, or the per-frame
+            // FlushAllPendingUploads() safety net (the raymarch pass reads
+            // this buffer too). densityCPU stays the single source of truth,
+            // so uploading a superset region is always correct.
+            bool hasPendingUpload = false;
+            glm::ivec3 pendingUploadMin = glm::ivec3(0);
+            glm::ivec3 pendingUploadMax = glm::ivec3(0);
+            glm::ivec3 pendingExactDistanceMin = glm::ivec3(0);
+            glm::ivec3 pendingExactDistanceMax = glm::ivec3(0);
+
             // The cheap per-chunk collision flag - see Carve()'s comment
             // in the header for what "cheap" means here.
             std::vector<bool> chunkSolid;
@@ -513,6 +733,19 @@ namespace Eden
 
         void CreateComputeLayout();
         void CreateComputePipelines();
+
+        // Shared tail end of SeedFromParticles/SetDensityFieldDirect -
+        // both leave a volume in the same state (density uploaded, every
+        // chunk marked dirty for the next MarchDirtyChunks call), they
+        // just reach it via different means (splat-then-upload vs
+        // install-a-precomputed-array-then-upload). Declared here, AFTER
+        // struct Volume's own definition just above, not before it -
+        // unlike a function BODY (which gets the "complete class"
+        // treatment and can reference members declared anywhere in the
+        // class), a member function's DECLARATION resolves its parameter
+        // types immediately at that point in the file, so Volume had to
+        // already be a complete type here.
+        void MarkAllChunksDirty(Volume& volume);
 
         // Cell coordinate -> owning chunk's flat index, using the SAME
         // formula voxel_march.comp uses internally (x + y*chunkDims.x +
@@ -538,6 +771,37 @@ namespace Eden
         // Vulkan-utility header is a bigger refactor than this milestone
         // calls for.
         void UploadRange(VkBuffer dst, VkDeviceSize dstOffset, const void* data, VkDeviceSize size);
+
+        // Submits a fully-recorded one-time command buffer and blocks
+        // only until THAT command buffer finishes - not vkQueueWaitIdle's
+        // "block until everything currently queued on this queue is
+        // done," which also includes whatever frame the renderer already
+        // has in flight on this same queue (see MarchDirtyChunks' and
+        // UploadDensityRegion's own comments for why that distinction
+        // matters here specifically: both run on every single Carve(),
+        // and with carving now holdable, vkQueueWaitIdle there meant every
+        // carve tick could stall behind an unrelated in-flight frame, not
+        // just its own GPU work - a real, measured cause of stutter while
+        // holding the carve button, not a theoretical one). Does NOT free
+        // cmd - every current caller passes GetReusableCommandBuffer()'s
+        // persistent buffer, owned for the lifetime of this class, not a
+        // one-off allocation this function is responsible for tearing
+        // down (see m_ReusableCommandBuffer's own comment for why that
+        // used to be a per-call allocate/free pair, same mistake as the
+        // fence and the staging buffer).
+        void SubmitAndWaitForCommandBuffer(VkCommandBuffer cmd);
+
+        // (Re)creates m_DensityStagingBuffer only if requiredBytes
+        // exceeds m_DensityStagingCapacityBytes - see that member's own
+        // comment. No-op (just returns) on the common case where the
+        // existing buffer already has enough room.
+        void EnsureDensityStagingCapacity(VkDeviceSize requiredBytes);
+
+        // Returns m_ReusableCommandBuffer, allocating it once on first
+        // call and resetting (not reallocating) it every call after -
+        // see that member's own comment. Ready for vkBeginCommandBuffer
+        // immediately on return.
+        VkCommandBuffer GetReusableCommandBuffer();
 
         // Pushes volume.densityCPU to the GPU density buffer in full -
         // used by SeedSphere, where every sample genuinely changes.
@@ -579,6 +843,42 @@ namespace Eden
         VmaAllocator m_Allocator = VK_NULL_HANDLE;
         VkCommandPool m_CommandPool = VK_NULL_HANDLE;
         VkQueue m_GraphicsQueue = VK_NULL_HANDLE;
+
+        // Created once in Init, destroyed once in Shutdown, reset and
+        // reused by every SubmitAndWaitForCommandBuffer call rather than
+        // creating a fresh VkFence per call - see that function's own
+        // comment for why a create/destroy pair every carve turned out to
+        // be a real regression, not a free correctness improvement.
+        VkFence m_SubmitFence = VK_NULL_HANDLE;
+
+        // Persistent, reused command buffer for the same carve hot path
+        // as m_SubmitFence/m_DensityStagingBuffer - UploadDensityRegion
+        // and MarchDirtyChunks both used to vkAllocateCommandBuffers a
+        // fresh one and vkFreeCommandBuffers it every single call, the
+        // SAME class of mistake as the other two, missed in both
+        // previous passes despite fixing it right next to this exact
+        // code both times. m_CommandPool was already created with
+        // VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT (see
+        // VulkanCommandPool::Init), so individual reset/reuse of one
+        // buffer from it is already valid - nothing about the pool
+        // needed to change, only how this class uses it.
+        VkCommandBuffer m_ReusableCommandBuffer = VK_NULL_HANDLE;
+
+        // Persistent, reused staging buffer for UploadDensityRegion (the
+        // carve hot path) - see that function's own comment for why this
+        // exists: it used to vmaCreateBuffer/vmaDestroyBuffer a fresh
+        // staging buffer on EVERY SINGLE CARVE, the exact same class of
+        // mistake m_SubmitFence's own comment already describes for
+        // fences (real driver work, not a free CPU-side struct, paid
+        // repeatedly in a path that can now fire 10+ times/sec). Grown
+        // (never shrunk) via EnsureDensityStagingCapacity whenever a
+        // carve's touched region needs more room than the current
+        // allocation provides - most carves reuse the existing buffer
+        // with zero allocation at all.
+        VkBuffer m_DensityStagingBuffer = VK_NULL_HANDLE;
+        VmaAllocation m_DensityStagingAllocation = VK_NULL_HANDLE;
+        VkDeviceSize m_DensityStagingCapacityBytes = 0;
+        void* m_DensityStagingMappedPtr = nullptr;
 
         // --- Shared density buffer -----------------------------------
         // ONE storage buffer holding every registered volume's density

@@ -85,15 +85,117 @@ namespace Eden
 
     constexpr uint32_t GPU_MAX_COLLIDERS = 32;
 
-    // Heat sentinel/threshold for the melt/reform pipeline (see
-    // MeltSystem.h and the upcoming ClusterSystem). Particles emitted by
-    // ordinary EmitBox/Emit calls (not MeltSystem::Melt) are given
-    // GPU_HEAT_NOT_MELTED and never decay or become reform-eligible -
-    // only particles that came from a melted solid should ever solidify
-    // back. GPU_HEAT_REFORM_THRESHOLD is how cool (post-decay) a
-    // melted particle must be before it's a reform candidate.
+    // Heat/hardening for the melt/reform pipeline (see MeltSystem.h and
+    // ClusterSystem.h). Previously, only particles that came from
+    // MeltSystem::Melt were ever reform-eligible - ordinary EmitBox/Emit
+    // particles were given GPU_HEAT_NOT_MELTED and permanently excluded
+    // from heat decay/conduction/reform entirely (a per-PARTICLE origin
+    // distinction). That's gone: ANY particle can now harden, regardless
+    // of whether it came from a melted solid or was poured as ordinary
+    // liquid - Emit/EmitBox/EmitPoints all default to a normal, decaying
+    // starting heat now (see ParticleSystemGPU::Emit's comment), and
+    // heat decay/conduction/color diffusion in particle_force.comp/
+    // particle_integrate.comp run unconditionally for every particle,
+    // no "is this particle part of the system" gate anymore.
+    //
+    // What replaced the per-particle exemption is a per-CHEMICAL one:
+    // ChemicalPropertiesGPU::hardeningThreshold < 0 means "this chemical
+    // never hardens at all" (matching the Design Document's own
+    // examples - Aqua/Ignis explicitly "do not harden"), independent of
+    // how any given particle of that chemical was created. See
+    // ClusterSystem::FindReformClusters for where this is actually
+    // checked.
+    //
+    // GPU_HEAT_NOT_MELTED is kept only as an available explicit sentinel
+    // value (e.g. for a future chemical-agnostic "permanently exempt"
+    // use case) - nothing in this codebase sets it as a default anymore.
     constexpr float GPU_HEAT_NOT_MELTED = -1.0f;
     constexpr float GPU_HEAT_REFORM_THRESHOLD = 0.05f;
+
+    // --- Chemical ID system (base build) -----------------------------------
+    // Per the Design Document's Matter system: every particle carries a
+    // Chemical ID indexing into a small, fixed table of material
+    // properties. This base build intentionally implements a SLICE of
+    // that spec, not the whole thing - see ChemicalPropertiesGPU's own
+    // comment for exactly which fields are load-bearing right now versus
+    // present as inert data for a later pass (reactions, conductivity/
+    // energy propagation) to consume. No reaction table exists yet -
+    // chemicalIds are set once at emit time and never mutated.
+    //
+    // Fixed, small capacity (like GPU_MAX_COLLIDERS) - this is a lookup
+    // table indexed by a per-particle ID, not a per-particle array, so
+    // its size has nothing to do with GPU_MAX_PARTICLES. 8 is generous
+    // for a base build (the Design Document's own illustrative example
+    // only names 4: Ignis/Aqua/Ferrum-melt/Viridis) with room to grow
+    // before this needs raising.
+    constexpr uint32_t GPU_MAX_CHEMICALS = 8;
+
+    // std430 layout, byte-identical to the GLSL ChemicalProperties struct
+    // declared in particle_density.comp/particle_force.comp/fluid_depth.vert -
+    // same "kept in sync by hand" convention SimParamsGPU already
+    // established, see that struct's own comments for prior art.
+    //
+    // Load-bearing (actually read by the SPH compute passes this build):
+    // mass, restDensity, stiffness, viscosity, cohesion - see
+    // particle_density.comp/particle_force.comp for exactly how. This is
+    // what makes "differing properties, not all shared globally" real
+    // rather than cosmetic: two different chemicals in the same
+    // simulation now genuinely push on each other with their own mass/
+    // pressure/viscosity/cohesion response, not a shared global
+    // multiplied by a color.
+    //
+    // cohesion replaces what used to be a plain alignment-padding float
+    // (`_pad0`) - same 48-byte layout, no size change, no re-sync risk
+    // across the struct's byte-identical GLSL mirrors (particle_density.comp/
+    // particle_force.comp/fluid_depth.vert all had an unused padding
+    // float in this exact slot already). Originally cohesion was kept
+    // GLOBAL (SimParamsGPU::cohesion) on the reasoning that the Design
+    // Document's Chemical ID field list doesn't name it explicitly - but
+    // "differing properties per chemical" is the actual ask this base
+    // build serves, and cohesion is exactly the kind of property that
+    // should differ (a thick honey-like chemical cohering strongly,
+    // water barely at all), so it moved here. particle_force.comp
+    // averages both particles' own cohesion per pair, same pattern
+    // viscosity already established - see that shader's cohesionIJ.
+    // SimParamsGPU::cohesion (the old global) still exists as an inert
+    // leftover field, same fate as the other now-superseded globals
+    // (particleMass/stiffness) - harmless, just unused.
+    //
+    // Data-only for now (present in the table, not yet consumed by
+    // anything):
+    // - hardeningThreshold IS consumed, but only by ClusterSystem's CPU-
+    //   side reform-eligibility check (see ClusterSystem::FindReformClusters),
+    //   not by any compute shader - kept here rather than duplicated
+    //   elsewhere since it's still fundamentally a per-chemical constant.
+    //   A NEGATIVE value means "this chemical never hardens at all" -
+    //   the Design Document's own examples include chemicals that
+    //   explicitly don't (Aqua, Ignis) - independent of which particle
+    //   of that chemical we're looking at or how it was created. Every
+    //   particle can now harden if and only if ITS chemical allows it -
+    //   see GPU_HEAT_NOT_MELTED's comment for what this replaced.
+    // - hardenedDensity is NOT yet consumed anywhere - ReformSystem's
+    //   blobby-SDF seeding still produces one hardcoded solid density
+    //   regardless of chemical. Present because the Design Document
+    //   names it as a Chemical ID field; wiring it into ReformSystem is
+    //   future work, not part of this base build.
+    // - conductivity is explicitly inert, matching the Design Document's
+    //   own "Explicitly Deferred" section (energy propagation is
+    //   deferred until voxel physics/SDF collision are solid) - present
+    //   so the data model matches the doc, not because anything reads it.
+    struct ChemicalPropertiesGPU
+    {
+        float mass = 1.728f;
+        float restDensity = 1000.0f;
+        float viscosity = 1.0f;
+        float stiffness = 3000.0f;
+        float hardeningThreshold = GPU_HEAT_REFORM_THRESHOLD;
+        float hardenedDensity = 1000.0f; // reserved - see struct comment above
+        float conductivity = 0.0f;       // inert - see struct comment above
+        float cohesion = 0.0f;           // per-pair-averaged in particle_force.comp - see struct comment above
+        glm::vec4 baseColor{ 1.0f, 1.0f, 1.0f, 1.0f }; // .a unused
+    };
+    static_assert(sizeof(ChemicalPropertiesGPU) == 48,
+                  "ChemicalPropertiesGPU must match the GLSL ChemicalProperties struct byte-for-byte");
 
     // How many Step() calls' worth of compute dispatches can be queued
     // before RecordPendingSteps() flushes them into a frame's command
