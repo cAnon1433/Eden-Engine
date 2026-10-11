@@ -166,6 +166,16 @@ add_executable(Eden ${EDEN_SOURCES})
 # (OpenGL ships with the OS) but a hard compile error on Linux machines
 # without libgl-dev, which Eden never needs.
 target_compile_definitions(Eden PRIVATE GLFW_INCLUDE_NONE GLFW_INCLUDE_VULKAN)
+
+# MSVC: treat source files as UTF-8 (comments here use non-ASCII characters;
+# without /utf-8 MSVC reads them in the system code page and warns/misparses),
+# compile files in parallel, and keep <windows.h> from defining min/max macros
+# (which break std::min/std::max and numeric_limits<>::max()) or dragging in
+# its whole API surface. No effect on other compilers.
+if(MSVC)
+    target_compile_options(Eden PRIVATE /utf-8 /MP)
+    target_compile_definitions(Eden PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS _USE_MATH_DEFINES)
+endif()
 add_dependencies(Eden EdenShaders)
 
 target_include_directories(Eden PRIVATE

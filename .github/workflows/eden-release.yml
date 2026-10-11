@@ -23,14 +23,37 @@ jobs:
       - name: Install Vulkan SDK
         uses: jakoch/install-vulkan-sdk-action@v1
         with:
-          vulkan_version: latest
+          # Pinned: 'latest' can move under us, and 'stripdown' may remove the
+          # shader compiler CMake needs.
+          vulkan_version: 1.3.296.0
           install_runtime: false
           cache: true
-          stripdown: true
-      - name: Build (Release)
+      - name: Show build tools
+        shell: pwsh
         run: |
-          cmake -S . -B build -A x64
-          cmake --build build --config Release --parallel
+          Write-Host "VULKAN_SDK = $env:VULKAN_SDK"
+          Get-Command glslangValidator, glslc -ErrorAction SilentlyContinue | Format-Table Name, Source
+          glslangValidator --version
+          cmake --version
+      - name: Build (Release)
+        shell: pwsh
+        run: |
+          cmake -S . -B build -A x64 2>&1 | Tee-Object -FilePath configure-log.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build --config Release --parallel 2>&1 | Tee-Object -FilePath build-log.txt
+          exit $LASTEXITCODE
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-build-logs
+          path: |
+            configure-log.txt
+            build-log.txt
+            build/CMakeFiles/CMakeConfigureLog.yaml
+            build/CMakeFiles/CMakeOutput.log
+            build/CMakeFiles/CMakeError.log
+          if-no-files-found: ignore
       - name: Package
         shell: pwsh
         run: |
